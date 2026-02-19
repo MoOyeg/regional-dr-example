@@ -1,0 +1,214 @@
+---
+# =============================================================================
+# Remove spoke operators (OpenShift DR Cluster Operator)
+# =============================================================================
+- name: Remove spoke operators (OpenShift DR Cluster Operator)
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-spoke clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'spoke'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Remove OADP Operator
+    # =========================================================================
+    - name: Delete OADP Operator Subscription
+      shell: |
+        oc delete subscription redhat-oadp-operator -n openshift-adp --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete OADP ClusterServiceVersions
+      shell: |
+        oc delete csv -n openshift-adp -l operators.coreos.com/redhat-oadp-operator.openshift-adp --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete OADP OperatorGroup
+      shell: |
+        oc delete operatorgroup openshift-adp-operatorgroup -n openshift-adp --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete openshift-adp namespace
+      shell: |
+        oc delete namespace openshift-adp --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove DR Cluster Operator
+    # =========================================================================
+    - name: Delete DR Cluster Operator Subscription
+      shell: |
+        oc delete subscription odr-cluster-operator -n openshift-dr-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete DR Cluster Operator ClusterServiceVersions
+      shell: |
+        oc delete csv -n openshift-dr-system -l operators.coreos.com/odr-cluster-operator.openshift-dr-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete DR Cluster OperatorGroup
+      shell: |
+        oc delete operatorgroup openshift-dr-system-operatorgroup -n openshift-dr-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete openshift-dr-system namespace
+      shell: |
+        oc delete namespace openshift-dr-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display spoke operator removal result
+      debug:
+        msg: |
+          ============================================
+          Spoke Operators Removed
+          ============================================
+          Cluster: {{ cluster_name }}
+          Removed: OADP Operator, OpenShift DR Cluster Operator
+
+# =============================================================================
+# Play 4: Remove hub operators (ODF MCO, ACM)
+# =============================================================================
+- name: Remove hub operators (ODF MCO, ACM)
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Remove ODF Multicluster Orchestrator
+    # =========================================================================
+    - name: Delete ODF MCO Subscription
+      shell: |
+        oc delete subscription odf-multicluster-orchestrator -n openshift-operators --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ODF MCO ClusterServiceVersions
+      shell: |
+        oc delete csv -n openshift-operators -l operators.coreos.com/odf-multicluster-orchestrator.openshift-operators --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove MultiClusterHub and ACM
+    # =========================================================================
+    - name: Delete MultiClusterHub
+      shell: |
+        oc delete multiclusterhub multiclusterhub -n open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for MultiClusterHub removal
+      shell: |
+        oc get multiclusterhub multiclusterhub -n open-cluster-management
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mch_check
+      until: mch_check.rc != 0
+      retries: 60
+      delay: 30
+      ignore_errors: true
+
+    - name: Delete ACM Subscription
+      shell: |
+        oc delete subscription advanced-cluster-management -n open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ACM ClusterServiceVersions
+      shell: |
+        oc delete csv -n open-cluster-management -l operators.coreos.com/advanced-cluster-management.open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ACM OperatorGroup
+      shell: |
+        oc delete operatorgroup open-cluster-management -n open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete open-cluster-management namespace
+      shell: |
+        oc delete namespace open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display hub operator removal result
+      debug:
+        msg: |
+          ============================================
+          Hub Operators Removed
+          ============================================
+          Cluster: {{ cluster_name }}
+          Removed: ACM, ODF Multicluster Orchestrator

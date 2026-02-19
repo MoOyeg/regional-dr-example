@@ -1,0 +1,44 @@
+---
+# Example cluster configuration for US West 2
+# This cluster uses credential set 2
+
+# Cluster identification
+cluster_name: "cluster2"
+#cluster_base_domain: "example.com"  # Optional: will auto-detect from Route53 if not provided
+
+# AWS Credential Set to use (1, 2, or 3)
+aws_credential_set: 2
+
+# AWS Configuration
+aws_region: "us-east-2"
+aws_availability_zone: "us-east-2a"
+aws_instance_type: "m5.2xlarge"
+aws_root_volume_size: 120
+control_plane_replicas: 3
+control_plane_instance_type: "m5.2xlarge"
+worker_replicas: 3
+worker_instance_type: "m5.4xlarge"
+
+cluster_role: spoke
+
+# RHCOS AMI for OpenShift 4.17 in us-east-2
+#aws_ami_id: "ami-0fedcba9876543210"
+
+# Network Configuration - Update with your values
+# aws_vpc_id: "vpc-yyyyyyyyyyyyyyyyy"
+# aws_subnet_id: "subnet-yyyyyyyyyyyyyyyyy"
+# aws_security_group_id: "sg-yyyyyyyyyyyyyyyyy"
+
+# SSH Key (choose one):
+# Option 1: Place ssh-key.pub in project root (auto-imported to EC2)
+# Option 2: Use existing AWS EC2 key pair:
+# aws_key_name: "my-keypair"
+
+# Elastic IP
+aws_create_eip: true
+
+# Optional: Route53 DNS
+# aws_route53_zone: "example.com"
+
+# OpenShift version
+openshift_version: "4.20"

@@ -1,0 +1,85 @@
+---
+# =============================================================================
+# Import spoke clusters into ACM hub
+# =============================================================================
+- name: Import spoke clusters into ACM hub
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first to install required operators.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Display spoke clusters to import
+      debug:
+        msg: "Spoke clusters to import: {{ spoke_clusters | join(', ') }}"
+
+  tasks:
+    - name: Import spoke cluster into ACM
+      include_tasks: tasks/import-spoke.yml
+      loop: "{{ spoke_clusters }}"
+      loop_control:
+        loop_var: spoke_name
+
+    - name: Display import success
+      debug:
+        msg: |
+          ============================================
+          Spoke Clusters Imported Successfully!
+          ============================================
+          Hub: {{ cluster_name }}
+          Imported: {{ spoke_clusters | join(', ') }}

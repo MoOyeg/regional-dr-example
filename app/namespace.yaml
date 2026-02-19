@@ -1,0 +1,7 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quarkus-web-app
+  labels:
+    app: quarkus-mysql-app

@@ -1,0 +1,14 @@
+---
+- name: List Configured Clusters
+  hosts: openshift_clusters
+  gather_facts: false
+  
+  tasks:
+    - name: Display cluster configuration
+      debug:
+        msg: |
+          Cluster: {{ cluster_name }}
+          Region: {{ aws_region }}
+          Credential Set: {{ aws_credential_set }}
+          Base Domain: {{ cluster_base_domain }}
+          Instance Type: {{ aws_instance_type }}

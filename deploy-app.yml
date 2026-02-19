@@ -1,0 +1,1204 @@
+---
+# =============================================================================
+# Play 1: Validate DR readiness for application deployment
+# =============================================================================
+- name: Validate DR readiness for application deployment
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Fail if app_git_url is not configured
+      fail:
+        msg: >-
+          app_git_url is not configured. Set it in inventory/group_vars/all.yml
+          to the Git repository URL containing the app manifests
+          (e.g., https://github.com/user/regional-dr-example.git).
+      when: app_git_url | default('') == ''
+
+  tasks:
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first to install required operators.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Check ManagedClusterSet exists
+      shell: |
+        oc get managedclusterset {{ managed_cluster_set_name }} -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mcs_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if ManagedClusterSet not found
+      fail:
+        msg: >-
+          ManagedClusterSet '{{ managed_cluster_set_name }}' not found.
+          Run './ansible-runner.sh infra-dr' first to set up DR infrastructure.
+      when: mcs_check.rc != 0
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Verify at least 2 spoke clusters exist for DR
+      fail:
+        msg: >-
+          Regional DR requires at least 2 spoke clusters.
+          Found: {{ spoke_clusters | length }} ({{ spoke_clusters | join(', ') }}).
+      when: spoke_clusters | length < 2
+
+    - name: Check StorageCluster Ready on spoke clusters
+      shell: |
+        oc get storagecluster ocs-storagecluster -n openshift-storage \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: sc_status
+      changed_when: false
+      failed_when: false
+      loop: "{{ spoke_clusters[:2] }}"
+
+    - name: Warn about spoke clusters without StorageCluster
+      debug:
+        msg: >-
+          WARNING: StorageCluster on {{ item.item }} is not Ready
+          (got: '{{ item.stdout | default('not found') }}'). DR replication may not work.
+      when: "'Ready' not in (item.stdout | default(''))"
+      loop: "{{ sc_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check DRPolicy CRD exists
+      shell: oc get crd drpolicies.ramendr.openshift.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: drpolicy_crd
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if DRPolicy CRD not available
+      fail:
+        msg: >-
+          DRPolicy CRD not found. The ODF Multicluster Orchestrator may not be installed.
+          Run './ansible-runner.sh operators' first.
+      when: drpolicy_crd.rc != 0
+
+    - name: Display validation success
+      debug:
+        msg: |
+          ============================================
+          DR Application Readiness Validated
+          ============================================
+          Hub: {{ cluster_name }}
+          Spoke Clusters: {{ spoke_clusters[:2] | join(', ') }}
+          ManagedClusterSet: {{ managed_cluster_set_name }}
+          Git URL: {{ app_git_url }}
+          Git Path: {{ app_git_path }}
+
+# =============================================================================
+# Play 2: Enable Ceph RBD mirroring via MirrorPeer
+# =============================================================================
+- name: Enable Ceph RBD mirroring via MirrorPeer
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Create MirrorPeer for Ceph RBD mirroring
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: multicluster.odf.openshift.io/v1alpha1
+        kind: MirrorPeer
+        metadata:
+          name: mirrorpeer-{{ spoke_clusters[0] }}-{{ spoke_clusters[1] }}
+        spec:
+          manageS3: true
+          type: async
+          schedulingIntervals:
+            - {{ dr_replication_interval }}
+          items:
+            - clusterName: {{ spoke_clusters[0] }}
+              storageClusterRef:
+                name: ocs-storagecluster
+                namespace: openshift-storage
+            - clusterName: {{ spoke_clusters[1] }}
+              storageClusterRef:
+                name: ocs-storagecluster
+                namespace: openshift-storage
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for MirrorPeer to reach ExchangingSecret or ExchangedSecret phase
+      shell: |
+        oc get mirrorpeer mirrorpeer-{{ spoke_clusters[0] }}-{{ spoke_clusters[1] }} \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mirrorpeer_status
+      until: >-
+        'ExchangedSecret' in mirrorpeer_status.stdout or
+        'ExchangingSecret' in mirrorpeer_status.stdout
+      retries: 40
+      delay: 15
+      ignore_errors: true
+
+    - name: Display MirrorPeer status
+      debug:
+        msg: >-
+          MirrorPeer status: {{ mirrorpeer_status.stdout | default('unknown') }}
+
+    - name: Wait for DRCluster resources to be auto-created
+      shell: |
+        oc get drcluster {{ spoke_clusters[0] }} -o jsonpath='{.metadata.name}' && \
+        oc get drcluster {{ spoke_clusters[1] }} -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: drcluster_check
+      until: drcluster_check.rc == 0
+      retries: 40
+      delay: 15
+      ignore_errors: true
+
+    - name: Display DRCluster status
+      debug:
+        msg: >-
+          DRClusters: {{ 'Created' if drcluster_check.rc == 0 else 'Still waiting (check MirrorPeer status)' }}
+
+    - name: Display MirrorPeer setup success
+      debug:
+        msg: |
+          ============================================
+          Ceph RBD Mirroring Enabled
+          ============================================
+          MirrorPeer: mirrorpeer-{{ spoke_clusters[0] }}-{{ spoke_clusters[1] }}
+          Phase: {{ mirrorpeer_status.stdout | default('unknown') }}
+          Type: async ({{ dr_replication_interval }})
+          Clusters: {{ spoke_clusters[0] }}, {{ spoke_clusters[1] }}
+
+# =============================================================================
+# Play 3: Create DRPolicy for regional DR
+# =============================================================================
+- name: Create DRPolicy for regional DR
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Verify DRClusters exist before creating DRPolicy
+      shell: |
+        oc get drcluster {{ spoke_clusters[0] }} && \
+        oc get drcluster {{ spoke_clusters[1] }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Create DRPolicy
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: ramendr.openshift.io/v1alpha1
+        kind: DRPolicy
+        metadata:
+          name: {{ dr_policy_name }}
+        spec:
+          drClusters:
+            - {{ spoke_clusters[0] }}
+            - {{ spoke_clusters[1] }}
+          schedulingInterval: {{ dr_replication_interval }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for DRPolicy to be validated
+      shell: |
+        oc get drpolicy {{ dr_policy_name }} \
+          -o jsonpath='{.status.conditions[?(@.type=="Validated")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: drpolicy_status
+      until: "'True' in drpolicy_status.stdout"
+      retries: 30
+      delay: 10
+
+    - name: Display DRPolicy creation success
+      debug:
+        msg: |
+          ============================================
+          DRPolicy Created Successfully
+          ============================================
+          Name: {{ dr_policy_name }}
+          Clusters: {{ spoke_clusters[0] }}, {{ spoke_clusters[1] }}
+          Replication Interval: {{ dr_replication_interval }}
+
+# =============================================================================
+# Play 4: Install OpenShift GitOps and configure ArgoCD for push mode
+# =============================================================================
+- name: Install OpenShift GitOps and configure ArgoCD for push mode
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    # =========================================================================
+    # Install OpenShift GitOps operator
+    # =========================================================================
+    - name: Create OpenShift GitOps Operator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: openshift-gitops-operator
+          namespace: openshift-operators
+        spec:
+          channel: {{ gitops_channel }}
+          installPlanApproval: Automatic
+          name: openshift-gitops-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for GitOps operator CSV to succeed
+      shell: |
+        oc get csv -n openshift-operators \
+          -o jsonpath='{.items[?(@.spec.displayName=="Red Hat OpenShift GitOps")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_csv_status
+      until: "'Succeeded' in gitops_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    - name: Wait for openshift-gitops namespace to be created
+      shell: |
+        oc get namespace {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_ns_status
+      until: "'Active' in gitops_ns_status.stdout"
+      retries: 20
+      delay: 10
+
+    - name: Wait for default ArgoCD instance to be available
+      shell: |
+        oc get argocd openshift-gitops -n {{ gitops_namespace }} \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_status
+      until: "'Available' in argocd_status.stdout"
+      retries: 30
+      delay: 15
+
+    # =========================================================================
+    # Register spoke clusters with ArgoCD via GitOpsCluster
+    # =========================================================================
+    - name: Create ManagedClusterSetBinding in openshift-gitops namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ gitops_namespace }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for GitOpsCluster registration
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ managed_cluster_set_name }}-gitops-registration
+          namespace: {{ gitops_namespace }}
+        spec:
+          clusterSets:
+            - {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create GitOpsCluster to register spoke clusters with ArgoCD
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: apps.open-cluster-management.io/v1beta1
+        kind: GitOpsCluster
+        metadata:
+          name: {{ managed_cluster_set_name }}-gitops
+          namespace: {{ gitops_namespace }}
+        spec:
+          argoServer:
+            cluster: local-cluster
+            argoNamespace: {{ gitops_namespace }}
+          placementRef:
+            kind: Placement
+            apiVersion: cluster.open-cluster-management.io/v1beta1
+            name: {{ managed_cluster_set_name }}-gitops-registration
+            namespace: {{ gitops_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ArgoCD cluster secrets to be created for spokes
+      shell: |
+        oc get secret -n {{ gitops_namespace }} \
+          -l argocd.argoproj.io/secret-type=cluster \
+          -o jsonpath='{.items[*].metadata.name}' | grep -q {{ item }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_cluster_secret
+      until: argocd_cluster_secret.rc == 0
+      retries: 20
+      delay: 15
+      loop: "{{ spoke_clusters[:2] }}"
+      ignore_errors: true
+
+    # =========================================================================
+    # ConfigMap for ClusterDecisionResource generator
+    # =========================================================================
+    - name: Create ConfigMap for ClusterDecisionResource generator
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: acm-placement
+          namespace: {{ gitops_namespace }}
+        data:
+          apiVersion: cluster.open-cluster-management.io/v1beta1
+          kind: placementdecisions
+          statusListKey: decisions
+          matchKey: clusterName
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Display GitOps setup success
+      debug:
+        msg: |
+          ============================================
+          OpenShift GitOps Configured
+          ============================================
+          Operator: Red Hat OpenShift GitOps ({{ gitops_channel }})
+          ArgoCD: openshift-gitops in {{ gitops_namespace }}
+          Registered Clusters: {{ spoke_clusters[:2] | join(', ') }}
+          GitOpsCluster: {{ managed_cluster_set_name }}-gitops
+
+# =============================================================================
+# Play 5: Deploy DR-protected application via OpenShift GitOps (ArgoCD)
+# =============================================================================
+- name: Deploy DR-protected application via OpenShift GitOps
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    # =========================================================================
+    # Placement for GitOps app (managed by DRPlacementControl)
+    # =========================================================================
+    - name: Create Placement for GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ app_name }}-gitops-placement
+          namespace: {{ gitops_namespace }}
+          annotations:
+            cluster.open-cluster-management.io/experimental-scheduling-disable: "true"
+        spec:
+          clusterSets:
+            - {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # ApplicationSet with ClusterDecisionResource generator
+    # =========================================================================
+    - name: Create ApplicationSet for GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: argoproj.io/v1alpha1
+        kind: ApplicationSet
+        metadata:
+          name: {{ app_name }}-gitops-appset
+          namespace: {{ gitops_namespace }}
+        spec:
+          generators:
+            - clusterDecisionResource:
+                configMapRef: acm-placement
+                labelSelector:
+                  matchLabels:
+                    cluster.open-cluster-management.io/placement: {{ app_name }}-gitops-placement
+                requeueAfterSeconds: 180
+          template:
+            metadata:
+              name: '{{ app_name }}-gitops-{{ "{{" }}name{{ "}}" }}'
+              namespace: {{ gitops_namespace }}
+              labels:
+                app: {{ app_name }}
+                app.kubernetes.io/part-of: {{ app_name }}
+            spec:
+              project: default
+              source:
+                repoURL: {{ app_git_url }}
+                targetRevision: {{ app_git_branch }}
+                path: {{ app_git_path }}
+              destination:
+                server: '{{ "{{" }}server{{ "}}" }}'
+                namespace: {{ app_namespace }}
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                syncOptions:
+                  - CreateNamespace=true
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # DRPlacementControl for GitOps instance
+    # =========================================================================
+    - name: Create DRPlacementControl for GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: ramendr.openshift.io/v1alpha1
+        kind: DRPlacementControl
+        metadata:
+          name: {{ app_name }}-gitops-drpc
+          namespace: {{ gitops_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          preferredCluster: {{ spoke_clusters[0] }}
+          drPolicyRef:
+            name: {{ dr_policy_name }}
+          placementRef:
+            kind: Placement
+            name: {{ app_name }}-gitops-placement
+          pvcSelector:
+            matchLabels:
+              appname: {{ app_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Delete stale PlacementDecision so Ramen can take over scheduling
+      shell: |
+        oc delete placementdecision \
+          -l cluster.open-cluster-management.io/placement={{ app_name }}-gitops-placement \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Wait for deployment
+    # =========================================================================
+    - name: Wait for GitOps Placement decision
+      shell: |
+        oc get placementdecision -n {{ gitops_namespace }} \
+          -l cluster.open-cluster-management.io/placement={{ app_name }}-gitops-placement \
+          -o jsonpath='{.items[0].status.decisions[0].clusterName}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_placement_decision
+      until: "gitops_placement_decision.stdout | length > 0"
+      retries: 20
+      delay: 10
+      ignore_errors: true
+
+    - name: Wait for ArgoCD Application to sync
+      shell: |
+        oc get application.argoproj.io -n {{ gitops_namespace }} \
+          -l app={{ app_name }} \
+          -o jsonpath='{.items[0].status.sync.status}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_app_sync
+      until: "'Synced' in argocd_app_sync.stdout"
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: Check GitOps DRPlacementControl status
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_drpc_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Wait for GitOps app deployment on preferred cluster
+      shell: |
+        oc get deployment {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_app_deployment
+      until: "(gitops_app_deployment.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: Get GitOps application Route URL
+      shell: |
+        oc get route {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_app_route
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display GitOps application deployment success
+      debug:
+        msg: |
+          ============================================
+          GitOps Instance: DR-Protected Application Deployed
+          ============================================
+          App: {{ app_name }}
+          Namespace: {{ app_namespace }}
+          Deployment Method: OpenShift GitOps (ArgoCD push mode)
+          Preferred Cluster: {{ spoke_clusters[0] }}
+          Placement Decision: {{ gitops_placement_decision.stdout | default('unknown') }}
+          ArgoCD Sync: {{ argocd_app_sync.stdout | default('unknown') }}
+          DR Policy: {{ dr_policy_name }} ({{ dr_replication_interval }} async)
+          DRPC Status: {{ gitops_drpc_status.stdout | default('unknown') }}
+          Route: https://{{ gitops_app_route.stdout | default('pending') }}
+
+          To failover:
+            oc patch drplacementcontrol {{ app_name }}-gitops-drpc -n {{ gitops_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Failover","failoverCluster":"{{ spoke_clusters[1] }}"}}'
+
+          To relocate (failback):
+            oc patch drplacementcontrol {{ app_name }}-gitops-drpc -n {{ gitops_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Relocate","preferredCluster":"{{ spoke_clusters[0] }}"}}'
+
+# =============================================================================
+# Play 6: Deploy DR-protected application via direct manifests
+# =============================================================================
+- name: Deploy DR-protected application via direct manifests
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    direct_namespace: "{{ app_namespace }}-direct"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    # =========================================================================
+    # Apply manifests directly to primary spoke cluster
+    # =========================================================================
+    - name: Create direct app namespace on primary spoke
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Apply MySQL Secret to primary spoke (direct)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: mysql-secret
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        type: Opaque
+        stringData:
+          database-user: quarkus
+          database-password: quarkus
+          database-root-password: rootpassword
+          database-name: quarkusdb
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Apply MySQL PVC to primary spoke (direct)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: mysql-pvc
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+            appname: {{ app_name }}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: {{ app_pvc_storage_class }}
+          resources:
+            requests:
+              storage: 1Gi
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Apply MySQL Deployment and Service to primary spoke (direct)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: mysql
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: {{ app_name }}
+              component: mysql
+          strategy:
+            type: Recreate
+          template:
+            metadata:
+              labels:
+                app: {{ app_name }}
+                component: mysql
+            spec:
+              containers:
+              - name: mysql
+                image: mysql:8.0
+                env:
+                - name: MYSQL_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-user
+                - name: MYSQL_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-password
+                - name: MYSQL_ROOT_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-root-password
+                - name: MYSQL_DATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-name
+                ports:
+                - containerPort: 3306
+                  name: mysql
+                volumeMounts:
+                - name: mysql-storage
+                  mountPath: /var/lib/mysql
+                livenessProbe:
+                  tcpSocket:
+                    port: 3306
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  exec:
+                    command:
+                    - /bin/sh
+                    - -c
+                    - mysqladmin ping -u root -p${MYSQL_ROOT_PASSWORD}
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+              volumes:
+              - name: mysql-storage
+                persistentVolumeClaim:
+                  claimName: mysql-pvc
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: mysql
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          ports:
+          - port: 3306
+            targetPort: 3306
+          selector:
+            app: {{ app_name }}
+            component: mysql
+          clusterIP: None
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Apply Quarkus App Deployment, Service, and Route to primary spoke (direct)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: {{ app_name }}
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: {{ app_name }}
+              component: quarkus
+          template:
+            metadata:
+              labels:
+                app: {{ app_name }}
+                component: quarkus
+            spec:
+              containers:
+              - name: {{ app_name }}
+                image: quay.io/mooyeg/quarkus-app:latest
+                imagePullPolicy: IfNotPresent
+                ports:
+                - containerPort: 8080
+                  protocol: TCP
+                env:
+                - name: DB_HOST
+                  value: mysql
+                - name: DB_PORT
+                  value: "3306"
+                - name: DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-user
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-password
+                - name: DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: database-name
+                livenessProbe:
+                  httpGet:
+                    path: /q/health/live
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /q/health/ready
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                resources:
+                  limits:
+                    memory: 512Mi
+                    cpu: 500m
+                  requests:
+                    memory: 256Mi
+                    cpu: 250m
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ app_name }}
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          ports:
+          - port: 8080
+            targetPort: 8080
+            protocol: TCP
+            name: http
+          selector:
+            app: {{ app_name }}
+            component: quarkus
+          type: ClusterIP
+        ---
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: {{ app_name }}
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          to:
+            kind: Service
+            name: {{ app_name }}
+          port:
+            targetPort: 8080
+          tls:
+            termination: edge
+            insecureEdgeTerminationPolicy: Redirect
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Wait for app to be available on spoke
+    # =========================================================================
+    - name: Wait for MySQL deployment on primary spoke (direct)
+      shell: |
+        oc get deployment mysql -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_mysql_deployment
+      until: "(direct_mysql_deployment.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: Wait for Quarkus app deployment on primary spoke (direct)
+      shell: |
+        oc get deployment {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_app_deployment
+      until: "(direct_app_deployment.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    # =========================================================================
+    # Create DR resources on hub for discovered app protection
+    # =========================================================================
+    - name: Create direct app namespace on hub for DR resources
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ direct_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ManagedClusterSetBinding in direct namespace on hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ direct_namespace }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for direct application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ app_name }}-direct-placement
+          namespace: {{ direct_namespace }}
+          annotations:
+            cluster.open-cluster-management.io/experimental-scheduling-disable: "true"
+        spec:
+          clusterSets:
+            - {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create DRPlacementControl for direct application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: ramendr.openshift.io/v1alpha1
+        kind: DRPlacementControl
+        metadata:
+          name: {{ app_name }}-direct-drpc
+          namespace: {{ direct_namespace }}
+          labels:
+            app: {{ app_name }}
+        spec:
+          preferredCluster: {{ spoke_clusters[0] }}
+          drPolicyRef:
+            name: {{ dr_policy_name }}
+          placementRef:
+            kind: Placement
+            name: {{ app_name }}-direct-placement
+          pvcSelector:
+            matchLabels:
+              appname: {{ app_name }}
+          kubeObjectProtection:
+            captureInterval: 5m
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Delete stale PlacementDecision so Ramen can take over scheduling
+      shell: |
+        oc delete placementdecision \
+          -l cluster.open-cluster-management.io/placement={{ app_name }}-direct-placement \
+          -n {{ direct_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Check Direct DRPlacementControl status
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_drpc_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Get Direct application Route URL
+      shell: |
+        oc get route {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_app_route
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Direct application deployment success
+      debug:
+        msg: |
+          ============================================
+          Direct Instance: DR-Protected Application Deployed
+          ============================================
+          App: {{ app_name }}
+          Namespace: {{ direct_namespace }}
+          Deployment Method: Direct manifests (oc apply)
+          Preferred Cluster: {{ spoke_clusters[0] }}
+          DR Policy: {{ dr_policy_name }} ({{ dr_replication_interval }} async)
+          DRPC Status: {{ direct_drpc_status.stdout | default('unknown') }}
+          Kube Object Protection: enabled (5m capture interval)
+          Route: https://{{ direct_app_route.stdout | default('pending') }}
+
+          To failover:
+            oc patch drplacementcontrol {{ app_name }}-direct-drpc -n {{ direct_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Failover","failoverCluster":"{{ spoke_clusters[1] }}"}}'
+
+          To relocate (failback):
+            oc patch drplacementcontrol {{ app_name }}-direct-drpc -n {{ direct_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Relocate","preferredCluster":"{{ spoke_clusters[0] }}"}}'

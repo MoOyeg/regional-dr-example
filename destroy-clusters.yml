@@ -1,0 +1,372 @@
+---
+- name: Destroy OpenShift Clusters on AWS
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Display cluster destruction information
+      debug:
+        msg: |
+          Destroying cluster: {{ cluster_name }}
+          Region: {{ aws_region }}
+          Credential Set: {{ aws_credential_set }}
+
+    - name: Determine deployment mode
+      set_fact:
+        use_existing_vpc: "{{ (aws_vpc_id is defined and aws_vpc_id != '') and (aws_subnet_id is defined and aws_subnet_id != '') }}"
+
+    - name: Set AWS credentials based on credential set
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+
+    - name: Validate AWS credentials are set
+      assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: "AWS credentials not found for credential set {{ aws_credential_set }}. Ensure AWS_ACCESS_KEY_ID_{{ aws_credential_set }} and AWS_SECRET_ACCESS_KEY_{{ aws_credential_set }} are set."
+
+    - name: Get first Route53 hosted zone if cluster_base_domain not provided
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws route53 list-hosted-zones \
+          --query 'HostedZones[0].Name' \
+          --output text | sed 's/\.$//'
+      register: route53_zone_result
+      changed_when: false
+      delegate_to: localhost
+      when: cluster_base_domain is not defined or cluster_base_domain == ""
+
+    - name: Set cluster_base_domain from Route53
+      set_fact:
+        cluster_base_domain: "{{ route53_zone_result.stdout }}"
+      when:
+        - cluster_base_domain is not defined or cluster_base_domain == ""
+        - route53_zone_result.stdout is defined
+        - route53_zone_result.stdout | length > 0
+
+    - name: Display destruction mode
+      debug:
+        msg: "Cluster {{ cluster_name }} - Mode: {{ 'UPI (existing VPC)' if use_existing_vpc else 'IPI (installer-created infra)' }}"
+
+  tasks:
+    # =========================================================================
+    # IPI Mode: Use openshift-install destroy cluster
+    # =========================================================================
+    - name: IPI cluster destruction
+      block:
+        - name: Check if IPI metadata exists in installer directory
+          stat:
+            path: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+          register: ipi_tmp_check
+          delegate_to: localhost
+
+        - name: Check if IPI metadata exists in artifacts
+          stat:
+            path: "{{ artifacts_dir }}/{{ cluster_name }}/metadata.json"
+          register: ipi_artifacts_check
+          delegate_to: localhost
+          when: not ipi_tmp_check.stat.exists
+
+        - name: Set metadata availability
+          set_fact:
+            has_ipi_metadata: "{{ ipi_tmp_check.stat.exists or (ipi_artifacts_check.stat is defined and ipi_artifacts_check.stat.exists) }}"
+
+        - name: Restore IPI installer directory from artifacts
+          block:
+            - name: Create installer directory
+              file:
+                path: "/tmp/ocp-install-{{ cluster_name }}"
+                state: directory
+                mode: '0755'
+              delegate_to: localhost
+
+            - name: Copy metadata.json from artifacts
+              copy:
+                src: "{{ artifacts_dir }}/{{ cluster_name }}/metadata.json"
+                dest: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+                mode: '0644'
+              delegate_to: localhost
+          when:
+            - not ipi_tmp_check.stat.exists
+            - ipi_artifacts_check.stat is defined
+            - ipi_artifacts_check.stat.exists
+
+        - name: Destroy IPI cluster with openshift-install
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            AWS_REGION="{{ aws_deploy_region }}" \
+            openshift-install destroy cluster \
+              --dir /tmp/ocp-install-{{ cluster_name }} \
+              --log-level=debug
+          register: ipi_destroy_result
+          ignore_errors: true
+          delegate_to: localhost
+          when: has_ipi_metadata
+
+        - name: Display IPI destroy output
+          debug:
+            msg: "{{ item }}"
+          loop: "{{ (ipi_destroy_result.stderr_lines | default([])) | select('search', '(level=info|level=error|level=warning)') | list }}"
+          loop_control:
+            label: "openshift-install"
+          when: ipi_destroy_result.stderr_lines is defined
+
+        - name: Display IPI destroy result
+          debug:
+            msg: >-
+              {{ 'IPI destroy succeeded for ' + cluster_name if (ipi_destroy_result.rc | default(1)) == 0
+                 else 'IPI destroy failed or skipped for ' + cluster_name + '. Will clean up DNS records.' }}
+
+      always:
+        - name: Ensure artifacts directory exists for destroy logs
+          file:
+            path: "{{ artifacts_dir }}/{{ cluster_name }}"
+            state: directory
+            mode: '0755'
+          delegate_to: localhost
+
+        - name: Copy destroy log to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/.openshift_install.log"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/openshift_destroy.log"
+            mode: '0644'
+          delegate_to: localhost
+          ignore_errors: true
+
+        - name: Clean up installation directory
+          file:
+            path: "/tmp/ocp-install-{{ cluster_name }}"
+            state: absent
+          delegate_to: localhost
+
+        - name: Display success
+          debug:
+            msg: |
+              ============================================
+              IPI Cluster Destroyed Successfully!
+              ============================================
+              Cluster: {{ cluster_name }}
+              Region: {{ aws_deploy_region }}
+
+              OpenShift installer removed all AWS resources:
+              - VPC, subnets, route tables
+              - Internet Gateway, NAT Gateways
+              - Security Groups, Load Balancers
+              - EC2 instances, EBS volumes
+
+          when: ipi_destroy_result.rc | default(1) == 0
+
+        - name: Display destroy failure with log location
+          debug:
+            msg: |
+              ============================================
+              IPI Cluster Destroy FAILED for {{ cluster_name }}
+              ============================================
+              Region: {{ aws_deploy_region }}
+              See destroy log: artifacts/{{ cluster_name }}/openshift_destroy.log
+          when: ipi_destroy_result.rc | default(1) != 0
+      when: not use_existing_vpc
+
+    # =========================================================================
+    # UPI Mode: Manual resource cleanup
+    # =========================================================================
+    - name: UPI cluster destruction
+      block:
+        - name: Find EC2 instances for cluster
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 describe-instances \
+              --filters "Name=tag:cluster,Values={{ cluster_name }}" \
+                        "Name=instance-state-name,Values=running,pending,stopped,stopping" \
+              --region {{ aws_deploy_region }} \
+              --query 'Reservations[*].Instances[*].InstanceId' \
+              --output text
+          register: instance_ids
+          changed_when: false
+          delegate_to: localhost
+
+        - name: Display instances found
+          debug:
+            msg: "{{ 'Found instances: ' + instance_ids.stdout if instance_ids.stdout | length > 0 else 'No instances found for cluster ' + cluster_name }}"
+
+        - name: Clean up UPI resources
+          block:
+            - name: Get Elastic IP allocations
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws ec2 describe-addresses \
+                  --filters "Name=instance-id,Values={{ instance_ids.stdout }}" \
+                  --region {{ aws_deploy_region }} \
+                  --query 'Addresses[*].AllocationId' \
+                  --output text
+              register: eip_allocations
+              changed_when: false
+              delegate_to: localhost
+
+            - name: Release Elastic IPs
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws ec2 release-address \
+                  --allocation-id {{ item }} \
+                  --region {{ aws_deploy_region }}
+              loop: "{{ eip_allocations.stdout.split() }}"
+              when: eip_allocations.stdout | length > 0
+              delegate_to: localhost
+
+            - name: Terminate EC2 instances
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws ec2 terminate-instances \
+                  --instance-ids {{ instance_ids.stdout }} \
+                  --region {{ aws_deploy_region }}
+              delegate_to: localhost
+
+            - name: Wait for instances to terminate
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws ec2 wait instance-terminated \
+                  --instance-ids {{ item }} \
+                  --region {{ aws_deploy_region }}
+              loop: "{{ instance_ids.stdout.split() }}"
+              delegate_to: localhost
+
+            - name: Delete imported EC2 key pair
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws ec2 delete-key-pair \
+                  --key-name "{{ cluster_name }}-key" \
+                  --region {{ aws_deploy_region }} 2>/dev/null || true
+              delegate_to: localhost
+
+            - name: Clean up installation directory
+              file:
+                path: "/tmp/ocp-install-{{ cluster_name }}"
+                state: absent
+              delegate_to: localhost
+
+            - name: Display UPI success
+              debug:
+                msg: |
+                  ============================================
+                  UPI Cluster Destroyed Successfully!
+                  ============================================
+                  Cluster: {{ cluster_name }}
+                  Region: {{ aws_deploy_region }}
+                  Instances Terminated: {{ instance_ids.stdout }}
+
+          when: instance_ids.stdout | length > 0
+      when: use_existing_vpc
+
+    # =========================================================================
+    # Always clean up Route53 DNS records (handles orphans from failed installs)
+    # =========================================================================
+    - name: Clean up Route53 DNS records
+      block:
+        - name: Get Route53 hosted zone ID for cleanup
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws route53 list-hosted-zones \
+              --query "HostedZones[?Name=='{{ cluster_base_domain }}.'].Id" \
+              --output text | cut -d'/' -f3
+          register: cleanup_hosted_zone_id
+          changed_when: false
+          delegate_to: localhost
+
+        - name: Get existing API record
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws route53 list-resource-record-sets \
+              --hosted-zone-id {{ cleanup_hosted_zone_id.stdout }} \
+              --query "ResourceRecordSets[?Name=='api.{{ cluster_name }}.{{ cluster_base_domain }}.']" \
+              --output json
+          register: cleanup_api_record
+          changed_when: false
+          delegate_to: localhost
+          when: cleanup_hosted_zone_id.stdout | length > 0
+
+        - name: Delete API A record
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id {{ cleanup_hosted_zone_id.stdout }} \
+              --change-batch '{
+                "Changes": [{
+                  "Action": "DELETE",
+                  "ResourceRecordSet": {{ cleanup_api_record.stdout | from_json | first | to_json }}
+                }]
+              }'
+          delegate_to: localhost
+          when:
+            - cleanup_hosted_zone_id.stdout | length > 0
+            - cleanup_api_record.stdout is defined
+            - (cleanup_api_record.stdout | from_json) | length > 0
+
+        - name: Get existing wildcard apps record
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws route53 list-resource-record-sets \
+              --hosted-zone-id {{ cleanup_hosted_zone_id.stdout }} \
+              --query "ResourceRecordSets[?Name=='\\052.apps.{{ cluster_name }}.{{ cluster_base_domain }}.']" \
+              --output json
+          register: cleanup_apps_record
+          changed_when: false
+          delegate_to: localhost
+          when: cleanup_hosted_zone_id.stdout | length > 0
+
+        - name: Delete wildcard apps A record
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id {{ cleanup_hosted_zone_id.stdout }} \
+              --change-batch '{
+                "Changes": [{
+                  "Action": "DELETE",
+                  "ResourceRecordSet": {{ cleanup_apps_record.stdout | from_json | first | to_json }}
+                }]
+              }'
+          delegate_to: localhost
+          when:
+            - cleanup_hosted_zone_id.stdout | length > 0
+            - cleanup_apps_record.stdout is defined
+            - (cleanup_apps_record.stdout | from_json) | length > 0
+
+        - name: Display DNS cleanup result
+          debug:
+            msg: "Cleaned up Route53 DNS records for {{ cluster_name }}.{{ cluster_base_domain }}"
+          when: >-
+            (cleanup_api_record.stdout is defined and (cleanup_api_record.stdout | from_json) | length > 0) or
+            (cleanup_apps_record.stdout is defined and (cleanup_apps_record.stdout | from_json) | length > 0)
+      when: cluster_base_domain is defined and cluster_base_domain != ""
+
+    # =========================================================================
+    # Clean up deploy artifacts (preserve destroy logs)
+    # =========================================================================
+    - name: Clean up deploy artifacts
+      file:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/{{ item }}"
+        state: absent
+      loop:
+        - metadata.json
+        - kubeconfig
+        - kubeadmin-password
+        - openshift_install.log
+      delegate_to: localhost

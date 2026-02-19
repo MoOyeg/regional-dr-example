@@ -1,0 +1,49 @@
+apiVersion: v1
+baseDomain: {{ cluster_base_domain }}
+compute:
+- name: worker
+  replicas: {{ worker_replicas }}
+{% if worker_replicas | int > 0 and worker_instance_type is defined %}
+  platform:
+    aws:
+      type: {{ worker_instance_type }}
+{% endif %}
+controlPlane:
+  name: master
+  replicas: {{ control_plane_replicas }}
+  platform:
+    aws:
+      type: {{ control_plane_instance_type }}
+metadata:
+  name: {{ cluster_name }}
+networking:
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  machineNetwork:
+  - cidr: 10.0.0.0/16
+  networkType: OVNKubernetes
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  aws:
+    region: {{ aws_deploy_region }}
+{% if not use_existing_vpc and aws_availability_zones is defined %}
+    availabilityZones:
+{% for zone in aws_availability_zones %}
+    - {{ zone }}
+{% endfor %}
+{% elif use_existing_vpc and aws_subnet_id is defined %}
+{% if aws_availability_zone is defined %}
+    availabilityZones:
+    - {{ aws_availability_zone }}
+{% endif %}
+    subnets:
+    - {{ aws_subnet_id }}
+{% endif %}
+{% if use_existing_vpc and control_plane_replicas | int == 1 and worker_replicas | int == 0 %}
+bootstrapInPlace:
+  installationDisk: /dev/xvda
+{% endif %}
+pullSecret: '{{ pull_secret_content.content | b64decode | trim }}'
+sshKey: '{{ ssh_key_content.content | b64decode | trim }}'

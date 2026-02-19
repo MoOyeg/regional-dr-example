@@ -1,0 +1,342 @@
+---
+# =============================================================================
+# Play 1: Install hub operators (ACM + ODF Multicluster Orchestrator)
+# =============================================================================
+- name: Install hub operators (ACM + ODF Multicluster Orchestrator)
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+  tasks:
+    # =========================================================================
+    # ACM (Advanced Cluster Management) Installation
+    # =========================================================================
+    - name: Create open-cluster-management namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: open-cluster-management
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ACM OperatorGroup
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: open-cluster-management
+          namespace: open-cluster-management
+        spec:
+          targetNamespaces:
+            - open-cluster-management
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ACM Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: advanced-cluster-management
+          namespace: open-cluster-management
+        spec:
+          channel: {{ acm_channel }}
+          installPlanApproval: Automatic
+          name: advanced-cluster-management
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ACM CRD to be available
+      shell: oc get crd multiclusterhubs.operator.open-cluster-management.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_crd_check
+      until: acm_crd_check.rc == 0
+      retries: 30
+      delay: 20
+
+    - name: Wait for ACM CSV to succeed
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      until: "'Succeeded' in acm_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    # =========================================================================
+    # MultiClusterHub
+    # =========================================================================
+    - name: Create MultiClusterHub CR
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operator.open-cluster-management.io/v1
+        kind: MultiClusterHub
+        metadata:
+          name: multiclusterhub
+          namespace: open-cluster-management
+        spec: {}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for MultiClusterHub to be Running
+      shell: |
+        oc get multiclusterhub multiclusterhub -n open-cluster-management \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mch_status
+      until: "'Running' in mch_status.stdout"
+      retries: 60
+      delay: 30
+
+    # =========================================================================
+    # ODF Multicluster Orchestrator
+    # =========================================================================
+    - name: Create ODF Multicluster Orchestrator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: odf-multicluster-orchestrator
+          namespace: openshift-operators
+        spec:
+          channel: {{ odf_channel }}
+          installPlanApproval: Automatic
+          name: odf-multicluster-orchestrator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ODF MCO CSV to succeed
+      shell: |
+        oc get csv -n openshift-operators \
+          -o jsonpath='{.items[?(@.spec.displayName=="ODF Multicluster Orchestrator")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mco_csv_status
+      until: "'Succeeded' in mco_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    - name: Display hub operator installation success
+      debug:
+        msg: |
+          ============================================
+          Hub Operators Installed Successfully!
+          ============================================
+          Cluster: {{ cluster_name }}
+          ACM: Installed ({{ acm_channel }})
+          MultiClusterHub: Running
+          ODF MCO: Installed ({{ odf_channel }})
+
+# =============================================================================
+# Play 2: Install spoke operators (OpenShift DR Cluster Operator)
+# =============================================================================
+- name: Install spoke operators (OpenShift DR Cluster Operator)
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-spoke clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'spoke'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+  tasks:
+    - name: Create openshift-dr-system namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: openshift-dr-system
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create DR Cluster OperatorGroup (AllNamespaces mode)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: openshift-dr-system-operatorgroup
+          namespace: openshift-dr-system
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create OpenShift DR Cluster Operator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: odr-cluster-operator
+          namespace: openshift-dr-system
+        spec:
+          channel: {{ odf_channel }}
+          installPlanApproval: Automatic
+          name: odr-cluster-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for DR Cluster Operator CSV to succeed
+      shell: |
+        oc get csv -n openshift-dr-system \
+          -o jsonpath='{.items[?(@.spec.displayName=="Openshift DR Cluster Operator")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: odr_csv_status
+      until: "'Succeeded' in odr_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    # =========================================================================
+    # OADP (OpenShift API for Data Protection)
+    # =========================================================================
+    - name: Create openshift-adp namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: openshift-adp
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create OADP OperatorGroup
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: openshift-adp-operatorgroup
+          namespace: openshift-adp
+        spec:
+          targetNamespaces:
+            - openshift-adp
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create OADP Operator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: redhat-oadp-operator
+          namespace: openshift-adp
+        spec:
+          channel: {{ oadp_channel }}
+          installPlanApproval: Automatic
+          name: redhat-oadp-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for OADP Operator CSV to succeed
+      shell: |
+        oc get csv -n openshift-adp \
+          -o jsonpath='{.items[?(@.spec.displayName=="OADP Operator")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_csv_status
+      until: "'Succeeded' in oadp_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    - name: Display spoke operator installation success
+      debug:
+        msg: |
+          ============================================
+          Spoke Operators Installed Successfully!
+          ============================================
+          Cluster: {{ cluster_name }}
+          OpenShift DR Cluster Operator: Installed ({{ odf_channel }})
+          OADP Operator: Installed ({{ oadp_channel }})

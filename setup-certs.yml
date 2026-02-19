@@ -1,0 +1,518 @@
+---
+# =============================================================================
+# Setup: Configure Let's Encrypt certificates via ACM Policy
+# =============================================================================
+# This playbook creates an ACM Policy on the hub cluster that pushes:
+# 1. cert-manager operator installation
+# 2. Route53 DNS-01 solver configuration with per-cluster AWS credentials
+# 3. Let's Encrypt wildcard certificate generation
+# 4. IngressController patching to use the certificate
+#
+# The Policy uses hub-side templates ({{hub fromConfigMap/fromSecret hub}})
+# to inject per-cluster values (base domain, Route53 zone, AWS creds).
+#
+# Prerequisites:
+# - ACM installed on hub (run ./ansible-runner.sh operators first)
+# - Spoke clusters imported (run ./ansible-runner.sh import first)
+# - AWS credentials with Route53 permissions
+# - acme_email set in inventory/group_vars/all.yml
+# =============================================================================
+
+- name: Configure Let's Encrypt certificates via ACM Policy
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "cert-manager-policy"
+    policy_namespace: "cert-manager-policy"
+    placement_name: "cert-manager-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate acme_email is configured
+      assert:
+        that:
+          - acme_email is defined
+          - acme_email != ""
+          - acme_email != "admin@example.com"
+        fail_msg: "acme_email is not set. Configure in inventory/group_vars/all.yml"
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Build list of all managed clusters (hub local-cluster + spokes)
+      set_fact:
+        all_managed_clusters: "{{ ['local-cluster'] + spoke_clusters }}"
+
+    - name: Display managed clusters for cert-manager
+      debug:
+        msg: "Configuring certificates for: {{ all_managed_clusters | join(', ') }}"
+
+  tasks:
+    # =========================================================================
+    # Query DNS info from all clusters
+    # =========================================================================
+    - name: Query base domain from each cluster
+      shell: |
+        oc get dns cluster -o jsonpath='{.spec.baseDomain}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: base_domain_results
+      changed_when: false
+      loop: "{{ [cluster_name] + spoke_clusters }}"
+
+    - name: Query Route53 hosted zone ID from each cluster
+      shell: |
+        oc get dns cluster -o jsonpath='{.spec.publicZone.id}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: zone_id_results
+      changed_when: false
+      loop: "{{ [cluster_name] + spoke_clusters }}"
+
+    - name: Query AWS region from each cluster
+      shell: |
+        oc get infrastructure cluster -o jsonpath='{.status.platformStatus.aws.region}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: region_results
+      changed_when: false
+      loop: "{{ [cluster_name] + spoke_clusters }}"
+
+    - name: Build cluster DNS info dictionary
+      set_fact:
+        cluster_dns_info: >-
+          {{ cluster_dns_info | default({}) | combine({
+            (item == cluster_name) | ternary('local-cluster', item): {
+              'base_domain': base_domain_results.results[idx].stdout,
+              'zone_id': zone_id_results.results[idx].stdout,
+              'region': region_results.results[idx].stdout
+            }
+          }) }}
+      loop: "{{ [cluster_name] + spoke_clusters }}"
+      loop_control:
+        index_var: idx
+
+    - name: Display cluster DNS info
+      debug:
+        msg: "{{ item.key }}: domain={{ item.value.base_domain }}, zone={{ item.value.zone_id }}, region={{ item.value.region }}"
+      loop: "{{ cluster_dns_info | dict2items }}"
+
+    # =========================================================================
+    # Create policy namespace and bind global ManagedClusterSet
+    # =========================================================================
+    - name: Create policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Bind global ManagedClusterSet to policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create hub-side ConfigMaps and Secrets in policy namespace
+    # (cluster-prefixed names so hub templates can look them up per cluster)
+    # =========================================================================
+    - name: Create cert-config ConfigMap per cluster in policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: cert-config-{{ item }}
+          namespace: {{ policy_namespace }}
+        data:
+          base-domain: "{{ cluster_dns_info[item].base_domain }}"
+          route53-zone-id: "{{ cluster_dns_info[item].zone_id }}"
+          aws-region: "{{ cluster_dns_info[item].region }}"
+          acme-email: "{{ acme_email }}"
+          acme-server: "{{ acme_server }}"
+          acme-issuer-name: "{{ acme_issuer_name }}"
+          cert-name: "{{ cert_name }}"
+          cert-secret-name: "{{ cert_secret_name }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+
+    - name: Look up AWS credentials for hub cluster
+      set_fact:
+        cert_aws_creds: >-
+          {{ cert_aws_creds | default([]) + [{
+            'cluster': item,
+            'access_key': lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)),
+            'secret_key': lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string))
+          }] }}
+      when: item == 'local-cluster'
+      loop: "{{ all_managed_clusters }}"
+      no_log: true
+
+    - name: Look up AWS credentials for spoke clusters
+      set_fact:
+        cert_aws_creds: >-
+          {{ cert_aws_creds | default([]) + [{
+            'cluster': item,
+            'access_key': lookup('env', 'AWS_ACCESS_KEY_ID_' + (hostvars[item]['aws_credential_set'] | string)),
+            'secret_key': lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (hostvars[item]['aws_credential_set'] | string))
+          }] }}
+      when: item != 'local-cluster'
+      loop: "{{ all_managed_clusters }}"
+      no_log: true
+
+    - name: Create cert-aws-creds Secret per cluster in policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: cert-aws-creds-{{ item.cluster }}
+          namespace: {{ policy_namespace }}
+        type: Opaque
+        stringData:
+          aws-access-key-id: "{{ item.access_key }}"
+          aws-secret-access-key: "{{ item.secret_key }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      no_log: true
+      loop: "{{ cert_aws_creds }}"
+
+    # =========================================================================
+    # Label local-cluster with cloud=Amazon for Placement matching
+    # =========================================================================
+    - name: Label local-cluster ManagedCluster with cloud=Amazon
+      shell: |
+        oc label managedcluster local-cluster cloud=Amazon --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    # =========================================================================
+    # Create Placement and PlacementBinding
+    # =========================================================================
+    - name: Create Placement for AWS clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    cloud: Amazon
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create PlacementBinding
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ placement_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create ACM Policy (1 OperatorPolicy + 3 ConfigurationPolicies)
+    # =========================================================================
+    - name: Create cert-manager ACM Policy
+      shell: |
+        oc apply -f - <<'POLICYEOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: Policy
+        metadata:
+          name: {{ policy_name }}
+          namespace: {{ policy_namespace }}
+          annotations:
+            policy.open-cluster-management.io/categories: CM Configuration Management
+            policy.open-cluster-management.io/standards: NIST SP 800-53
+            policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+        spec:
+          disabled: false
+          remediationAction: enforce
+          policy-templates:
+            # =================================================================
+            # 1. Install cert-manager operator (OperatorPolicy)
+            # =================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1beta1
+                kind: OperatorPolicy
+                metadata:
+                  name: cert-manager-operator-install
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  complianceType: musthave
+                  upgradeApproval: Automatic
+                  subscription:
+                    channel: {{ certmanager_channel }}
+                    name: openshift-cert-manager-operator
+                    source: redhat-operators
+                    sourceNamespace: openshift-marketplace
+            # =================================================================
+            # 2. Configure CertManager CR + AWS credentials
+            # =================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1beta1
+                  kind: OperatorPolicy
+                  name: cert-manager-operator-install
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: cert-manager-config
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: operator.openshift.io/v1alpha1
+                        kind: CertManager
+                        metadata:
+                          name: cluster
+                        spec:
+                          managementState: Managed
+                          unsupportedConfigOverrides:
+                            controller:
+                              args:
+                                - "--dns01-recursive-nameservers=8.8.8.8:53,1.1.1.1:53"
+                                - "--dns01-recursive-nameservers-only=true"
+                                - "--cluster-resource-namespace=kube-system"
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Secret
+                        metadata:
+                          name: aws-route53-credentials
+                          namespace: kube-system
+                        type: Opaque
+                        data:
+                          aws-access-key-id: '{% raw %}{{hub fromSecret "cert-manager-policy" (printf "cert-aws-creds-%s" .ManagedClusterName) "aws-access-key-id" hub}}{% endraw %}'
+                          aws-secret-access-key: '{% raw %}{{hub fromSecret "cert-manager-policy" (printf "cert-aws-creds-%s" .ManagedClusterName) "aws-secret-access-key" hub}}{% endraw %}'
+            # =================================================================
+            # 3. Create ClusterIssuer + Certificate
+            # =================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: cert-manager-config
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: cert-manager-issuer-and-cert
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: cert-manager.io/v1
+                        kind: ClusterIssuer
+                        metadata:
+                          name: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "acme-issuer-name" hub}}{% endraw %}'
+                        spec:
+                          acme:
+                            email: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "acme-email" hub}}{% endraw %}'
+                            server: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "acme-server" hub}}{% endraw %}'
+                            privateKeySecretRef:
+                              name: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "acme-issuer-name" hub}}{% endraw %}-account-key'
+                            solvers:
+                              - dns01:
+                                  route53:
+                                    region: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "aws-region" hub}}{% endraw %}'
+                                    hostedZoneID: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "route53-zone-id" hub}}{% endraw %}'
+                                    accessKeyIDSecretRef:
+                                      name: aws-route53-credentials
+                                      key: aws-access-key-id
+                                    secretAccessKeySecretRef:
+                                      name: aws-route53-credentials
+                                      key: aws-secret-access-key
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: cert-manager.io/v1
+                        kind: Certificate
+                        metadata:
+                          name: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "cert-name" hub}}{% endraw %}'
+                          namespace: openshift-ingress
+                        spec:
+                          secretName: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "cert-secret-name" hub}}{% endraw %}'
+                          issuerRef:
+                            kind: ClusterIssuer
+                            name: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "acme-issuer-name" hub}}{% endraw %}'
+                          commonName: '{% raw %}*.apps.{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "base-domain" hub}}{% endraw %}'
+                          dnsNames:
+                            - '{% raw %}*.apps.{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "base-domain" hub}}{% endraw %}'
+                          duration: 2160h
+                          renewBefore: 360h
+            # =================================================================
+            # 4. Patch IngressController with the certificate
+            # =================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: cert-manager-issuer-and-cert
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: cert-manager-ingress-patch
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: operator.openshift.io/v1
+                        kind: IngressController
+                        metadata:
+                          name: default
+                          namespace: openshift-ingress-operator
+                        spec:
+                          defaultCertificate:
+                            name: '{% raw %}{{hub fromConfigMap "cert-manager-policy" (printf "cert-config-%s" .ManagedClusterName) "cert-secret-name" hub}}{% endraw %}'
+        POLICYEOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Wait for policy compliance
+    # =========================================================================
+    - name: Wait for cert-manager policy to be Compliant
+      shell: |
+        oc get policy {{ policy_name }} -n {{ policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: policy_compliance
+      until: policy_compliance.stdout == "Compliant"
+      retries: 120
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display policy compliance status
+      debug:
+        msg: |
+          ============================================
+          cert-manager ACM Policy Status
+          ============================================
+          Policy: {{ policy_name }}
+          Namespace: {{ policy_namespace }}
+          Compliance: {{ policy_compliance.stdout | default('Unknown') }}
+          Managed Clusters: {{ all_managed_clusters | join(', ') }}
+          {% if policy_compliance.stdout == 'Compliant' %}
+          All clusters have:
+          - cert-manager operator installed
+          - Let's Encrypt ClusterIssuer configured
+          - Wildcard certificate generated
+          - IngressController patched
+          {% else %}
+          Policy is not yet fully compliant. Check status with:
+            oc get policy {{ policy_name }} -n {{ policy_namespace }} -o yaml
+          {% endif %}

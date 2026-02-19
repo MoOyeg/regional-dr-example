@@ -1,0 +1,44 @@
+# Artifacts directory - contains cluster credentials
+artifacts/
+
+# Installation temporary directories
+/tmp/ocp-install-*
+
+# Ansible retry files
+*.retry
+
+# Pull secret (sensitive)
+pull-secret.json
+
+# SSH keys (sensitive)
+ssh-key.pub
+ssh-key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Secrets
+secret.sh
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

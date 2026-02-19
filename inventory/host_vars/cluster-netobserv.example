@@ -1,0 +1,50 @@
+# Example NetObserv Cluster Configuration
+# Copy this file and customize for your NetObserv enabled cluster
+#
+# Usage:
+#   cp inventory/host_vars/cluster-netobserv.example inventory/host_vars/cluster-netobserv.yml
+#   Edit as needed
+#   Add "cluster-netobserv" to inventory/hosts
+#   Run: ./ansible-runner.sh netobserv
+
+---
+# Cluster identification
+cluster_name: "cluster-netobserv"
+
+# AWS configuration
+aws_credential_set: 1                 # Which credential set to use (1, 2, or 3)
+aws_region: "us-east-1"
+
+# Optional: Override instance type for NetObserv (needs more resources)
+# aws_instance_type: "m5.4xlarge"   # Larger instance for network monitoring
+
+# =========================================================================
+# NetObserv Configuration
+# =========================================================================
+netobserv: true                       # Enable NetObserv monitoring on this cluster
+
+# Optional: Customize operator channels
+# loki_channel: "stable"              # Loki operator channel (default: stable)
+# netobserv_channel: "stable"         # NetObserv operator channel (default: stable)
+
+# =========================================================================
+# Combined example with all options
+# =========================================================================
+# cluster_name: "cluster-netobserv-prod"
+# aws_credential_set: 1
+# aws_region: "us-west-2"
+# aws_instance_type: "m5.4xlarge"     # Larger for network traffic processing
+# netobserv: true
+# loki_channel: "stable"
+# netobserv_channel: "stable"
+
+# =========================================================================
+# Notes
+# =========================================================================
+# - netobserv: true triggers the netobserv command installation
+# - S3 bucket will be created automatically with name:
+#   netobserv-loki-<cluster-name>-<region>-<timestamp>
+# - Loki will be installed in openshift-logging namespace
+# - NetObserv FlowCollector will be installed in netobserv namespace
+# - eBPF agents will run on all cluster nodes
+# - Flows are collected and stored in S3-backed Loki

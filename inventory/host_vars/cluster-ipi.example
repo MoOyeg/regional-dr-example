@@ -1,0 +1,54 @@
+# OpenShift Cluster Configuration - IPI Mode Example
+# IPI (Installer Provisioned Infrastructure): OpenShift creates all AWS resources
+
+# Cluster identification
+cluster_name: cluster-us-east-1-ipi
+
+# Cluster role for DR operators (hub or spoke)
+# Set to 'hub' for the ACM management cluster
+# Defaults to 'spoke' from group_vars
+# cluster_role: hub
+
+# AWS Region
+aws_region: us-east-1
+
+# AWS Credential Set (1, 2, or 3)
+# Refers to AWS_ACCESS_KEY_ID_1, AWS_SECRET_ACCESS_KEY_1, AWS_REGION_1
+aws_credential_set: 1
+
+# Base Domain (Optional - auto-detected from Route53 if not specified)
+# If you have a Route53 hosted zone, this will be automatically detected
+# cluster_base_domain: example.com
+
+# OpenShift Version (Optional - defaults to 4.17)
+# openshift_version: "4.17"
+
+# Node topology (defaults: SNO with 1 master, 0 workers)
+# control_plane_replicas: 1
+# control_plane_instance_type: m5.2xlarge
+# worker_replicas: 0
+# worker_instance_type: m5.xlarge  # Only used when worker_replicas > 0
+
+# IPI MODE - NO VPC/SUBNET/AMI CONFIGURATION NEEDED!
+# When aws_vpc_id and aws_subnet_id are NOT specified, the playbook
+# automatically uses IPI mode where OpenShift installer creates:
+# - New VPC
+# - Public and private subnets
+# - Internet Gateway
+# - NAT Gateway(s)
+# - Route Tables
+# - Security Groups
+# - Load Balancers
+# - EC2 instances
+# - All required AWS resources
+
+# Route53 Configuration (Optional)
+# If you want automatic DNS record creation, set this to the hosted zone
+# aws_route53_zone: example.com
+
+# Deployment Notes:
+# 1. Simpler configuration - no need to pre-create infrastructure
+# 2. Ideal for testing, development, or DR scenarios
+# 3. Deployment time: ~45-60 minutes
+# 4. Clean destroy: openshift-install removes all created resources
+# 5. Required IAM permissions: EC2, VPC, ELB, Route53 full access

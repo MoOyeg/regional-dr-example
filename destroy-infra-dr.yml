@@ -1,0 +1,295 @@
+---
+# =============================================================================
+# Play 1: Remove user-ca-bundle from all clusters
+# =============================================================================
+- name: Remove user-ca-bundle SSL configuration from all clusters
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Remove trustedCA from proxy on hub cluster
+      shell: |
+        oc patch proxy cluster --type=merge \
+          --patch='{"spec":{"trustedCA":{"name":""}}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove trustedCA from proxy on spoke clusters
+      shell: |
+        oc patch proxy cluster --type=merge \
+          --patch='{"spec":{"trustedCA":{"name":""}}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Delete user-ca-bundle configmap from hub cluster
+      shell: |
+        oc delete configmap user-ca-bundle -n openshift-config --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete user-ca-bundle configmap from spoke clusters
+      shell: |
+        oc delete configmap user-ca-bundle -n openshift-config --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Display user-ca-bundle removal result
+      debug:
+        msg: "Removed user-ca-bundle and proxy trustedCA from all clusters"
+
+# =============================================================================
+# Play 2: Remove StorageCluster and ODF from spoke clusters
+# =============================================================================
+- name: Remove StorageCluster and ODF from spoke clusters
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-spoke clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'spoke'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Delete StorageCluster
+      shell: |
+        oc delete storagecluster ocs-storagecluster -n openshift-storage --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for StorageCluster removal
+      shell: |
+        oc get storagecluster ocs-storagecluster -n openshift-storage
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sc_check
+      until: sc_check.rc != 0
+      retries: 40
+      delay: 30
+      ignore_errors: true
+
+    - name: Remove ODF storage labels from worker nodes
+      shell: |
+        oc label nodes -l cluster.ocs.openshift.io/openshift-storage \
+          cluster.ocs.openshift.io/openshift-storage- --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete OCS Operator Subscription
+      shell: |
+        oc delete subscription ocs-operator -n openshift-storage --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete OCS ClusterServiceVersions
+      shell: |
+        oc delete csv -n openshift-storage -l operators.coreos.com/ocs-operator.openshift-storage --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ODF OperatorGroup
+      shell: |
+        oc delete operatorgroup openshift-storage-operatorgroup -n openshift-storage --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete openshift-storage namespace
+      shell: |
+        oc delete namespace openshift-storage --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display ODF removal result
+      debug:
+        msg: |
+          ============================================
+          ODF StorageCluster Removed
+          ============================================
+          Cluster: {{ cluster_name }}
+          Removed: StorageCluster, OCS Operator, openshift-storage namespace
+
+# =============================================================================
+# Play 2: Remove Submariner networking
+# =============================================================================
+- name: Remove Submariner networking
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Build list of all managed clusters
+      set_fact:
+        all_managed_clusters: "{{ ['local-cluster'] + spoke_clusters }}"
+
+  tasks:
+    - name: Delete Submariner ManagedClusterAddOn
+      shell: |
+        oc delete managedclusteraddon submariner -n {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Delete SubmarinerConfig
+      shell: |
+        oc delete submarinerconfig submariner -n {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Delete Submariner AWS credentials secrets
+      shell: |
+        oc delete secret {{ item }}-aws-creds -n {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Remove clusterset labels from managed clusters
+      shell: |
+        oc label managedcluster {{ item }} cluster.open-cluster-management.io/clusterset- --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Delete ManagedClusterSetBinding
+      shell: |
+        oc delete managedclustersetbinding {{ managed_cluster_set_name }} -n open-cluster-management --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete Submariner Broker
+      shell: |
+        oc delete broker submariner-broker -n {{ managed_cluster_set_name }}-broker --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete broker namespace
+      shell: |
+        oc delete namespace {{ managed_cluster_set_name }}-broker --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ManagedClusterSet
+      shell: |
+        oc delete managedclusterset {{ managed_cluster_set_name }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display Submariner removal result
+      debug:
+        msg: "Submariner networking and globalnet removed from cluster set {{ managed_cluster_set_name }}"

@@ -1,0 +1,821 @@
+---
+# =============================================================================
+# NetObserv Setup via ACM Policy
+# =============================================================================
+# This playbook creates an ACM Policy on the hub cluster that:
+# 1. Provisions S3 bucket for Loki storage (per-cluster)
+# 2. Installs Loki operator via OperatorPolicy
+# 3. Configures LokiStack with S3 backend
+# 4. Installs NetObserv operator via OperatorPolicy
+# 5. Creates FlowCollector to collect network traffic flows
+#
+# Prerequisites:
+# - ACM installed on hub (run ./ansible-runner.sh operators first)
+# - Spoke clusters imported (run ./ansible-runner.sh import first)
+# - AWS credentials with S3 permissions
+# - netobserv: true label in cluster inventory
+# =============================================================================
+
+- name: Configure NetObserv via ACM Policy
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "netobserv-policy"
+    policy_namespace: "netobserv-policy"
+    placement_name: "netobserv-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Build list of spoke clusters with netobserv enabled
+      set_fact:
+        netobserv_clusters: "{{ groups['openshift_clusters'] | 
+          map('extract', hostvars) | 
+          selectattr('netobserv', 'defined') | 
+          selectattr('netobserv', 'equalto', true) | 
+          map(attribute='cluster_name') | 
+          list }}"
+
+    - name: Display netobserv clusters
+      debug:
+        msg: "NetObserv will be configured on: {{ netobserv_clusters | join(', ') }}"
+
+    - name: End play if no clusters have netobserv enabled
+      meta: end_play
+      when: netobserv_clusters | length == 0
+
+  tasks:
+    # =========================================================================
+    # Label managed clusters for placement
+    # =========================================================================
+    - name: Label managed clusters with netobserv=true
+      shell: |
+        oc label managedcluster {{ item }} netobserv=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ netobserv_clusters }}"
+      changed_when: false
+
+    # =========================================================================
+    # Create policy namespace, ManagedClusterSetBinding, Placement, and PlacementBinding
+    # =========================================================================
+    - name: Create policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Bind global ManagedClusterSet to policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for netobserv clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    netobserv: "true"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create PlacementBinding
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ policy_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: |
+          Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig
+          Please deploy the cluster first: ./ansible-runner.sh deploy
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc whoami
+      delegate_to: localhost
+      changed_when: false
+      register: cluster_user
+      ignore_errors: true
+
+    - name: Fail if cluster not accessible
+      fail:
+        msg: "Cannot connect to cluster {{ cluster_name }}. Verify kubeconfig and cluster is running."
+      when: cluster_user.rc != 0
+
+    - name: Retrieve AWS credentials
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+
+    - name: Validate AWS credentials are available
+      assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: |
+          AWS credentials not found for credential set {{ aws_credential_set }}
+          Set: export AWS_ACCESS_KEY_ID_{{ aws_credential_set }}="..."
+               export AWS_SECRET_ACCESS_KEY_{{ aws_credential_set }}="..."
+
+    - name: Generate timestamp for S3 bucket name
+      shell: date +%s
+      delegate_to: localhost
+      register: timestamp_result
+      changed_when: false
+
+    - name: Set S3 bucket name
+      set_fact:
+        s3_bucket_name: "netobserv-loki-{{ cluster_name }}-{{ aws_deploy_region }}-{{ timestamp_result.stdout }}"
+        loki_storage_namespace: "openshift-logging"
+
+  tasks:
+    # =========================================================================
+    # Create S3 bucket for Loki backend
+    # =========================================================================
+    - name: Create S3 bucket for Loki storage
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api create-bucket \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          {% if aws_deploy_region != 'us-east-1' %}--create-bucket-configuration LocationConstraint={{ aws_deploy_region }}{% endif %} \
+          2>&1 || echo "Bucket may already exist"
+      delegate_to: localhost
+      register: s3_create_result
+      changed_when: "'created' in s3_create_result.stdout.lower() or 'success' in s3_create_result.stdout.lower()"
+
+    - name: Tag S3 bucket with cluster name
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api put-bucket-tagging \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          --tagging 'TagSet=[{Key=cluster,Value={{ cluster_name }}},{Key=managed-by,Value=netobserv}]'
+      delegate_to: localhost
+      register: tag_result
+      retries: 3
+      delay: 5
+
+    - name: Enable versioning on S3 bucket
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api put-bucket-versioning \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          --versioning-configuration Status=Enabled
+      delegate_to: localhost
+      register: versioning_result
+      retries: 3
+      delay: 5
+
+    - name: Save S3 bucket name to artifacts
+      copy:
+        content: "{{ s3_bucket_name }}"
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/s3-bucket-name"
+      delegate_to: localhost
+
+    - name: Display S3 bucket creation success
+      debug:
+        msg: |
+          ✓ S3 Bucket Created
+          Cluster: {{ cluster_name }}
+          Bucket: {{ s3_bucket_name }}
+          Region: {{ aws_deploy_region }}
+          Status: Ready for Loki
+
+# =============================================================================
+# Play 2: Install Loki Operator
+# =============================================================================
+- name: "Play 2: Install Loki operator"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    loki_namespace: "openshift-logging"
+
+  pre_tasks:
+    - name: Skip cluster if netobserv is not enabled
+      meta: end_host
+      when: netobserv is not defined or not netobserv | bool
+
+    - name: Verify kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Retrieve S3 bucket name
+      shell: cat {{ artifacts_dir }}/{{ cluster_name }}/s3-bucket-name
+      delegate_to: localhost
+      register: s3_bucket_result
+      changed_when: false
+
+    - name: Set S3 bucket fact
+      set_fact:
+        s3_bucket_name: "{{ s3_bucket_result.stdout }}"
+
+    # Check if ACM OperatorPolicy CRD is available
+    - name: Check for ACM OperatorPolicy CRD availability
+      shell: |
+        set -e
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        if oc api-resources 2>/dev/null | grep -q "operatorpolicies"; then
+          echo "available"
+        else
+          echo "unavailable"
+        fi
+      delegate_to: localhost
+      register: operatorpolicy_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set use_operatorpolicy flag
+      set_fact:
+        use_operatorpolicy: "{{ operatorpolicy_check.stdout | trim == 'available' }}"
+
+    - name: Display installation method and status
+      debug:
+        msg: |
+          Detection stdout: '{{ operatorpolicy_check.stdout | trim }}'
+          Detection rc: {{ operatorpolicy_check.rc }}
+          Use OperatorPolicy: {{ use_operatorpolicy }}
+          Installation Method: {% if use_operatorpolicy %}ACM OperatorPolicy{% else %}Direct Subscription (Fallback){% endif %}
+
+    - name: Retrieve AWS credentials
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+
+  tasks:
+    # =========================================================================
+    # Create logging namespace
+    # =========================================================================
+    - name: Create openshift-logging namespace
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ loki_namespace }}
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+
+    # =========================================================================
+    # Install Loki operator via ACM OperatorPolicy (if available) or direct Subscription
+    # =========================================================================
+    - name: Create OperatorPolicy for Loki operator
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: loki-operator-policy
+          namespace: {{ loki_namespace }}
+        spec:
+          remediationAction: enforce
+          severity: critical
+          complianceType: musthave
+          upgradeApproval: Automatic
+          operatorGroup:
+            name: openshift-logging
+            namespace: {{ loki_namespace }}
+            targetNamespaces:
+              - {{ loki_namespace }}
+          subscription:
+            name: loki-operator
+            namespace: {{ loki_namespace }}
+            channel: {{ loki_channel | default('stable') }}
+            installPlanApproval: Automatic
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+            package: loki-operator
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: use_operatorpolicy | bool
+
+    - name: Wait for Loki OperatorPolicy to be compliant
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get operatorpolicy loki-operator-policy -n {{ loki_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      delegate_to: localhost
+      register: loki_policy_status
+      until: loki_policy_status.stdout == "Compliant"
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: use_operatorpolicy | bool
+
+    # Fallback: Install via direct Subscription if OperatorPolicy not available
+    - name: Create OperatorGroup for Loki (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: openshift-logging
+          namespace: {{ loki_namespace }}
+        spec:
+          targetNamespaces:
+            - {{ loki_namespace }}
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not use_operatorpolicy | bool
+
+    - name: Create Subscription for Loki operator (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: loki-operator
+          namespace: {{ loki_namespace }}
+        spec:
+          channel: {{ loki_channel | default('stable') }}
+          installPlanApproval: Automatic
+          name: loki-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not use_operatorpolicy | bool
+
+    - name: Wait for Loki Subscription CSV (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get csv -n {{ loki_namespace }} -l operators.coreos.com/loki-operator.openshift-logging= \
+          -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound"
+      delegate_to: localhost
+      register: loki_csv_status
+      until: loki_csv_status.stdout == "Succeeded"
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: not use_operatorpolicy | bool
+
+    # =========================================================================
+    # Create S3 credentials secret
+    # =========================================================================
+    - name: Create S3 credentials secret for Loki
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc create secret generic loki-s3-credentials \
+          --from-literal=bucketname="{{ s3_bucket_name }}" \
+          --from-literal=endpoint="https://s3.{{ aws_deploy_region }}.amazonaws.com" \
+          --from-literal=access_key_id="{{ aws_access_key }}" \
+          --from-literal=access_key_secret="{{ aws_secret_key }}" \
+          --from-literal=region="{{ aws_deploy_region }}" \
+          -n {{ loki_namespace }} \
+          --dry-run=client -o yaml | oc apply -f -
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+
+    # =========================================================================
+    # Configure and deploy LokiStack
+    # =========================================================================
+    - name: Get default storage class
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get storageclass -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' | head -1
+      delegate_to: localhost
+      register: default_storage_class
+      changed_when: false
+
+    - name: Create LokiStack with S3 backend
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: loki.grafana.com/v1
+        kind: LokiStack
+        metadata:
+          name: loki
+          namespace: {{ loki_namespace }}
+        spec:
+          size: 1x.small
+          storage:
+            schemas:
+            - version: v12
+              from: 2024-01-01
+              store: tsdb
+              object_store: s3
+              index:
+                prefix: loki_index_
+                period: 24h
+            secret:
+              name: loki-s3-credentials
+              type: s3
+          tenants:
+            mode: openshift-logging
+          limits:
+            global:
+              retention:
+                days: 7
+          rules:
+            enabled: false
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+
+    - name: Wait for LokiStack to be ready
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get lokistack loki -n {{ loki_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: localhost
+      register: lokistack_ready
+      until: lokistack_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Display Loki installation success
+      debug:
+        msg: |
+          ✓ Loki Operator Installed
+          Cluster: {{ cluster_name }}
+          Namespace: {{ loki_namespace }}
+          Storage: S3 ({{ s3_bucket_name }})
+          Status: Ready
+
+# Play 3: Install NetObserv Operator and Configure FlowCollector
+# =============================================================================
+- name: "Play 3: Install NetObserv operator and configure FlowCollector"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    netobserv_namespace: "netobserv"
+    loki_namespace: "openshift-logging"
+
+  pre_tasks:
+    - name: Skip cluster if netobserv is not enabled
+      meta: end_host
+      when: netobserv is not defined or not netobserv | bool
+
+    - name: Verify kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    # Check if ACM OperatorPolicy CRD is available
+    - name: Check for ACM OperatorPolicy CRD availability
+      shell: |
+        set -e
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        if oc api-resources 2>/dev/null | grep -q "operatorpolicies"; then
+          echo "available"
+        else
+          echo "unavailable"
+        fi
+      delegate_to: localhost
+      register: operatorpolicy_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set use_operatorpolicy flag
+      set_fact:
+        use_operatorpolicy: "{{ operatorpolicy_check.stdout | trim == 'available' }}"
+
+  tasks:
+    # =========================================================================
+    # Create netobserv namespace
+    # =========================================================================
+    - name: Create netobserv namespace
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ netobserv_namespace }}
+          labels:
+            pod-security.kubernetes.io/enforce: restricted
+            pod-security.kubernetes.io/audit: restricted
+            pod-security.kubernetes.io/warn: restricted
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+
+    # =========================================================================
+    # Install NetObserv operator via ACM OperatorPolicy (if available) or direct Subscription
+    # =========================================================================
+    - name: Create OperatorPolicy for NetObserv operator
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: netobserv-operator-policy
+          namespace: {{ netobserv_namespace }}
+        spec:
+          remediationAction: enforce
+          severity: critical
+          complianceType: musthave
+          upgradeApproval: Automatic
+          operatorGroup:
+            name: netobserv-operator
+            namespace: {{ netobserv_namespace }}
+            targetNamespaces:
+              - {{ netobserv_namespace }}
+          subscription:
+            name: netobserv-operator
+            namespace: {{ netobserv_namespace }}
+            channel: {{ netobserv_channel | default('stable') }}
+            installPlanApproval: Automatic
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+            package: netobserv-operator
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: use_operatorpolicy | bool
+
+    - name: Wait for NetObserv OperatorPolicy to be compliant
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get operatorpolicy netobserv-operator-policy -n {{ netobserv_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      delegate_to: localhost
+      register: netobserv_policy_status
+      until: netobserv_policy_status.stdout == "Compliant"
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: use_operatorpolicy | bool
+
+    # Fallback: Install via direct Subscription if OperatorPolicy not available
+    - name: Create OperatorGroup for NetObserv (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: netobserv-operator
+          namespace: {{ netobserv_namespace }}
+        spec:
+          targetNamespaces:
+            - {{ netobserv_namespace }}
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not use_operatorpolicy | bool
+
+    - name: Create Subscription for NetObserv operator (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: netobserv-operator
+          namespace: {{ netobserv_namespace }}
+        spec:
+          channel: {{ netobserv_channel | default('stable') }}
+          installPlanApproval: Automatic
+          name: netobserv-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not use_operatorpolicy | bool
+
+    - name: Wait for NetObserv Subscription CSV (direct installation fallback)
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get csv -n {{ netobserv_namespace }} -l operators.coreos.com/netobserv-operator.netobserv= \
+          -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound"
+      delegate_to: localhost
+      register: netobserv_csv_status
+      until: netobserv_csv_status.stdout == "Succeeded"
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: not use_operatorpolicy | bool
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    # =========================================================================
+    # Create FlowCollector with Loki backend
+    # =========================================================================
+    - name: Create FlowCollector for network traffic collection
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc apply -f - <<'EOF'
+        apiVersion: flows.netobserv.io/v1beta1
+        kind: FlowCollector
+        metadata:
+          name: cluster
+          namespace: {{ netobserv_namespace }}
+        spec:
+          agent:
+            type: eBPF
+            ebpf:
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 50Mi
+                limits:
+                  cpu: 500m
+                  memory: 500Mi
+            ipfix:
+              cacheMaxFlows: 400
+              cacheFlushInterval: 20s
+              sampling: 400
+              logLevel: info
+          processor:
+            logLevel: info
+            resources:
+              requests:
+                cpu: 100m
+                memory: 100Mi
+              limits:
+                cpu: 1000m
+                memory: 800Mi
+          loki:
+            url: "http://loki-distributor-http.{{ loki_namespace }}.svc.cluster.local:3100/"
+            statusUrl: "http://loki-querier-http.{{ loki_namespace }}.svc.cluster.local:3100/"
+            authToken: disabled
+            tenantID: netobserv
+            tls:
+              enable: false
+          deploymentModel: Direct
+          exporters:
+            - type: loki
+          logLevel: info
+        EOF
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+
+    - name: Wait for FlowCollector to be ready
+      shell: |
+        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+        oc get flowcollector cluster -n {{ netobserv_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: localhost
+      register: flowcollector_ready
+      until: flowcollector_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Display NetObserv installation success
+      debug:
+        msg: |
+          ✓ NetObserv Installed Successfully
+          Cluster: {{ cluster_name }}
+          Namespace: {{ netobserv_namespace }}
+          Loki Backend: openshift-logging/loki
+          Network Flow Collection: Enabled (eBPF)
+          Status: Ready
+          
+          Access NetObserv Console:
+            oc port-forward -n {{ netobserv_namespace }} svc/netobserv-ui 3000:3000
+            Open http://localhost:3000
+
+    - name: Display final configuration
+      debug:
+        msg: |
+          ============================================
+          NetObserv Network Traffic Analysis Ready!
+          ============================================
+          Cluster: {{ cluster_name }}
+          
+          Components:
+          ✓ Loki operator - For log storage with S3 backend
+          ✓ NetObserv operator - For network flow collection
+          ✓ FlowCollector - Using eBPF agent
+          ✓ S3 bucket - {{ s3_bucket_name }}
+          
+          View collected flows:
+            oc exec -it -n {{ netobserv_namespace }} <pod> -- \
+              loki-logcli query '{job="netobserv-flows"}'

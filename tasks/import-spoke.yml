@@ -1,0 +1,98 @@
+---
+# Included from setup-operators.yml Play 3
+# Loop variable: spoke_name (inventory hostname of the spoke cluster)
+# Runs on the hub cluster with hub's KUBECONFIG
+
+- name: Read spoke kubeconfig for {{ spoke_name }}
+  slurp:
+    src: "{{ artifacts_dir }}/{{ spoke_name }}/kubeconfig"
+  register: spoke_kubeconfig
+  delegate_to: localhost
+
+- name: Create namespace for {{ spoke_name }} on hub
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: {{ spoke_name }}
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Create ManagedCluster for {{ spoke_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    metadata:
+      name: {{ spoke_name }}
+      labels:
+        cloud: Amazon
+        vendor: OpenShift
+    spec:
+      hubAcceptsClient: true
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Create KlusterletAddonConfig for {{ spoke_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: agent.open-cluster-management.io/v1
+    kind: KlusterletAddonConfig
+    metadata:
+      name: {{ spoke_name }}
+      namespace: {{ spoke_name }}
+    spec:
+      clusterName: {{ spoke_name }}
+      clusterNamespace: {{ spoke_name }}
+      applicationManager:
+        enabled: true
+      certPolicyController:
+        enabled: true
+      iamPolicyController:
+        enabled: true
+      policyController:
+        enabled: true
+      searchCollector:
+        enabled: true
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Create auto-import secret for {{ spoke_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: auto-import-secret
+      namespace: {{ spoke_name }}
+    stringData:
+      autoImportRetry: "5"
+      kubeconfig: |
+        {{ spoke_kubeconfig.content | b64decode | indent(4) }}
+    type: Opaque
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Wait for {{ spoke_name }} to join ACM hub
+  shell: |
+    oc get managedcluster {{ spoke_name }} -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterJoined")].status}'
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  register: mc_joined
+  until: "'True' in mc_joined.stdout"
+  retries: 40
+  delay: 30
+
+- name: "{{ spoke_name }} imported into ACM hub"
+  debug:
+    msg: "Spoke cluster {{ spoke_name }} joined ACM hub successfully"

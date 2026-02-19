@@ -1,0 +1,94 @@
+---
+# =============================================================================
+# Detach spoke clusters from ACM hub
+# =============================================================================
+- name: Detach spoke clusters from ACM hub
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Delete auto-import secret for spoke
+      shell: |
+        oc delete secret auto-import-secret -n {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Delete KlusterletAddonConfig for spoke
+      shell: |
+        oc delete klusterletaddonconfig {{ item }} -n {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Delete ManagedCluster for spoke
+      shell: |
+        oc delete managedcluster {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Wait for spoke klusterlet cleanup
+      shell: |
+        oc get managedcluster {{ item }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mc_check
+      until: mc_check.rc != 0
+      retries: 20
+      delay: 15
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Delete spoke namespaces on hub
+      shell: |
+        oc delete namespace {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Display spoke detach result
+      debug:
+        msg: "Spoke clusters detached from ACM: {{ spoke_clusters | join(', ') }}"

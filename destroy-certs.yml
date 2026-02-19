@@ -1,0 +1,225 @@
+---
+# =============================================================================
+# Play 1: Remove ACM Policy and hub-side resources (hub-only)
+# =============================================================================
+- name: Remove cert-manager ACM Policy and hub resources
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "cert-manager-policy"
+    policy_namespace: "cert-manager-policy"
+    placement_name: "cert-manager-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Build list of all managed clusters
+      set_fact:
+        all_managed_clusters: "{{ ['local-cluster'] + spoke_clusters }}"
+
+  tasks:
+    - name: Delete policy namespace (includes Policy, Placement, Binding, ManagedClusterSetBinding)
+      shell: |
+        oc delete namespace {{ policy_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display hub cleanup result
+      debug:
+        msg: |
+          ACM Policy namespace deleted: {{ policy_namespace }}
+          (includes Policy, Placement, PlacementBinding, ConfigMaps, Secrets)
+
+# =============================================================================
+# Play 2: Direct per-cluster cleanup of cert-manager resources
+# =============================================================================
+- name: Remove cert-manager resources from all clusters
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Restore default IngressController certificate
+    # =========================================================================
+    - name: Remove custom certificate from IngressController
+      shell: |
+        oc patch ingresscontroller default -n openshift-ingress-operator \
+          --type=json -p='[{"op": "remove", "path": "/spec/defaultCertificate"}]'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete Certificate and TLS secret from openshift-ingress
+    # =========================================================================
+    - name: Delete Certificate from openshift-ingress
+      shell: |
+        oc delete certificate {{ cert_name }} -n openshift-ingress --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete TLS secret from openshift-ingress
+      shell: |
+        oc delete secret {{ cert_secret_name }} -n openshift-ingress --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Legacy cleanup: Certificate and secret from kube-system
+    # =========================================================================
+    - name: Delete Certificate from kube-system (legacy)
+      shell: |
+        oc delete certificate {{ cert_name }} -n kube-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete TLS secret from kube-system (legacy)
+      shell: |
+        oc delete secret {{ cert_secret_name }} -n kube-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete ClusterIssuer and ACME account key
+    # =========================================================================
+    - name: Delete ClusterIssuer
+      shell: |
+        oc delete clusterissuer {{ acme_issuer_name }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ACME account key secret
+      shell: |
+        oc delete secret {{ acme_issuer_name }}-account-key -n kube-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete AWS credentials secret from kube-system
+    # =========================================================================
+    - name: Delete AWS credentials secret from kube-system
+      shell: |
+        oc delete secret aws-route53-credentials -n kube-system --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Reset CertManager CR to default configuration
+    # =========================================================================
+    - name: Reset CertManager CR to default
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operator.openshift.io/v1alpha1
+        kind: CertManager
+        metadata:
+          name: cluster
+        spec:
+          managementState: Managed
+          unsupportedConfigOverrides: null
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove cert-manager operator
+    # =========================================================================
+    - name: Delete cert-manager Subscription
+      shell: |
+        oc delete subscription openshift-cert-manager-operator \
+          -n openshift-cert-manager-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete cert-manager ClusterServiceVersions
+      shell: |
+        oc delete csv -n openshift-cert-manager-operator \
+          -l operators.coreos.com/openshift-cert-manager-operator.openshift-cert-manager-operator \
+          --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete cert-manager OperatorGroup
+      shell: |
+        oc delete operatorgroup openshift-cert-manager-operator \
+          -n openshift-cert-manager-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display certificate removal result
+      debug:
+        msg: |
+          ============================================
+          Certificates and cert-manager Removed
+          ============================================
+          Cluster: {{ cluster_name }}
+          Removed: IngressController patch, TLS secrets, Certificate,
+                   ClusterIssuer, AWS credentials, cert-manager operator
+          IngressController: Restored to default certificate

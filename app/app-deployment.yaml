@@ -1,0 +1,98 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quarkus-mysql-app
+  namespace: quarkus-web-app
+  labels:
+    app: quarkus-mysql-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quarkus-mysql-app
+  template:
+    metadata:
+      labels:
+        app: quarkus-mysql-app
+    spec:
+      containers:
+      - name: quarkus-mysql-app
+        image: quay.io/mooyeg/quarkus-app:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: DB_HOST
+          value: mysql
+        - name: DB_PORT
+          value: "3306"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: database-user
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: database-password
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: database-name
+        livenessProbe:
+          httpGet:
+            path: /q/health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /q/health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          limits:
+            memory: 512Mi
+            cpu: 500m
+          requests:
+            memory: 256Mi
+            cpu: 250m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quarkus-mysql-app
+  namespace: quarkus-web-app
+  labels:
+    app: quarkus-mysql-app
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: quarkus-mysql-app
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: quarkus-mysql-app
+  namespace: quarkus-web-app
+  labels:
+    app: quarkus-mysql-app
+spec:
+  to:
+    kind: Service
+    name: quarkus-mysql-app
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

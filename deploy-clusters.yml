@@ -1,0 +1,720 @@
+---
+- name: Deploy OpenShift Clusters on AWS
+  hosts: openshift_clusters
+  gather_facts: false
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+  
+  pre_tasks:
+    - name: Determine deployment mode
+      set_fact:
+        use_existing_vpc: "{{ (aws_vpc_id is defined and aws_vpc_id != '') and (aws_subnet_id is defined and aws_subnet_id != '') }}"
+    
+    - name: Display deployment mode
+      debug:
+        msg: "Deployment mode: {{ 'Using existing VPC/Subnet' if use_existing_vpc else 'OpenShift installer will create VPC/Subnet' }}"
+    
+    - name: Validate required variables for existing VPC mode
+      assert:
+        that:
+          - cluster_name is defined
+          - aws_credential_set is defined
+          - aws_region is defined
+          - aws_instance_type is defined
+          - aws_ami_id is defined
+          - aws_security_group_id is defined
+        fail_msg: "Missing required variables for cluster {{ cluster_name }}"
+      when: use_existing_vpc
+    
+    - name: Validate required variables for IPI mode
+      assert:
+        that:
+          - cluster_name is defined
+          - aws_credential_set is defined
+          - aws_region is defined
+        fail_msg: "Missing required variables for cluster {{ cluster_name }}"
+      when: not use_existing_vpc
+    
+    - name: Set AWS credentials based on credential set
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+    
+    - name: Validate AWS credentials are set
+      assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: "AWS credentials not found for credential set {{ aws_credential_set }}"
+
+    - name: Use explicit availability zone when set (IPI mode)
+      set_fact:
+        aws_availability_zones: ["{{ aws_availability_zone }}"]
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is defined
+
+    - name: Look up availability zones for region (IPI mode)
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws ec2 describe-availability-zones \
+          --region {{ aws_deploy_region }} \
+          --filters "Name=state,Values=available" \
+          --query 'AvailabilityZones[*].ZoneName' \
+          --output json
+      register: az_lookup_result
+      changed_when: false
+      delegate_to: localhost
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is not defined
+
+    - name: Set availability zones based on aws_zone_count
+      set_fact:
+        aws_availability_zones: "{{ (az_lookup_result.stdout | from_json)[:aws_zone_count | int] }}"
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is not defined
+        - az_lookup_result.stdout is defined
+
+    - name: Display selected availability zones
+      debug:
+        msg: "Selected {{ aws_availability_zones | length }} zone(s): {{ aws_availability_zones | join(', ') }}"
+      when: aws_availability_zones is defined
+
+    - name: Get first Route53 hosted zone if cluster_base_domain not provided
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws route53 list-hosted-zones \
+          --query 'HostedZones[0].Name' \
+          --output text | sed 's/\.$//'
+      register: route53_zone_result
+      changed_when: false
+      delegate_to: localhost
+      when: cluster_base_domain is not defined or cluster_base_domain == ""
+    
+    - name: Set cluster_base_domain from Route53
+      set_fact:
+        cluster_base_domain: "{{ route53_zone_result.stdout }}"
+      when: 
+        - cluster_base_domain is not defined or cluster_base_domain == ""
+        - route53_zone_result.stdout is defined
+        - route53_zone_result.stdout | length > 0
+    
+    - name: Fail if no cluster_base_domain found
+      fail:
+        msg: "cluster_base_domain is not defined and no Route53 hosted zones found in AWS account"
+      when: cluster_base_domain is not defined or cluster_base_domain == ""
+    
+    - name: Display cluster deployment information
+      debug:
+        msg: |
+          Deploying cluster: {{ cluster_name }}
+          Region: {{ aws_region }}
+          Credential Set: {{ aws_credential_set }}
+          Base Domain: {{ cluster_base_domain }}
+          {{ '(auto-detected from Route53)' if route53_zone_result.stdout is defined else '' }}
+    
+    - name: Create artifacts directory
+      file:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+  
+  tasks:
+    - name: Validate AWS credentials
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws sts get-caller-identity --region {{ aws_deploy_region }}
+      register: aws_validate
+      changed_when: false
+      delegate_to: localhost
+    
+    - name: Display AWS account info
+      debug:
+        msg: "Using AWS Account: {{ (aws_validate.stdout | from_json).Account }}"
+    
+    - name: Check if pull secret exists
+      stat:
+        path: "{{ playbook_dir }}/pull-secret.json"
+      register: pull_secret_stat
+      delegate_to: localhost
+    
+    - name: Fail if pull secret is missing
+      fail:
+        msg: "pull-secret.json not found. Download from https://console.redhat.com/openshift/install/pull-secret"
+      when: not pull_secret_stat.stat.exists
+    
+    - name: Check if SSH public key exists
+      stat:
+        path: "{{ playbook_dir }}/ssh-key.pub"
+      register: ssh_key_stat
+      delegate_to: localhost
+    
+    - name: Fail if SSH key is missing
+      fail:
+        msg: "ssh-key.pub not found. Generate with: ssh-keygen -t rsa -b 4096"
+      when: not ssh_key_stat.stat.exists
+    
+    - name: Load pull secret
+      slurp:
+        src: "{{ playbook_dir }}/pull-secret.json"
+      register: pull_secret_content
+      delegate_to: localhost
+    
+    - name: Load SSH public key
+      slurp:
+        src: "{{ playbook_dir }}/ssh-key.pub"
+      register: ssh_key_content
+      delegate_to: localhost
+
+    - name: Import local SSH key as EC2 key pair
+      block:
+        - name: Check if EC2 key pair already exists
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 describe-key-pairs \
+              --key-names "{{ cluster_name }}-key" \
+              --region {{ aws_deploy_region }} \
+              --query 'KeyPairs[0].KeyName' \
+              --output text 2>/dev/null || echo ""
+          register: existing_key_pair
+          changed_when: false
+          delegate_to: localhost
+
+        - name: Import SSH public key to EC2
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 import-key-pair \
+              --key-name "{{ cluster_name }}-key" \
+              --public-key-material fileb://{{ playbook_dir }}/ssh-key.pub \
+              --region {{ aws_deploy_region }} \
+              --tag-specifications 'ResourceType=key-pair,Tags=[
+                {Key=cluster,Value={{ cluster_name }}},
+                {Key=managed-by,Value=ansible}
+              ]' \
+              --output json
+          register: imported_key_pair
+          delegate_to: localhost
+          when: existing_key_pair.stdout == "" or existing_key_pair.stdout == "None"
+
+        - name: Set aws_key_name from imported key pair
+          set_fact:
+            aws_key_name: "{{ cluster_name }}-key"
+            aws_key_imported: true
+      when:
+        - use_existing_vpc
+        - aws_key_name is not defined or aws_key_name == ""
+
+    - name: Set key import tracking for pre-existing key
+      set_fact:
+        aws_key_imported: false
+      when: aws_key_imported is not defined
+
+    - name: Validate RHCOS AMI exists
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws ec2 describe-images \
+          --image-ids {{ aws_ami_id }} \
+          --region {{ aws_deploy_region }} \
+          --query 'Images[0].ImageId' \
+          --output text
+      register: ami_check
+      changed_when: false
+      delegate_to: localhost
+      when: use_existing_vpc and aws_ami_id is defined
+    
+    - name: Validate VPC exists
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws ec2 describe-vpcs \
+          --vpc-ids {{ aws_vpc_id }} \
+          --region {{ aws_deploy_region }} \
+          --query 'Vpcs[0].VpcId' \
+          --output text
+      register: vpc_check
+      changed_when: false
+      delegate_to: localhost
+      when: use_existing_vpc
+    
+    - name: Create installation directory
+      file:
+        path: "/tmp/ocp-install-{{ cluster_name }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+    
+    - name: Generate install-config.yaml
+      template:
+        src: templates/install-config.yaml.j2
+        dest: "/tmp/ocp-install-{{ cluster_name }}/install-config.yaml"
+        mode: '0644'
+      delegate_to: localhost
+    
+    - name: Backup install-config.yaml
+      copy:
+        src: "/tmp/ocp-install-{{ cluster_name }}/install-config.yaml"
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/install-config.yaml"
+        mode: '0644'
+      delegate_to: localhost
+    
+    - name: Create ignition files (UPI mode only)
+      shell: |
+        openshift-install create single-node-ignition-config \
+          --dir /tmp/ocp-install-{{ cluster_name }}
+      args:
+        creates: "/tmp/ocp-install-{{ cluster_name }}/bootstrap-in-place-for-live-iso.ign"
+      delegate_to: localhost
+      when: use_existing_vpc
+
+    - name: Read ignition config
+      slurp:
+        src: "/tmp/ocp-install-{{ cluster_name }}/bootstrap-in-place-for-live-iso.ign"
+      register: ignition_config
+      delegate_to: localhost
+      when: use_existing_vpc
+
+    - name: Create EC2 user data from ignition
+      copy:
+        content: |
+          {
+            "ignition": {{ ignition_config.content | b64decode | from_json | to_json }}
+          }
+        dest: "/tmp/ocp-install-{{ cluster_name }}/user-data.json"
+        mode: '0644'
+      delegate_to: localhost
+      when: use_existing_vpc
+    
+    - name: Check if cluster already exists
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values={{ cluster_name }}" \
+                    "Name=instance-state-name,Values=running,pending,stopped,stopping" \
+          --region {{ aws_deploy_region }} \
+          --query 'Reservations[*].Instances[*].InstanceId' \
+          --output text
+      register: existing_instances
+      changed_when: false
+      delegate_to: localhost
+      when: use_existing_vpc
+    
+    - name: Check if IPI cluster already exists
+      stat:
+        path: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+      register: existing_ipi_cluster
+      delegate_to: localhost
+      when: not use_existing_vpc
+    
+    - name: Skip deployment if cluster exists
+      debug:
+        msg: "Cluster {{ cluster_name }} already exists"
+      when: (use_existing_vpc and existing_instances.stdout | length > 0) or (not use_existing_vpc and existing_ipi_cluster.stat.exists)
+    
+    # UPI Mode: Manual EC2 instance creation with existing VPC
+    - block:
+        - name: Create EC2 instance for OpenShift
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 run-instances \
+              --image-id {{ aws_ami_id }} \
+              --instance-type {{ aws_instance_type }} \
+              {{ '--key-name ' + aws_key_name if aws_key_name is defined and aws_key_name != '' else '' }} \
+              --subnet-id {{ aws_subnet_id }} \
+              --security-group-ids {{ aws_security_group_id }} \
+              --block-device-mappings '[
+                {
+                  "DeviceName": "/dev/xvda",
+                  "Ebs": {
+                    "VolumeSize": {{ aws_root_volume_size | default(120) }},
+                    "VolumeType": "gp3",
+                    "DeleteOnTermination": true
+                  }
+                }
+              ]' \
+              --user-data file:///tmp/ocp-install-{{ cluster_name }}/user-data.json \
+              --tag-specifications 'ResourceType=instance,Tags=[
+                {Key=Name,Value={{ cluster_name }}},
+                {Key=cluster,Value={{ cluster_name }}},
+                {Key=region,Value={{ aws_deploy_region }}},
+                {Key=openshift-version,Value={{ openshift_version | default("4.17") }}},
+                {Key=managed-by,Value=ansible}
+              ]' \
+              --region {{ aws_deploy_region }} \
+              --output json
+          register: ec2_instance_result
+          delegate_to: localhost
+        
+        - name: Parse instance ID
+          set_fact:
+            instance_id: "{{ (ec2_instance_result.stdout | from_json).Instances[0].InstanceId }}"
+        
+        - name: Save instance ID
+          copy:
+            content: "{{ instance_id }}"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/instance-id.txt"
+            mode: '0644'
+          delegate_to: localhost
+        
+        - name: Wait for instance to be running
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 wait instance-running \
+              --instance-ids {{ instance_id }} \
+              --region {{ aws_deploy_region }}
+          delegate_to: localhost
+        
+        - name: Allocate Elastic IP
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 allocate-address \
+              --domain vpc \
+              --region {{ aws_deploy_region }} \
+              --output json
+          register: eip_result
+          when: aws_create_eip | default(true) | bool
+          delegate_to: localhost
+        
+        - name: Associate Elastic IP
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 associate-address \
+              --instance-id {{ instance_id }} \
+              --allocation-id {{ (eip_result.stdout | from_json).AllocationId }} \
+              --region {{ aws_deploy_region }}
+          when: aws_create_eip | default(true) | bool
+          delegate_to: localhost
+        
+        - name: Get instance public IP
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 describe-instances \
+              --instance-ids {{ instance_id }} \
+              --region {{ aws_deploy_region }} \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text
+          register: instance_ip
+          delegate_to: localhost
+        
+        - name: Display deployment information
+          debug:
+            msg: |
+              Cluster deployment started:
+              - Name: {{ cluster_name }}
+              - Instance ID: {{ instance_id }}
+              - Public IP: {{ instance_ip.stdout }}
+              - Region: {{ aws_deploy_region }}
+              - API URL: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+        
+        - name: Create Route53 DNS records
+          block:
+            - name: Get Route53 hosted zone ID
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws route53 list-hosted-zones \
+                  --query "HostedZones[?Name=='{{ cluster_base_domain }}.'].Id" \
+                  --output text | cut -d'/' -f3
+              register: hosted_zone_id
+              delegate_to: localhost
+            
+            - name: Create API A record
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws route53 change-resource-record-sets \
+                  --hosted-zone-id {{ hosted_zone_id.stdout }} \
+                  --change-batch '{
+                    "Changes": [{
+                      "Action": "UPSERT",
+                      "ResourceRecordSet": {
+                        "Name": "api.{{ cluster_name }}.{{ cluster_base_domain }}",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "{{ instance_ip.stdout }}"}]
+                      }
+                    }]
+                  }'
+              delegate_to: localhost
+            
+            - name: Create wildcard apps A record
+              shell: |
+                AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+                AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+                aws route53 change-resource-record-sets \
+                  --hosted-zone-id {{ hosted_zone_id.stdout }} \
+                  --change-batch '{
+                    "Changes": [{
+                      "Action": "UPSERT",
+                      "ResourceRecordSet": {
+                        "Name": "*.apps.{{ cluster_name }}.{{ cluster_base_domain }}",
+                        "Type": "A",
+                        "TTL": 300,
+                        "ResourceRecords": [{"Value": "{{ instance_ip.stdout }}"}]
+                      }
+                    }]
+                  }'
+              delegate_to: localhost
+          when: aws_route53_zone is defined
+        
+        - name: Wait for OpenShift API to be available
+          uri:
+            url: "https://{{ instance_ip.stdout }}:6443/healthz"
+            validate_certs: no
+            status_code: 200
+          register: api_health
+          until: api_health.status == 200
+          retries: 60
+          delay: 30
+          delegate_to: localhost
+        
+        - name: Wait for bootstrap complete
+          shell: |
+            openshift-install wait-for bootstrap-complete \
+              --dir /tmp/ocp-install-{{ cluster_name }} \
+              --log-level debug
+          register: bootstrap_result
+          delegate_to: localhost
+        
+        - name: Wait for installation complete
+          shell: |
+            openshift-install wait-for install-complete \
+              --dir /tmp/ocp-install-{{ cluster_name }} \
+              --log-level debug
+          register: install_result
+          delegate_to: localhost
+        
+        - name: Copy kubeconfig to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/auth/kubeconfig"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+            mode: '0600'
+          delegate_to: localhost
+        
+        - name: Copy kubeadmin password to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/auth/kubeadmin-password"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/kubeadmin-password"
+            mode: '0600'
+          delegate_to: localhost
+        
+        - name: Create cluster info file
+          copy:
+            content: |
+              Cluster Name: {{ cluster_name }}
+              Base Domain: {{ cluster_base_domain }}
+              Region: {{ aws_deploy_region }}
+              Instance ID: {{ instance_id }}
+              Public IP: {{ instance_ip.stdout }}
+              API URL: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+              Console URL: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+              Username: kubeadmin
+              Password: See kubeadmin-password file
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/cluster-info.txt"
+            mode: '0644'
+          delegate_to: localhost
+        
+        - name: Display success message
+          debug:
+            msg: |
+              ============================================
+              OpenShift Cluster Deployed Successfully!
+              ============================================
+              Cluster: {{ cluster_name }}
+              Region: {{ aws_deploy_region }}
+              
+              Credentials saved to: {{ artifacts_dir }}/{{ cluster_name }}/
+              
+              Access your cluster:
+              export KUBECONFIG={{ artifacts_dir }}/{{ cluster_name }}/kubeconfig
+              oc get nodes
+              
+              Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+              Username: kubeadmin
+              Password: cat {{ artifacts_dir }}/{{ cluster_name }}/kubeadmin-password
+      
+      when: use_existing_vpc and existing_instances.stdout | length == 0
+    
+    # IPI Mode: Let OpenShift installer create VPC, subnet, and all infrastructure
+    - block:
+        - name: Configure AWS credentials for installer
+          copy:
+            content: |
+              [default]
+              aws_access_key_id = {{ aws_access_key }}
+              aws_secret_access_key = {{ aws_secret_key }}
+              region = {{ aws_deploy_region }}
+            dest: "/tmp/ocp-install-{{ cluster_name }}/aws-credentials"
+            mode: '0600'
+          delegate_to: localhost
+
+        - name: Run OpenShift installer (IPI mode - creates VPC/subnet)
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            AWS_REGION="{{ aws_deploy_region }}" \
+            openshift-install create cluster \
+              --dir /tmp/ocp-install-{{ cluster_name }} \
+              --log-level=debug 2>&1 | tee /tmp/ocp-install-{{ cluster_name }}/install.log
+          register: ipi_install_result
+          delegate_to: localhost
+          async: 7200  # 2 hours timeout
+          poll: 30
+
+        - name: Get cluster metadata
+          slurp:
+            src: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+          register: cluster_metadata_raw
+          delegate_to: localhost
+
+        - name: Parse cluster information
+          set_fact:
+            cluster_info: "{{ cluster_metadata_raw.content | b64decode | from_json }}"
+
+        - name: Get cluster infrastructure details
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values={{ cluster_name }}-*-master-0" \
+                        "Name=instance-state-name,Values=running" \
+              --region {{ aws_deploy_region }} \
+              --query 'Reservations[0].Instances[0].[InstanceId,PublicIpAddress,PrivateIpAddress]' \
+              --output json
+          register: ipi_instance_info
+          delegate_to: localhost
+
+        - name: Parse instance details
+          set_fact:
+            ipi_instance_id: "{{ (ipi_instance_info.stdout | from_json)[0] }}"
+            ipi_public_ip: "{{ (ipi_instance_info.stdout | from_json)[1] }}"
+            ipi_private_ip: "{{ (ipi_instance_info.stdout | from_json)[2] }}"
+          when: ipi_instance_info.stdout != "null"
+
+        - name: Copy kubeconfig to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/auth/kubeconfig"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+            mode: '0600'
+          delegate_to: localhost
+
+        - name: Copy kubeadmin password to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/auth/kubeadmin-password"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/kubeadmin-password"
+            mode: '0600'
+          delegate_to: localhost
+
+        - name: Copy cluster metadata
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/metadata.json"
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: Get created VPC ID
+          shell: |
+            AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+            AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+            aws ec2 describe-vpcs \
+              --filters "Name=tag:Name,Values={{ cluster_name }}-*-vpc" \
+              --region {{ aws_deploy_region }} \
+              --query 'Vpcs[0].VpcId' \
+              --output text
+          register: created_vpc
+          delegate_to: localhost
+
+        - name: Create cluster info file
+          copy:
+            content: |
+              Cluster Name: {{ cluster_name }}
+              Base Domain: {{ cluster_base_domain }}
+              Region: {{ aws_deploy_region }}
+              Deployment Mode: IPI (Infrastructure created by OpenShift installer)
+              Created VPC: {{ created_vpc.stdout }}
+              Master Instance ID: {{ ipi_instance_id | default('N/A') }}
+              Public IP: {{ ipi_public_ip | default('N/A') }}
+              API URL: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+              Console URL: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+              Username: kubeadmin
+              Password: See kubeadmin-password file
+
+              Note: OpenShift installer created the following AWS resources:
+              - VPC and subnets
+              - Internet Gateway
+              - NAT Gateway(s)
+              - Route Tables
+              - Security Groups
+              - Load Balancers
+              - EC2 instances
+
+              To destroy this cluster, use: ./ansible-runner.sh destroy --limit {{ cluster_name }}
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/cluster-info.txt"
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: Display success message
+          debug:
+            msg: |
+              ============================================
+              OpenShift Cluster Deployed Successfully (IPI Mode)!
+              ============================================
+              Cluster: {{ cluster_name }}
+              Region: {{ aws_deploy_region }}
+              VPC Created: {{ created_vpc.stdout }}
+
+              OpenShift installer created all AWS infrastructure automatically.
+
+              Credentials saved to: {{ artifacts_dir }}/{{ cluster_name }}/
+
+              Access your cluster:
+              export KUBECONFIG={{ artifacts_dir }}/{{ cluster_name }}/kubeconfig
+              oc get nodes
+
+              Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+              Username: kubeadmin
+              Password: cat {{ artifacts_dir }}/{{ cluster_name }}/kubeadmin-password
+
+      rescue:
+        - name: Display installer failure
+          debug:
+            msg: |
+              ============================================
+              OpenShift IPI Install FAILED for {{ cluster_name }}
+              ============================================
+              Region: {{ aws_deploy_region }}
+              See installer log: artifacts/{{ cluster_name }}/openshift_install.log
+
+      always:
+        - name: Copy installer log to artifacts
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/.openshift_install.log"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/openshift_install.log"
+            mode: '0644'
+          delegate_to: localhost
+          ignore_errors: true
+
+        - name: Copy metadata to artifacts (if generated)
+          copy:
+            src: "/tmp/ocp-install-{{ cluster_name }}/metadata.json"
+            dest: "{{ artifacts_dir }}/{{ cluster_name }}/metadata.json"
+            mode: '0644'
+          delegate_to: localhost
+          ignore_errors: true
+
+      when: not use_existing_vpc and not existing_ipi_cluster.stat.exists

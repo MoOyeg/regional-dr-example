@@ -1,0 +1,86 @@
+# OpenShift Cluster Configuration - UPI Mode Example
+# UPI (User Provisioned Infrastructure): Use existing AWS VPC/subnet
+
+# Cluster identification
+cluster_name: cluster-us-east-1-upi
+
+# Cluster role for DR operators (hub or spoke)
+# Set to 'hub' for the ACM management cluster
+# Defaults to 'spoke' from group_vars
+# cluster_role: hub
+
+# AWS Region
+aws_region: us-east-1
+
+# AWS Credential Set (1, 2, or 3)
+# Refers to AWS_ACCESS_KEY_ID_1, AWS_SECRET_ACCESS_KEY_1, AWS_REGION_1
+aws_credential_set: 1
+
+# Base Domain (Optional - auto-detected from Route53 if not specified)
+# If you have a Route53 hosted zone, this will be automatically detected
+# cluster_base_domain: example.com
+
+# OpenShift Version (Optional - defaults to 4.17)
+openshift_version: "4.17"
+
+# Instance Configuration
+aws_instance_type: m5.2xlarge
+aws_root_volume_size: 120
+aws_availability_zone: us-east-1a
+
+# Node topology (defaults: SNO with 1 master, 0 workers)
+# control_plane_replicas: 1
+# control_plane_instance_type: m5.2xlarge
+# worker_replicas: 0
+# worker_instance_type: m5.xlarge  # Only used when worker_replicas > 0
+
+# ============================================
+# UPI MODE - EXISTING INFRASTRUCTURE REQUIRED
+# ============================================
+# When both aws_vpc_id AND aws_subnet_id are specified,
+# the playbook uses UPI mode with your existing infrastructure
+
+# REQUIRED: RHCOS AMI ID for your region
+# Find RHCOS AMIs: https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/
+# Or use: aws ec2 describe-images --owners 309956199498 --query 'Images[?Name!=`null`]|[?starts_with(Name, `rhcos-4.17`)]'
+aws_ami_id: ami-0123456789abcdef0
+
+# REQUIRED: Existing VPC ID
+aws_vpc_id: vpc-0123456789abcdef0
+
+# REQUIRED: Existing Subnet ID (must be in the VPC above)
+aws_subnet_id: subnet-0123456789abcdef0
+
+# REQUIRED: Security Group ID (must allow SSH:22, API:6443, HTTP:80, HTTPS:443)
+aws_security_group_id: sg-0123456789abcdef0
+
+# SSH Key Configuration (choose one):
+# Option 1: Use local SSH key (recommended) - provide ssh-key.pub in project root
+#   The playbook will import it as an EC2 key pair named "<cluster_name>-key"
+#   No aws_key_name needed!
+#
+# Option 2: Use pre-existing AWS EC2 key pair
+# aws_key_name: my-openshift-keypair
+
+# Elastic IP Configuration
+aws_create_eip: true
+
+# Route53 Configuration (Optional)
+# If you want automatic DNS record creation
+aws_route53_zone: example.com
+
+# UPI Mode Features:
+# - Uses your existing VPC and subnet
+# - More control over network configuration
+# - Faster deployment (~30-40 min)
+# - Manual infrastructure management
+# - VPC/subnet preserved on cluster destroy
+
+# Prerequisites:
+# 1. VPC with internet gateway
+# 2. Subnet with route to internet gateway
+# 3. Security group allowing:
+#    - Inbound: 22 (SSH), 6443 (API), 80 (HTTP), 443 (HTTPS)
+#    - Outbound: All
+# 4. SSH key pair created in EC2
+# 5. RHCOS AMI available in your region

@@ -1,0 +1,100 @@
+---
+- name: Validate Configuration
+  hosts: localhost
+  gather_facts: false
+  
+  tasks:
+    - name: Check AWS credentials
+      debug:
+        msg: "Validating AWS credentials..."
+    
+    - name: Validate credential set 1
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_1') }}" \
+        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_1') }}" \
+        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_1') | default('us-east-1', true) }}
+      register: cred1_result
+      ignore_errors: true
+      changed_when: false
+    
+    - name: Credential set 1 status
+      debug:
+        msg: "Credential Set 1: {{ 'Valid' if cred1_result.rc == 0 else 'Not configured or invalid' }}"
+    
+    - name: Validate credential set 2
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_2') }}" \
+        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_2') }}" \
+        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_2') | default('us-east-1', true) }}
+      register: cred2_result
+      ignore_errors: true
+      changed_when: false
+      when: lookup('env', 'AWS_ACCESS_KEY_ID_2') | length > 0
+    
+    - name: Credential set 2 status
+      debug:
+        msg: "Credential Set 2: {{ 'Valid' if cred2_result.rc == 0 else 'Not configured' }}"
+      when: lookup('env', 'AWS_ACCESS_KEY_ID_2') | length > 0
+    
+    - name: Validate credential set 3
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_3') }}" \
+        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_3') }}" \
+        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_3') | default('us-east-1', true) }}
+      register: cred3_result
+      ignore_errors: true
+      changed_when: false
+      when: lookup('env', 'AWS_ACCESS_KEY_ID_3') | length > 0
+    
+    - name: Credential set 3 status
+      debug:
+        msg: "Credential Set 3: {{ 'Valid' if cred3_result.rc == 0 else 'Not configured' }}"
+      when: lookup('env', 'AWS_ACCESS_KEY_ID_3') | length > 0
+    
+    - name: Check for pull secret
+      stat:
+        path: "{{ playbook_dir }}/pull-secret.json"
+      register: pull_secret_stat
+    
+    - name: Pull secret status
+      debug:
+        msg: "pull-secret.json: {{ 'Found' if pull_secret_stat.stat.exists else 'Missing - download from https://console.redhat.com/openshift/install/pull-secret' }}"
+    
+    - name: Check for SSH public key
+      stat:
+        path: "{{ playbook_dir }}/ssh-key.pub"
+      register: ssh_pub_key_stat
+
+    - name: SSH public key status
+      debug:
+        msg: "ssh-key.pub: {{ 'Found' if ssh_pub_key_stat.stat.exists else 'Missing - generate with: ssh-keygen -t rsa -b 4096' }}"
+
+    - name: Check for SSH private key
+      stat:
+        path: "{{ playbook_dir }}/ssh-key"
+      register: ssh_priv_key_stat
+
+    - name: SSH private key status
+      debug:
+        msg: "ssh-key: {{ 'Found (will be mounted into container for SSH access)' if ssh_priv_key_stat.stat.exists else 'Not found (optional - only needed for direct SSH to nodes)' }}"
+
+    - name: Check inventory file
+      stat:
+        path: "{{ playbook_dir }}/inventory/hosts"
+      register: inventory_stat
+    
+    - name: Inventory status
+      debug:
+        msg: "inventory/hosts: {{ 'Found' if inventory_stat.stat.exists else 'Missing' }}"
+    
+    - name: Summary
+      debug:
+        msg: |
+          ============================================
+          Configuration Validation Summary
+          ============================================
+          AWS Credentials: {{ 'OK' if cred1_result.rc == 0 else 'FAILED' }}
+          Pull Secret: {{ 'OK' if pull_secret_stat.stat.exists else 'MISSING' }}
+          SSH Public Key: {{ 'OK' if ssh_pub_key_stat.stat.exists else 'MISSING' }}
+          SSH Private Key: {{ 'Found' if ssh_priv_key_stat.stat.exists else 'Not found (optional)' }}
+          Inventory: {{ 'OK' if inventory_stat.stat.exists else 'MISSING' }}

@@ -1,0 +1,182 @@
+---
+# Global variables for all clusters
+# These can be overridden in host_vars for specific clusters
+
+# OpenShift version
+openshift_version: "4.20"
+
+# Default AWS settings
+aws_instance_type: "m5.2xlarge"
+aws_root_volume_size: 120
+aws_create_eip: true
+aws_zone_count: 1
+
+# Node topology (SNO defaults: 1 master, 0 workers)
+control_plane_replicas: 1
+control_plane_instance_type: "m5.2xlarge"
+worker_replicas: 0
+# worker_instance_type: "m5.xlarge"  # Only used when worker_replicas > 0
+
+# Cluster role for DR operators (hub or spoke)
+cluster_role: spoke
+
+# ACM ManagedCluster name mapping
+# =========================================================================
+# When a cluster is imported into ACM, it gets a ManagedCluster resource name.
+# For the hub cluster (self-import), this is typically "local-cluster".
+# For spoke clusters, this is usually the cluster name, but can be customized.
+#
+# Override in host_vars if your ManagedCluster name differs from cluster_name:
+#   managedcluster_name: "custom-name"
+#
+# If not set, defaults to:
+#   - "local-cluster" for hub clusters (cluster_role: hub)
+#   - cluster_name for spoke clusters
+# =========================================================================
+
+# Operator channels
+acm_channel: "release-2.15"
+odf_channel: "stable-4.20"
+oadp_channel: "stable"
+
+# ManagedClusterSet name for DR
+managed_cluster_set_name: "dr-clusters"
+
+# Submariner globalnet
+globalnet_enabled: true
+globalnet_cidr_range: "242.0.0.0/8"
+# Cable driver: "vxlan" (default) or "libreswan" (IPsec, has known issues with Submariner v0.22+)
+submariner_cable_driver: "vxlan"
+# Include hub (local-cluster) in the Submariner ManagedClusterSet
+# Set to true if the hub cluster should also participate in Submariner networking
+submariner_include_hub: false
+
+# ODF StorageCluster settings (for spoke clusters)
+odf_storage_class: "gp3-csi"
+odf_storage_size: "512Gi"
+odf_device_set_count: 1
+odf_device_set_replica: 3
+
+# Cert-manager / Let's Encrypt settings
+# =========================================================================
+# The certs command will:
+# 1. Install cert-manager operator from OperatorHub
+# 2. Create a ClusterIssuer for Let's Encrypt with Route53 DNS-01 solver
+# 3. Generate a wildcard certificate for *.apps.<base-domain>
+# 4. Patch the IngressController to use the certificate
+#
+# Prerequisites:
+# - AWS credentials must be set (export AWS_ACCESS_KEY_ID_N, AWS_SECRET_ACCESS_KEY_N)
+# - AWS credential set must have Route53 permissions for DNS-01 validation
+# - acme_email MUST be set (used for Let's Encrypt account registration)
+# =========================================================================
+
+# cert-manager operator channel
+certmanager_channel: "stable-v1"
+
+# Let's Encrypt ACME server
+# Use staging for testing (won't be trusted by browsers, but rate-limited less)
+# acme_server: "https://acme-staging-v02.api.letsencrypt.org/directory"
+# Use production for real certificates (be careful with rate limits!)
+acme_server: "https://acme-v02.api.letsencrypt.org/directory"
+
+# Email address for Let's Encrypt registration (REQUIRED for certs command!)
+# This email will receive certificate expiry notifications
+acme_email: "mojojoye@yahoo.com"
+
+# ClusterIssuer and Certificate names
+acme_issuer_name: "letsencrypt"
+cert_name: "acme-wildcard-cert"
+cert_secret_name: "acme-wildcard-cert-secret"
+
+# NetObserv Network Traffic Monitoring
+# =========================================================================
+# The netobserv command will install network traffic monitoring on clusters
+# marked with netobserv: true in inventory/host_vars/<cluster>.yml
+#
+# Features:
+# - Loki operator for centralized log storage
+# - NetObserv operator for network flow collection
+# - S3 bucket for Loki backend storage
+# - FlowCollector with eBPF agent for traffic analysis
+#
+# Prerequisites:
+# - AWS credentials with S3 and IAM permissions
+# - netobserv: true label in cluster host_vars
+#
+# Example cluster configuration:
+#   cat inventory/host_vars/cluster-netobserv.yml
+#   cluster_name: cluster-netobserv
+#   aws_credential_set: 1
+#   aws_region: us-east-1
+#   netobserv: true         # Enable NetObserv on this cluster
+# =========================================================================
+
+# Loki operator channel
+loki_channel: "stable"
+
+# NetObserv operator channel
+netobserv_channel: "stable"
+
+# DR Application Deployment
+# =========================================================================
+# The app command deploys TWO DR-protected instances of a sample application
+# (Quarkus + MySQL) with DRPlacementControl for automated failover:
+#
+#   Instance 1 (GitOps): Deployed via OpenShift GitOps (ArgoCD) in push mode.
+#     - Installs GitOps operator on hub, registers spokes with ArgoCD
+#     - ApplicationSet with ClusterDecisionResource generator
+#     - DRPlacementControl manages failover by changing PlacementDecision
+#     - Namespace: {{ app_namespace }} (e.g., quarkus-web-app)
+#
+#   Instance 2 (Direct): Manifests applied directly to primary spoke.
+#     - oc apply manifests to spoke_clusters[0]
+#     - DRPlacementControl with kubeObjectProtection for failover
+#     - Namespace: {{ app_namespace }}-direct (e.g., quarkus-web-app-direct)
+#
+# Prerequisites:
+# 1. Clusters deployed: ./ansible-runner.sh deploy
+# 2. Operators installed: ./ansible-runner.sh operators
+# 3. Clusters imported: ./ansible-runner.sh import
+# 4. DR infrastructure configured: ./ansible-runner.sh infra-dr
+# 5. App manifests accessible via Git (set app_git_url below)
+#
+# The app/ directory in this repo contains the adapted manifests:
+# - namespace.yaml: quarkus-web-app namespace
+# - mysql-secret.yaml: MySQL credentials
+# - mysql-pvc.yaml: PVC with ocs-storagecluster-ceph-rbd StorageClass
+# - mysql-deployment.yaml: MySQL 8.0 Deployment + headless Service
+# - app-deployment.yaml: Quarkus app Deployment + Service + Route
+#
+# Push this repo to a Git server and set app_git_url to the repo URL.
+# =========================================================================
+
+# Application namespace (GitOps instance; Direct instance uses {{ app_namespace }}-direct)
+app_namespace: "quarkus-web-app"
+
+# Application name (used for naming RHACM resources)
+app_name: "quarkus-mysql-app"
+
+# Git repository URL containing app manifests (REQUIRED for app command)
+# Point this to your fork/copy of this repository pushed to a Git server
+# Example: https://github.com/user/regional-dr-example.git
+app_git_url: ""
+
+# Git branch containing the app manifests
+app_git_branch: "main"
+
+# Path within the Git repo to the app manifests directory
+app_git_path: "app"
+
+# DRPolicy name (cluster-scoped resource on hub)
+dr_policy_name: "dr-policy"
+
+# Async replication schedule interval for Ceph RBD mirroring
+dr_replication_interval: "5m"
+
+# StorageClass for app PVCs (must support Ceph RBD mirroring)
+app_pvc_storage_class: "ocs-storagecluster-ceph-rbd"
+
+# OpenShift GitOps operator channel (installed on hub for ArgoCD push mode)
+gitops_channel: "latest"
+

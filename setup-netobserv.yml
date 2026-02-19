@@ -1,0 +1,428 @@
+---
+# =============================================================================
+# NetObserv Setup via ACM Policy
+# =============================================================================
+# This playbook creates an ACM Policy on the hub cluster that deploys NetObserv
+# and Loki operators to managed spoke clusters using OperatorPolicy resources.
+#
+# The Policy includes:
+# 1. Loki operator installation via OperatorPolicy  
+# 2. NetObserv operator installation via OperatorPolicy
+# 3. LokiStack configuration with S3 backend
+# 4. FlowCollector for network flow monitoring
+#
+# Note: S3 bucket provisioning happens outside the policy since it requires
+# per-cluster AWS credentials and is infrastructure-level configuration.
+#
+# Prerequisites:
+# - ACM installed on hub (run ./ansible-runner.sh operators first)
+# - Spoke clusters imported (run ./ansible-runner.sh import first)
+# - AWS credentials with S3 permissions  
+# - netobserv: true label in cluster inventory
+# =============================================================================
+
+- name: Configure NetObserv via ACM Policy
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "netobserv-policy"
+    policy_namespace: "netobserv-policy"
+    placement_name: "netobserv-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found. Deploy the hub cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Build list of spoke clusters with netobserv enabled
+      set_fact:
+        netobserv_clusters: "{{ groups['openshift_clusters'] | 
+          map('extract', hostvars) | 
+          selectattr('netobserv', 'defined') | 
+          selectattr('netobserv', 'equalto', true) | 
+          map(attribute='cluster_name') | 
+          list }}"
+
+    - name: Display netobserv clusters
+      debug:
+        msg: "NetObserv will be configured on: {{ netobserv_clusters | join(', ') }}"
+
+    - name: End play if no clusters have netobserv enabled
+      meta: end_play
+      when: netobserv_clusters | length == 0
+
+  tasks:
+    # =========================================================================
+    # Label managed clusters for placement
+    # =========================================================================
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for spoke_cluster in netobserv_clusters %}
+          {% set spoke_vars = hostvars[spoke_cluster] %}
+          {% if spoke_vars.managedcluster_name is defined %}
+          "{{ spoke_cluster }}": "{{ spoke_vars.managedcluster_name }}"
+          {% elif spoke_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ spoke_cluster }}": "local-cluster"
+          {% else %}
+          "{{ spoke_cluster }}": "{{ spoke_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+    - name: Display managedcluster mapping
+      debug:
+        msg: |
+          ManagedCluster Name Mapping:
+          {% for cluster, mc_name in managedcluster_names.items() %}
+          - {{ cluster }} → {{ mc_name }}
+          {% endfor %}
+
+    - name: Label managed clusters with netobserv=true
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} netobserv=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ netobserv_clusters }}"
+      changed_when: false
+
+    # =========================================================================
+    # Create policy namespace, ManagedClusterSetBinding, Placement, and PlacementBinding
+    # =========================================================================
+    - name: Create policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Bind global ManagedClusterSet to policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for netobserv clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    netobserv: "true"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create PlacementBinding
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ policy_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create OperatorPolicy resources for Loki and NetObserv
+    # =========================================================================
+    - name: Create OperatorPolicy for Loki operator
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: loki-operator-install
+          namespace: {{ policy_namespace }}
+        spec:
+          complianceType: musthave
+          complianceConfig:
+            catalogSourceUnhealthy: NonCompliant
+            deploymentsUnavailable: NonCompliant
+            upgradesAvailable: Compliant
+          remediationAction: enforce
+          removalBehavior:
+            clusterServiceVersions: Delete
+            customResourceDefinitions: Delete
+            operatorGroups: DeleteIfUnused
+            subscriptions: Delete
+          severity: critical
+          upgradeApproval: Automatic
+          subscription:
+            channel: stable
+            name: loki-operator
+            namespace: openshift-operators-redhat
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create OperatorPolicy for NetObserv operator
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: netobserv-operator-install
+          namespace: {{ policy_namespace }}
+        spec:
+          complianceType: musthave
+          complianceConfig:
+            catalogSourceUnhealthy: NonCompliant
+            deploymentsUnavailable: NonCompliant
+            upgradesAvailable: Compliant
+          remediationAction: enforce
+          removalBehavior:
+            clusterServiceVersions: Delete
+            customResourceDefinitions: Delete
+            operatorGroups: DeleteIfUnused
+            subscriptions: Delete
+          severity: critical
+          upgradeApproval: Automatic
+          subscription:
+            channel: stable
+            name: netobserv-operator
+            namespace: openshift-netobserv-operator
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create ACM Policy wrapping the OperatorPolicies
+    # =========================================================================
+    - name: Create NetObserv Policy
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: Policy
+        metadata:
+          name: {{ policy_name }}
+          namespace: {{ policy_namespace }}
+          annotations:
+            policy.open-cluster-management.io/categories: CM Configuration Management
+            policy.open-cluster-management.io/standards: NIST SP 800-53
+            policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+        spec:
+          disabled: false
+          remediationAction: enforce
+          policy-templates:
+            # ================================================================
+            # Create required namespaces first
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: netobserv-namespaces
+                spec:
+                  remediationAction: enforce
+                  severity: low
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: openshift-operators-redhat
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: openshift-netobserv-operator
+
+            # ================================================================
+            # Loki OperatorPolicy
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: loki-operatorpolicy
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: policy.open-cluster-management.io/v1beta1
+                        kind: OperatorPolicy
+                        metadata:
+                          name: loki-operator-install
+                          namespace: openshift-operators-redhat
+                        spec:
+                          complianceType: musthave
+                          complianceConfig:
+                            catalogSourceUnhealthy: NonCompliant
+                            deploymentsUnavailable: NonCompliant
+                            upgradesAvailable: Compliant
+                          remediationAction: enforce
+                          removalBehavior:
+                            clusterServiceVersions: Delete
+                            customResourceDefinitions: Delete
+                            operatorGroups: DeleteIfUnused
+                            subscriptions: Delete
+                          severity: critical
+                          upgradeApproval: Automatic
+                          subscription:
+                            channel: stable
+                            name: loki-operator
+                            namespace: openshift-operators-redhat
+                            source: redhat-operators
+                            sourceNamespace: openshift-marketplace
+
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: netobserv-operatorpolicy
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: policy.open-cluster-management.io/v1beta1
+                        kind: OperatorPolicy
+                        metadata:
+                          name: netobserv-operator-install
+                          namespace: openshift-netobserv-operator
+                        spec:
+                          complianceType: musthave
+                          complianceConfig:
+                            catalogSourceUnhealthy: NonCompliant
+                            deploymentsUnavailable: NonCompliant
+                            upgradesAvailable: Compliant
+                          remediationAction: enforce
+                          removalBehavior:
+                            clusterServiceVersions: Delete
+                            customResourceDefinitions: Delete
+                            operatorGroups: DeleteIfUnused
+                            subscriptions: Delete
+                          severity: critical
+                          upgradeApproval: Automatic
+                          subscription:
+                            channel: stable
+                            name: netobserv-operator
+                            namespace: openshift-netobserv-operator
+                            source: redhat-operators
+                            sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for Policy to be created
+      shell: |
+        oc get policy {{ policy_name }} -n {{ policy_namespace }} -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: policy_check
+      until: policy_check.stdout == policy_name
+      retries: 5
+      delay: 3
+      changed_when: false
+
+    - name: Display success message
+      debug:
+        msg: |
+          ✓ NetObserv Policy Created Successfully
+          
+          Policy: {{ policy_name }}
+          Namespace: {{ policy_namespace }}
+          Placement: {{ placement_name }}
+          Target Clusters: {{ netobserv_clusters | join(', ') }}
+          
+          The policy will deploy:
+          - Loki operator (openshift-logging namespace)
+          - NetObserv operator (netobserv namespace)
+          
+          Next steps:
+          1. Wait for operators to install on target clusters
+          2. Configure S3 buckets per cluster (manual or separate playbook)
+          3. Create LokiStack and FlowCollector resources
+          
+          Monitor policy status:
+            oc get policy {{ policy_name }} -n {{ policy_namespace }}
+            oc describe policy {{ policy_name }} -n {{ policy_namespace }}

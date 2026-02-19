@@ -1,0 +1,93 @@
+---
+# Included from infra-dr.yml Play 3
+# Loop variables:
+#   managed_cluster_name — ACM managed cluster name (spoke hostname or "local-cluster" for hub)
+#   managed_cluster_idx  — 0-based loop index (used for globalCIDR assignment)
+# Runs on the hub cluster with hub's KUBECONFIG
+
+- name: Look up AWS credentials for {{ managed_cluster_name }}
+  set_fact:
+    sub_aws_access_key: >-
+      {{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (hostvars[managed_cluster_name]['aws_credential_set'] | string))
+         if managed_cluster_name != 'local-cluster'
+         else lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}
+    sub_aws_secret_key: >-
+      {{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (hostvars[managed_cluster_name]['aws_credential_set'] | string))
+         if managed_cluster_name != 'local-cluster'
+         else lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}
+
+- name: Create AWS credentials secret for {{ managed_cluster_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: {{ managed_cluster_name }}-aws-creds
+      namespace: {{ managed_cluster_name }}
+    type: Opaque
+    stringData:
+      aws_access_key_id: {{ sub_aws_access_key }}
+      aws_secret_access_key: {{ sub_aws_secret_key }}
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Create SubmarinerConfig for {{ managed_cluster_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: submarineraddon.open-cluster-management.io/v1alpha1
+    kind: SubmarinerConfig
+    metadata:
+      name: submariner
+      namespace: {{ managed_cluster_name }}
+    spec:
+      gatewayConfig:
+        gateways: 1
+        aws:
+          instanceType: m5.xlarge
+      IPSecNATTPort: 4500
+      NATTEnable: true
+      cableDriver: {{ submariner_cable_driver | default('vxlan') }}
+      credentialsSecret:
+        name: {{ managed_cluster_name }}-aws-creds
+    {% if globalnet_enabled | default(false) %}
+      globalCIDR: "242.{{ managed_cluster_idx | int + 1 }}.0.0/16"
+    {% endif %}
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Create Submariner ManagedClusterAddOn for {{ managed_cluster_name }}
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: addon.open-cluster-management.io/v1alpha1
+    kind: ManagedClusterAddOn
+    metadata:
+      name: submariner
+      namespace: {{ managed_cluster_name }}
+    spec:
+      installNamespace: submariner-operator
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Wait for Submariner addon on {{ managed_cluster_name }}
+  shell: |
+    oc get managedclusteraddon submariner -n {{ managed_cluster_name }} -o jsonpath='{.status.conditions[?(@.type=="Available")].status}'
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  register: submariner_status
+  until: "'True' in submariner_status.stdout"
+  retries: 40
+  delay: 30
+  ignore_errors: true
+
+- name: Display Submariner status for {{ managed_cluster_name }}
+  debug:
+    msg: >-
+      Submariner for {{ managed_cluster_name }}:
+      {{ 'Available' if 'True' in (submariner_status.stdout | default('')) else 'Still progressing (verify manually)' }}

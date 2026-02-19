@@ -1,0 +1,583 @@
+---
+# =============================================================================
+# Play 1: Validate hub readiness for DR infrastructure
+# =============================================================================
+- name: Validate hub readiness for DR infrastructure
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+  tasks:
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first to install required operators.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Check MultiClusterHub is Running
+      shell: |
+        oc get multiclusterhub multiclusterhub -n open-cluster-management \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mch_status
+      changed_when: false
+
+    - name: Fail if MultiClusterHub is not Running
+      fail:
+        msg: >-
+          MultiClusterHub is not in Running phase (got: '{{ mch_status.stdout }}').
+          Wait for MCH to finish installing or check hub operator status.
+      when: "'Running' not in mch_status.stdout"
+
+    - name: Display hub readiness validation success
+      debug:
+        msg: |
+          ============================================
+          Hub Readiness Validated
+          ============================================
+          Cluster: {{ cluster_name }}
+          ACM CSV: Succeeded
+          MultiClusterHub: Running
+
+# =============================================================================
+# Play 2: Enable Submariner networking with globalnet
+# =============================================================================
+- name: Enable Submariner networking with globalnet
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Set AWS credentials for hub
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Build list of managed clusters for Submariner
+      set_fact:
+        all_managed_clusters: "{{ (['local-cluster'] if submariner_include_hub | default(false) else []) + spoke_clusters }}"
+
+    - name: Display managed clusters for Submariner
+      debug:
+        msg: "Enabling Submariner with globalnet for: {{ all_managed_clusters | join(', ') }}"
+
+    - name: Verify spoke clusters are imported as ManagedClusters
+      shell: |
+        oc get managedcluster {{ item }} -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: mc_check
+      failed_when: false
+      changed_when: false
+      loop: "{{ spoke_clusters }}"
+
+    - name: Fail if spoke clusters are not imported
+      fail:
+        msg: >-
+          Spoke cluster '{{ item.item }}' is not imported as a ManagedCluster in ACM.
+          Run './ansible-runner.sh import' first to import spoke clusters into ACM hub.
+      when: item.rc != 0
+      loop: "{{ mc_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+  tasks:
+    - name: Create ManagedClusterSet
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSet
+        metadata:
+          name: {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Label managed clusters with clusterset
+      shell: |
+        oc label managedcluster {{ item }} \
+          cluster.open-cluster-management.io/clusterset={{ managed_cluster_set_name }} --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+
+    # Clean up local-cluster Submariner resources if hub is excluded
+    - name: Remove Submariner ManagedClusterAddOn from local-cluster
+      shell: |
+        oc delete managedclusteraddon submariner -n local-cluster --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: not (submariner_include_hub | default(false))
+
+    - name: Remove SubmarinerConfig from local-cluster
+      shell: |
+        oc delete submarinerconfig submariner -n local-cluster --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: not (submariner_include_hub | default(false))
+
+    - name: Remove clusterset label from local-cluster
+      shell: |
+        oc label managedcluster local-cluster \
+          cluster.open-cluster-management.io/clusterset- 2>/dev/null || true
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: not (submariner_include_hub | default(false))
+
+    - name: Create ManagedClusterSetBinding
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: open-cluster-management
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create broker namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ managed_cluster_set_name }}-broker
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Submariner Broker with globalnet enabled
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: submariner.io/v1alpha1
+        kind: Broker
+        metadata:
+          name: submariner-broker
+          namespace: {{ managed_cluster_set_name }}-broker
+        spec:
+          globalnetEnabled: {{ globalnet_enabled | default(true) }}
+          globalnetCIDRRange: "{{ globalnet_cidr_range | default('242.0.0.0/8') }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Configure Submariner for each managed cluster
+      include_tasks: tasks/setup-submariner.yml
+      loop: "{{ all_managed_clusters }}"
+      loop_control:
+        loop_var: managed_cluster_name
+        index_var: managed_cluster_idx
+
+    - name: Display Submariner setup success
+      debug:
+        msg: |
+          ============================================
+          Submariner Networking Enabled (Globalnet)!
+          ============================================
+          Cluster Set: {{ managed_cluster_set_name }}
+          Globalnet: {{ 'Enabled (' + globalnet_cidr_range | default('242.0.0.0/8') + ')' if globalnet_enabled | default(true) else 'Disabled' }}
+          Managed Clusters: {{ all_managed_clusters | join(', ') }}
+
+# =============================================================================
+# Play 3: Install ODF and create StorageCluster on spoke clusters
+# =============================================================================
+- name: Install ODF and create StorageCluster on spoke clusters
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-spoke clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'spoke'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig. Deploy the cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+  tasks:
+    # =========================================================================
+    # ODF Operator Installation
+    # =========================================================================
+    - name: Create openshift-storage namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: openshift-storage
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ODF OperatorGroup
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: openshift-storage-operatorgroup
+          namespace: openshift-storage
+        spec:
+          targetNamespaces:
+            - openshift-storage
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ODF Operator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: odf-operator
+          namespace: openshift-storage
+        spec:
+          channel: {{ odf_channel }}
+          installPlanApproval: Automatic
+          name: odf-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ODF Operator CSV to succeed
+      shell: |
+        oc get csv -n openshift-storage -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' | grep -i odf-operator
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: odf_csv_status
+      until: "'Succeeded' in odf_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    - name: Wait for OCS Operator CSV to succeed (installed as ODF dependency)
+      shell: |
+        oc get csv -n openshift-storage -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' | grep -i ocs
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: ocs_csv_status
+      until: "'Succeeded' in ocs_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    # =========================================================================
+    # Label Storage Nodes
+    # =========================================================================
+    - name: Label worker nodes for ODF storage
+      shell: |
+        oc label nodes -l node-role.kubernetes.io/worker= \
+          cluster.ocs.openshift.io/openshift-storage="" --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # StorageCluster Creation
+    # =========================================================================
+    - name: Create ODF StorageCluster
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: ocs.openshift.io/v1
+        kind: StorageCluster
+        metadata:
+          name: ocs-storagecluster
+          namespace: openshift-storage
+        spec:
+          manageNodes: false
+          storageDeviceSets:
+          - name: ocs-deviceset
+            count: {{ odf_device_set_count }}
+            dataPVCTemplate:
+              spec:
+                accessModes:
+                - ReadWriteOnce
+                volumeMode: Block
+                storageClassName: {{ odf_storage_class }}
+                resources:
+                  requests:
+                    storage: {{ odf_storage_size }}
+            portable: true
+            replica: {{ odf_device_set_replica }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for StorageCluster to be Ready
+      shell: |
+        oc get storagecluster ocs-storagecluster -n openshift-storage \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sc_status
+      until: "'Ready' in sc_status.stdout"
+      retries: 60
+      delay: 30
+
+    - name: Display ODF StorageCluster success
+      debug:
+        msg: |
+          ============================================
+          ODF StorageCluster Created Successfully!
+          ============================================
+          Cluster: {{ cluster_name }}
+          StorageClass: {{ odf_storage_class }}
+          Storage Size: {{ odf_storage_size }}
+          Device Sets: {{ odf_device_set_count }} x {{ odf_device_set_replica }} replicas
+
+# =============================================================================
+# Play 4: Configure SSL access between S3 endpoints (user-ca-bundle)
+# Skipped if cert-manager certificates are already configured.
+# =============================================================================
+- name: Configure SSL access between S3 endpoints (user-ca-bundle)
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found at {{ artifacts_dir }}/{{ cluster_name }}/kubeconfig."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Check if cert-manager certificate is already configured
+      shell: |
+        oc get certificate {{ cert_name | default('acme-wildcard-cert') }} -n kube-system \
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "NotFound"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: certmgr_check
+      changed_when: false
+
+    - name: Skip if cert-manager certificates are configured
+      meta: end_host
+      when: "'True' in certmgr_check.stdout"
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Build list of all clusters (hub + spokes)
+      set_fact:
+        all_cluster_names: "{{ [cluster_name] + spoke_clusters }}"
+
+  tasks:
+    # =========================================================================
+    # Extract default ingress certs from all clusters
+    # =========================================================================
+    - name: Extract default-ingress-cert from hub cluster
+      shell: |
+        oc get cm default-ingress-cert -n openshift-config-managed \
+          -o jsonpath="{['data']['ca-bundle\.crt']}"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_ingress_cert
+      changed_when: false
+
+    - name: Extract default-ingress-cert from spoke clusters
+      shell: |
+        oc get cm default-ingress-cert -n openshift-config-managed \
+          -o jsonpath="{['data']['ca-bundle\.crt']}"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: spoke_ingress_certs
+      changed_when: false
+      loop: "{{ spoke_clusters }}"
+
+    # =========================================================================
+    # Build combined CA bundle
+    # =========================================================================
+    - name: Build combined CA bundle from all clusters
+      set_fact:
+        combined_ca_bundle: >-
+          {{ ([hub_ingress_cert.stdout]
+             + spoke_ingress_certs.results | map(attribute='stdout') | list)
+             | join('\n') }}
+
+    # =========================================================================
+    # Apply user-ca-bundle configmap to all clusters
+    # =========================================================================
+    - name: Create user-ca-bundle configmap on hub cluster
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: user-ca-bundle
+          namespace: openshift-config
+        data:
+          ca-bundle.crt: |
+        {{ combined_ca_bundle | indent(4, true) }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create user-ca-bundle configmap on spoke clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: user-ca-bundle
+          namespace: openshift-config
+        data:
+          ca-bundle.crt: |
+        {{ combined_ca_bundle | indent(4, true) }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    # =========================================================================
+    # Patch proxy to trust the CA bundle on all clusters
+    # =========================================================================
+    - name: Patch proxy on hub cluster to trust user-ca-bundle
+      shell: |
+        oc patch proxy cluster --type=merge \
+          --patch='{"spec":{"trustedCA":{"name":"user-ca-bundle"}}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Patch proxy on spoke clusters to trust user-ca-bundle
+      shell: |
+        oc patch proxy cluster --type=merge \
+          --patch='{"spec":{"trustedCA":{"name":"user-ca-bundle"}}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Display SSL configuration success
+      debug:
+        msg: |
+          ============================================
+          S3 Endpoint SSL Access Configured
+          ============================================
+          Combined certs from: {{ all_cluster_names | join(', ') }}
+          Applied user-ca-bundle to: {{ all_cluster_names | join(', ') }}
+          Proxy patched with trustedCA on all clusters

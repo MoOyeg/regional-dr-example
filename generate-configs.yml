@@ -1,0 +1,174 @@
+---
+# =============================================================================
+# Generate install-config.yaml for all clusters without deploying
+# =============================================================================
+- name: Generate install-config.yaml for OpenShift clusters
+  hosts: openshift_clusters
+  gather_facts: false
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Determine deployment mode
+      set_fact:
+        use_existing_vpc: "{{ (aws_vpc_id is defined and aws_vpc_id != '') and (aws_subnet_id is defined and aws_subnet_id != '') }}"
+
+    - name: Validate required variables for existing VPC mode
+      assert:
+        that:
+          - cluster_name is defined
+          - aws_credential_set is defined
+          - aws_region is defined
+          - aws_instance_type is defined
+          - aws_ami_id is defined
+          - aws_security_group_id is defined
+        fail_msg: "Missing required variables for cluster {{ cluster_name }}"
+      when: use_existing_vpc
+
+    - name: Validate required variables for IPI mode
+      assert:
+        that:
+          - cluster_name is defined
+          - aws_credential_set is defined
+          - aws_region is defined
+        fail_msg: "Missing required variables for cluster {{ cluster_name }}"
+      when: not use_existing_vpc
+
+    - name: Set AWS credentials based on credential set
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+
+    - name: Validate AWS credentials are set
+      assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: "AWS credentials not found for credential set {{ aws_credential_set }}"
+
+    - name: Use explicit availability zone when set (IPI mode)
+      set_fact:
+        aws_availability_zones: ["{{ aws_availability_zone }}"]
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is defined
+
+    - name: Look up availability zones for region (IPI mode)
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws ec2 describe-availability-zones \
+          --region {{ aws_deploy_region }} \
+          --filters "Name=state,Values=available" \
+          --query 'AvailabilityZones[*].ZoneName' \
+          --output json
+      register: az_lookup_result
+      changed_when: false
+      delegate_to: localhost
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is not defined
+
+    - name: Set availability zones based on aws_zone_count
+      set_fact:
+        aws_availability_zones: "{{ (az_lookup_result.stdout | from_json)[:aws_zone_count | int] }}"
+      when:
+        - not use_existing_vpc
+        - aws_availability_zone is not defined
+        - az_lookup_result.stdout is defined
+
+    - name: Display selected availability zones
+      debug:
+        msg: "Selected {{ aws_availability_zones | length }} zone(s): {{ aws_availability_zones | join(', ') }}"
+      when: aws_availability_zones is defined
+
+    - name: Get first Route53 hosted zone if cluster_base_domain not provided
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws route53 list-hosted-zones \
+          --query 'HostedZones[0].Name' \
+          --output text | sed 's/\.$//'
+      register: route53_zone_result
+      changed_when: false
+      delegate_to: localhost
+      when: cluster_base_domain is not defined or cluster_base_domain == ""
+
+    - name: Set cluster_base_domain from Route53
+      set_fact:
+        cluster_base_domain: "{{ route53_zone_result.stdout }}"
+      when:
+        - cluster_base_domain is not defined or cluster_base_domain == ""
+        - route53_zone_result.stdout is defined
+        - route53_zone_result.stdout | length > 0
+
+    - name: Fail if no cluster_base_domain found
+      fail:
+        msg: "cluster_base_domain is not defined and no Route53 hosted zones found in AWS account"
+      when: cluster_base_domain is not defined or cluster_base_domain == ""
+
+    - name: Create artifacts directory
+      file:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+
+  tasks:
+    - name: Check if pull secret exists
+      stat:
+        path: "{{ playbook_dir }}/pull-secret.json"
+      register: pull_secret_stat
+      delegate_to: localhost
+
+    - name: Fail if pull secret is missing
+      fail:
+        msg: "pull-secret.json not found. Download from https://console.redhat.com/openshift/install/pull-secret"
+      when: not pull_secret_stat.stat.exists
+
+    - name: Check if SSH public key exists
+      stat:
+        path: "{{ playbook_dir }}/ssh-key.pub"
+      register: ssh_key_stat
+      delegate_to: localhost
+
+    - name: Fail if SSH key is missing
+      fail:
+        msg: "ssh-key.pub not found. Generate with: ssh-keygen -t rsa -b 4096"
+      when: not ssh_key_stat.stat.exists
+
+    - name: Load pull secret
+      slurp:
+        src: "{{ playbook_dir }}/pull-secret.json"
+      register: pull_secret_content
+      delegate_to: localhost
+
+    - name: Load SSH public key
+      slurp:
+        src: "{{ playbook_dir }}/ssh-key.pub"
+      register: ssh_key_content
+      delegate_to: localhost
+
+    - name: Generate install-config.yaml
+      template:
+        src: templates/install-config.yaml.j2
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/install-config.yaml"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Display generated config summary
+      debug:
+        msg: |
+          ============================================
+          install-config.yaml Generated
+          ============================================
+          Cluster: {{ cluster_name }}
+          Mode: {{ 'UPI (existing VPC)' if use_existing_vpc else 'IPI (installer-provisioned)' }}
+          Region: {{ aws_deploy_region }}
+          Base Domain: {{ cluster_base_domain }}
+          Control Plane: {{ control_plane_replicas }} x {{ control_plane_instance_type }}
+          Workers: {{ worker_replicas }}{% if worker_replicas | int > 0 %} x {{ worker_instance_type | default('default') }}{% endif %}
+
+          Availability Zones: {{ aws_availability_zones | default([aws_availability_zone | default('auto')]) | join(', ') }}
+          Output: {{ artifacts_dir }}/{{ cluster_name }}/install-config.yaml

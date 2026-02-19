@@ -1,0 +1,246 @@
+---
+# =============================================================================
+# Play 1: Remove DR-protected applications and shared resources from hub
+# =============================================================================
+- name: Remove DR-protected applications and shared resources from hub
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Remove GitOps instance DR resources (DRPC first)
+    # =========================================================================
+    - name: Delete GitOps DRPlacementControl
+      shell: |
+        oc delete drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for GitOps DRPlacementControl removal
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-gitops-drpc -n {{ gitops_namespace }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_drpc_check
+      until: gitops_drpc_check.rc != 0
+      retries: 20
+      delay: 15
+      ignore_errors: true
+
+    - name: Delete GitOps ApplicationSet
+      shell: |
+        oc delete applicationset {{ app_name }}-gitops-appset \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete GitOps application Placement
+      shell: |
+        oc delete placement {{ app_name }}-gitops-placement \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove Direct instance DR resources (DRPC first)
+    # =========================================================================
+    - name: Delete Direct DRPlacementControl
+      shell: |
+        oc delete drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for Direct DRPlacementControl removal
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-direct-drpc -n {{ direct_namespace }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_drpc_check
+      until: direct_drpc_check.rc != 0
+      retries: 20
+      delay: 15
+      ignore_errors: true
+
+    - name: Delete Direct application Placement
+      shell: |
+        oc delete placement {{ app_name }}-direct-placement \
+          -n {{ direct_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ManagedClusterSetBinding from direct namespace
+      shell: |
+        oc delete managedclustersetbinding {{ managed_cluster_set_name }} \
+          -n {{ direct_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete direct app namespace on hub
+      shell: |
+        oc delete namespace {{ direct_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove shared DR resources
+    # =========================================================================
+    - name: Delete DRPolicy
+      shell: |
+        oc delete drpolicy {{ dr_policy_name }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Delete MirrorPeer
+      shell: |
+        oc delete mirrorpeer mirrorpeer-{{ spoke_clusters[0] }}-{{ spoke_clusters[1] }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove GitOps configuration (leave operator installed)
+    # =========================================================================
+    - name: Delete ConfigMap for ClusterDecisionResource generator
+      shell: |
+        oc delete configmap acm-placement -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete GitOpsCluster
+      shell: |
+        oc delete gitopscluster {{ managed_cluster_set_name }}-gitops \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete GitOps registration Placement
+      shell: |
+        oc delete placement {{ managed_cluster_set_name }}-gitops-registration \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ManagedClusterSetBinding from openshift-gitops
+      shell: |
+        oc delete managedclustersetbinding {{ managed_cluster_set_name }} \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display hub resource removal result
+      debug:
+        msg: |
+          ============================================
+          DR Applications Removed from Hub
+          ============================================
+          Removed GitOps instance: DRPlacementControl, ApplicationSet, Placement
+          Removed Direct instance: DRPlacementControl, Placement, Namespace
+          Removed shared: DRPolicy, MirrorPeer
+          Removed GitOps config: GitOpsCluster, ConfigMap, Placements
+          (GitOps operator left installed)
+
+# =============================================================================
+# Play 2: Clean up application namespaces on spoke clusters
+# =============================================================================
+- name: Clean up application namespaces on spoke clusters
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    direct_namespace: "{{ app_namespace }}-direct"
+
+  pre_tasks:
+    - name: Skip non-spoke clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'spoke'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Delete app namespaces on spoke cluster
+      shell: |
+        oc delete namespace {{ item }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+      loop:
+        - "{{ app_namespace }}"
+        - "{{ direct_namespace }}"
+
+    - name: Display spoke cleanup result
+      debug:
+        msg: "Cleaned up {{ app_namespace }} and {{ direct_namespace }} namespaces on {{ cluster_name }}"
