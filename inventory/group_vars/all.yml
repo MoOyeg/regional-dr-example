@@ -160,7 +160,7 @@ app_name: "quarkus-mysql-app"
 # Git repository URL containing app manifests (REQUIRED for app command)
 # Point this to your fork/copy of this repository pushed to a Git server
 # Example: https://github.com/user/regional-dr-example.git
-app_git_url: ""
+app_git_url: "https://github.com/MoOyeg/regional-dr-example.git"
 
 # Git branch containing the app manifests
 app_git_branch: "main"

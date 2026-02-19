@@ -1,0 +1,18 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: quarkus-mysql-app
+  namespace: quarkus-web-app
+spec:
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  internalTrafficPolicy: Cluster
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  sessionAffinity: None
+  selector:
+    app: quarkus-mysql-app
+    component: quarkus

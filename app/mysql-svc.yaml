@@ -1,0 +1,24 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: mysql
+  namespace: quarkus-web-app
+spec:
+  clusterIP: None
+  ipFamilies:
+    - IPv4
+  ports:
+    - protocol: TCP
+      port: 3306
+      targetPort: 3306
+  internalTrafficPolicy: Cluster
+  clusterIPs:
+    - None
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  sessionAffinity: None
+  selector:
+    app: quarkus-mysql-app
+    component: mysql
+status:
+  loadBalancer: {}

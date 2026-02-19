@@ -17,6 +17,7 @@ spec:
     metadata:
       labels:
         app: quarkus-mysql-app
+        db: quarkus-mysql-app
     spec:
       containers:
       - name: mysql
