@@ -1,14 +1,113 @@
 ---
 # =============================================================================
-# NetObserv Cleanup - Remove Loki, NetObserv, and S3 bucket
+# NetObserv Cleanup
 # =============================================================================
-- name: "Destroy NetObserv and Loki components"
+# Play 1: Remove ACM Policy and hub-side resources (hub only)
+# Play 2: Clean up per-cluster resources and S3 buckets (each netobserv cluster)
+# =============================================================================
+
+# =============================================================================
+# Play 1: Remove ACM Policy and hub-side resources
+# =============================================================================
+- name: "Play 1: Remove ACM Policy and hub-side resources"
   hosts: openshift_clusters
   gather_facts: false
 
   vars:
     artifacts_dir: "{{ playbook_dir }}/artifacts"
-    netobserv_namespace: "netobserv"
+    policy_name: "netobserv-policy"
+    policy_namespace: "netobserv-policy"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of netobserv clusters
+      set_fact:
+        netobserv_clusters: "{{ groups['openshift_clusters'] |
+          map('extract', hostvars) |
+          selectattr('netobserv', 'defined') |
+          selectattr('netobserv', 'equalto', true) |
+          map(attribute='cluster_name') |
+          list }}"
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for spoke_cluster in netobserv_clusters %}
+          {% set spoke_vars = hostvars[spoke_cluster] %}
+          {% if spoke_vars.managedcluster_name is defined %}
+          "{{ spoke_cluster }}": "{{ spoke_vars.managedcluster_name }}"
+          {% elif spoke_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ spoke_cluster }}": "local-cluster"
+          {% else %}
+          "{{ spoke_cluster }}": "{{ spoke_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+  tasks:
+    - name: Remove netobserv=true label from managed clusters
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} netobserv- --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ netobserv_clusters }}"
+      changed_when: false
+      ignore_errors: true
+
+    - name: Delete policy namespace (cascades Policy, Placement, PlacementBinding, hub secrets)
+      shell: |
+        oc delete namespace {{ policy_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for policy namespace deletion
+      shell: |
+        oc get namespace {{ policy_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: ns_delete_check
+      until: '"deleted" in ns_delete_check.stdout'
+      retries: 20
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display hub cleanup result
+      debug:
+        msg: |
+          Hub cleanup complete:
+          - Removed netobserv=true labels from: {{ netobserv_clusters | join(', ') }}
+          - Deleted namespace: {{ policy_namespace }}
+            (cascaded: Policy, Placement, PlacementBinding, hub-side S3 secrets)
+
+# =============================================================================
+# Play 2: Clean up per-cluster resources and S3 buckets
+# =============================================================================
+- name: "Play 2: Clean up per-cluster resources and S3 buckets"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
     loki_namespace: "openshift-logging"
 
   pre_tasks:
@@ -26,25 +125,6 @@
       meta: end_host
       when: not kubeconfig_stat.stat.exists
 
-    # Check if ACM OperatorPolicy CRD is available
-    - name: Check for ACM OperatorPolicy CRD availability
-      shell: |
-        set -e
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        if oc api-resources 2>/dev/null | grep -q "operatorpolicies"; then
-          echo "available"
-        else
-          echo "unavailable"
-        fi
-      delegate_to: localhost
-      register: operatorpolicy_check
-      changed_when: false
-      failed_when: false
-
-    - name: Set use_operatorpolicy flag
-      set_fact:
-        use_operatorpolicy: "{{ operatorpolicy_check.stdout | trim == 'available' }}"
-
     - name: Retrieve AWS credentials
       set_fact:
         aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
@@ -53,19 +133,21 @@
 
   tasks:
     # =========================================================================
-    # Delete FlowCollector
+    # Delete FlowCollector (cluster-scoped)
     # =========================================================================
     - name: Delete FlowCollector
       shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete flowcollector cluster -n {{ netobserv_namespace }} --ignore-not-found
+        oc delete flowcollector cluster --ignore-not-found --timeout=60s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       ignore_errors: true
 
     - name: Wait for FlowCollector deletion
       shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc get flowcollector cluster -n {{ netobserv_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+        oc get flowcollector cluster 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       register: fc_delete_check
       until: '"deleted" in fc_delete_check.stdout'
@@ -75,98 +157,26 @@
       ignore_errors: true
 
     # =========================================================================
-    # Delete NetObserv OperatorPolicy
+    # Delete LokiStack
     # =========================================================================
-    - name: Delete NetObserv OperatorPolicy
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete operatorpolicy netobserv-operator-policy -n {{ netobserv_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Delete NetObserv OperatorGroup (cleanup after policy removal)
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete operatorgroup netobserv-operator -n {{ netobserv_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Delete NetObserv Subscription (cleanup after policy removal)
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete subscription netobserv-operator -n {{ netobserv_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Delete NetObserv namespace
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete namespace {{ netobserv_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    # =========================================================================
-    # Delete Loki OperatorPolicy
-    # =========================================================================
-    - name: Delete Loki OperatorPolicy
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete operatorpolicy loki-operator-policy -n {{ loki_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Delete Loki OperatorGroup (cleanup after policy removal)
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete operatorgroup openshift-logging -n {{ loki_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Delete Loki Subscription (cleanup after policy removal)
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete subscription loki-operator -n {{ loki_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    # =========================================================================
-    # Delete LokiStack and FlowCollector
-    # =========================================================================
-    - name: Delete FlowCollector
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete flowcollector cluster -n {{ netobserv_namespace }} --ignore-not-found
-      delegate_to: localhost
-      ignore_errors: true
-
-    - name: Wait for FlowCollector deletion
-      shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc get flowcollector cluster -n {{ netobserv_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
-      delegate_to: localhost
-      register: fc_delete_check
-      until: '"deleted" in fc_delete_check.stdout'
-      retries: 10
-      delay: 5
-      changed_when: false
-      ignore_errors: true
-
     - name: Delete LokiStack
       shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-        oc delete lokistack loki -n {{ loki_namespace }} --ignore-not-found
+        oc delete lokistack loki -n {{ loki_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       ignore_errors: true
 
     - name: Wait for LokiStack deletion
       shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
         oc get lokistack loki -n {{ loki_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       register: ls_delete_check
       until: '"deleted" in ls_delete_check.stdout'
-      retries: 10
-      delay: 5
+      retries: 20
+      delay: 10
       changed_when: false
       ignore_errors: true
 
@@ -175,13 +185,49 @@
     # =========================================================================
     - name: Delete Loki S3 credentials secret
       shell: |
-        export KUBECONFIG="{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
         oc delete secret loki-s3-credentials -n {{ loki_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       ignore_errors: true
 
     # =========================================================================
-    # Delete S3 bucket (read bucket name from artifacts)
+    # Operator cleanup (safety net if ACM policy removal didn't cascade)
+    # =========================================================================
+    - name: Delete NetObserv Subscription
+      shell: |
+        oc delete subscription --all -n openshift-netobserv-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete NetObserv CSVs
+      shell: |
+        oc delete csv --all -n openshift-netobserv-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete Loki Subscription
+      shell: |
+        oc delete subscription --all -n openshift-operators-redhat --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete Loki CSVs
+      shell: |
+        oc delete csv -n openshift-operators-redhat -l operators.coreos.com/loki-operator.openshift-operators-redhat --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete S3 bucket
     # =========================================================================
     - name: Check if S3 bucket name was saved
       stat:
@@ -196,11 +242,49 @@
       changed_when: false
       when: s3_bucket_file.stat.exists
 
-    - name: Empty S3 bucket before deletion
+    - name: Empty S3 bucket (current objects)
       shell: |
         AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
         AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
         aws s3 rm s3://{{ saved_s3_bucket.stdout }} --recursive --region {{ aws_deploy_region }}
+      delegate_to: localhost
+      ignore_errors: true
+      when: s3_bucket_file.stat.exists
+
+    - name: Delete all object versions from versioned S3 bucket
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api list-object-versions \
+          --bucket "{{ saved_s3_bucket.stdout }}" \
+          --region "{{ aws_deploy_region }}" \
+          --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+          --output json 2>/dev/null | \
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api delete-objects \
+          --bucket "{{ saved_s3_bucket.stdout }}" \
+          --region "{{ aws_deploy_region }}" \
+          --delete file:///dev/stdin 2>/dev/null || true
+      delegate_to: localhost
+      ignore_errors: true
+      when: s3_bucket_file.stat.exists
+
+    - name: Delete all delete markers from versioned S3 bucket
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api list-object-versions \
+          --bucket "{{ saved_s3_bucket.stdout }}" \
+          --region "{{ aws_deploy_region }}" \
+          --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+          --output json 2>/dev/null | \
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api delete-objects \
+          --bucket "{{ saved_s3_bucket.stdout }}" \
+          --region "{{ aws_deploy_region }}" \
+          --delete file:///dev/stdin 2>/dev/null || true
       delegate_to: localhost
       ignore_errors: true
       when: s3_bucket_file.stat.exists
@@ -226,12 +310,6 @@
     - name: Display cleanup complete
       debug:
         msg: |
-          ✓ NetObserv Cleanup Complete
-          Cluster: {{ cluster_name }}
-          
-          Removed:
-          ✓ FlowCollector
-          ✓ NetObserv operator
-          ✓ LokiStack
-          ✓ Loki operator
-          ✓ S3 bucket ({{ saved_s3_bucket.stdout if s3_bucket_file.stat.exists else 'not found' }})
+          NetObserv Cleanup Complete - {{ cluster_name }}
+          Removed: FlowCollector, LokiStack, S3 credentials, operators
+          S3 bucket: {{ saved_s3_bucket.stdout | default('not found') if s3_bucket_file.stat.exists else 'not found' }}

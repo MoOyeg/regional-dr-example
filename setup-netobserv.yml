@@ -2,26 +2,162 @@
 # =============================================================================
 # NetObserv Setup via ACM Policy
 # =============================================================================
-# This playbook creates an ACM Policy on the hub cluster that deploys NetObserv
-# and Loki operators to managed spoke clusters using OperatorPolicy resources.
+# This playbook:
+# 1. Provisions S3 buckets per cluster for Loki storage (Play 1)
+# 2. Creates an ACM Policy on the hub that deploys Loki, NetObserv operators,
+#    LokiStack with S3 backend, and FlowCollector to managed clusters (Play 2)
 #
-# The Policy includes:
-# 1. Loki operator installation via OperatorPolicy  
-# 2. NetObserv operator installation via OperatorPolicy
-# 3. LokiStack configuration with S3 backend
-# 4. FlowCollector for network flow monitoring
-#
-# Note: S3 bucket provisioning happens outside the policy since it requires
-# per-cluster AWS credentials and is infrastructure-level configuration.
+# The Policy uses hub-side templates ({{hub fromSecret hub}}) to inject
+# per-cluster S3 credentials and bucket configuration.
 #
 # Prerequisites:
 # - ACM installed on hub (run ./ansible-runner.sh operators first)
 # - Spoke clusters imported (run ./ansible-runner.sh import first)
-# - AWS credentials with S3 permissions  
-# - netobserv: true label in cluster inventory
+# - AWS credentials with S3 permissions
+# - netobserv: true in cluster inventory host_vars
 # =============================================================================
 
-- name: Configure NetObserv via ACM Policy
+# =============================================================================
+# Play 1: Provision S3 buckets for Loki storage
+# =============================================================================
+- name: "Play 1: Provision S3 buckets for Loki storage"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip clusters without netobserv enabled
+      meta: end_host
+      when: netobserv is not defined or not netobserv | bool
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Retrieve AWS credentials
+      set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+
+    - name: Validate AWS credentials are available
+      assert:
+        that:
+          - aws_access_key | length > 0
+          - aws_secret_key | length > 0
+        fail_msg: |
+          AWS credentials not found for credential set {{ aws_credential_set }}
+          Set: export AWS_ACCESS_KEY_ID_{{ aws_credential_set }}="..."
+               export AWS_SECRET_ACCESS_KEY_{{ aws_credential_set }}="..."
+
+    - name: Check if S3 bucket already provisioned
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/s3-bucket-name"
+      register: s3_bucket_file
+      delegate_to: localhost
+
+    - name: Read existing S3 bucket name
+      shell: cat {{ artifacts_dir }}/{{ cluster_name }}/s3-bucket-name
+      delegate_to: localhost
+      register: existing_s3_bucket
+      changed_when: false
+      when: s3_bucket_file.stat.exists
+
+    - name: Set existing bucket fact
+      set_fact:
+        s3_bucket_name: "{{ existing_s3_bucket.stdout | trim }}"
+        skip_bucket_creation: true
+      when: s3_bucket_file.stat.exists
+
+    - name: Set skip flag when bucket does not exist
+      set_fact:
+        skip_bucket_creation: false
+      when: not s3_bucket_file.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Create S3 bucket for Loki backend
+    # =========================================================================
+    - name: Generate timestamp for S3 bucket name
+      shell: date +%s
+      delegate_to: localhost
+      register: timestamp_result
+      changed_when: false
+      when: not skip_bucket_creation
+
+    - name: Set S3 bucket name
+      set_fact:
+        s3_bucket_name: "netobserv-loki-{{ cluster_name }}-{{ aws_deploy_region }}-{{ timestamp_result.stdout }}"
+      when: not skip_bucket_creation
+
+    - name: Create S3 bucket for Loki storage
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api create-bucket \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          {% if aws_deploy_region != 'us-east-1' %}--create-bucket-configuration LocationConstraint={{ aws_deploy_region }}{% endif %}
+
+      delegate_to: localhost
+      when: not skip_bucket_creation
+
+    - name: Tag S3 bucket
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api put-bucket-tagging \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          --tagging 'TagSet=[{Key=cluster,Value={{ cluster_name }}},{Key=managed-by,Value=netobserv}]'
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not skip_bucket_creation
+
+    - name: Enable versioning on S3 bucket
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ aws_access_key }}" \
+        AWS_SECRET_ACCESS_KEY="{{ aws_secret_key }}" \
+        aws s3api put-bucket-versioning \
+          --bucket "{{ s3_bucket_name }}" \
+          --region "{{ aws_deploy_region }}" \
+          --versioning-configuration Status=Enabled
+      delegate_to: localhost
+      retries: 3
+      delay: 5
+      when: not skip_bucket_creation
+
+    - name: Save S3 bucket name to artifacts
+      copy:
+        content: "{{ s3_bucket_name }}"
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/s3-bucket-name"
+      delegate_to: localhost
+      when: not skip_bucket_creation
+
+    - name: Display S3 bucket status
+      debug:
+        msg: |
+          S3 Bucket for {{ cluster_name }}:
+          {% if skip_bucket_creation %}
+          Already exists: {{ s3_bucket_name }}
+          {% else %}
+          Created: {{ s3_bucket_name }}
+          Region: {{ aws_deploy_region }}
+          {% endif %}
+
+# =============================================================================
+# Play 2: Configure NetObserv via ACM Policy
+# =============================================================================
+- name: "Play 2: Configure NetObserv via ACM Policy"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -73,11 +209,11 @@
 
     - name: Build list of spoke clusters with netobserv enabled
       set_fact:
-        netobserv_clusters: "{{ groups['openshift_clusters'] | 
-          map('extract', hostvars) | 
-          selectattr('netobserv', 'defined') | 
-          selectattr('netobserv', 'equalto', true) | 
-          map(attribute='cluster_name') | 
+        netobserv_clusters: "{{ groups['openshift_clusters'] |
+          map('extract', hostvars) |
+          selectattr('netobserv', 'defined') |
+          selectattr('netobserv', 'equalto', true) |
+          map(attribute='cluster_name') |
           list }}"
 
     - name: Display netobserv clusters
@@ -114,7 +250,7 @@
         msg: |
           ManagedCluster Name Mapping:
           {% for cluster, mc_name in managedcluster_names.items() %}
-          - {{ cluster }} → {{ mc_name }}
+          - {{ cluster }} -> {{ mc_name }}
           {% endfor %}
 
     - name: Label managed clusters with netobserv=true
@@ -199,80 +335,64 @@
       delegate_to: localhost
 
     # =========================================================================
-    # Create OperatorPolicy resources for Loki and NetObserv
+    # Create hub-side per-cluster secrets for S3 credentials
     # =========================================================================
-    - name: Create OperatorPolicy for Loki operator
+    - name: Read S3 bucket names from artifacts
+      shell: cat {{ artifacts_dir }}/{{ item }}/s3-bucket-name
+      delegate_to: localhost
+      register: s3_bucket_results
+      changed_when: false
+      loop: "{{ netobserv_clusters }}"
+
+    - name: Build per-cluster S3 credential info
+      set_fact:
+        cluster_s3_info: >-
+          {{ cluster_s3_info | default([]) + [{
+            'mc_name': managedcluster_names[item.item],
+            'bucket_name': item.stdout | trim,
+            'access_key': lookup('env', 'AWS_ACCESS_KEY_ID_' + (hostvars[item.item]['aws_credential_set'] | string)),
+            'secret_key': lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (hostvars[item.item]['aws_credential_set'] | string)),
+            'region': lookup('env', 'AWS_REGION_' + (hostvars[item.item]['aws_credential_set'] | string)) | default(hostvars[item.item]['aws_region'], true)
+          }] }}
+      loop: "{{ s3_bucket_results.results }}"
+      no_log: true
+
+    - name: Display per-cluster S3 info (bucket names only)
+      debug:
+        msg: |
+          Per-cluster S3 configuration:
+          {% for info in cluster_s3_info %}
+          - {{ info.mc_name }}: {{ info.bucket_name }} ({{ info.region }})
+          {% endfor %}
+
+    - name: Create netobserv-s3-creds secret per cluster in policy namespace
       shell: |
         oc apply -f - <<'EOF'
-        apiVersion: policy.open-cluster-management.io/v1beta1
-        kind: OperatorPolicy
+        apiVersion: v1
+        kind: Secret
         metadata:
-          name: loki-operator-install
+          name: netobserv-s3-creds-{{ item.mc_name }}
           namespace: {{ policy_namespace }}
-        spec:
-          complianceType: musthave
-          complianceConfig:
-            catalogSourceUnhealthy: NonCompliant
-            deploymentsUnavailable: NonCompliant
-            upgradesAvailable: Compliant
-          remediationAction: enforce
-          removalBehavior:
-            clusterServiceVersions: Delete
-            customResourceDefinitions: Delete
-            operatorGroups: DeleteIfUnused
-            subscriptions: Delete
-          severity: critical
-          upgradeApproval: Automatic
-          subscription:
-            channel: stable
-            name: loki-operator
-            namespace: openshift-operators-redhat
-            source: redhat-operators
-            sourceNamespace: openshift-marketplace
+        type: Opaque
+        stringData:
+          bucketname: "{{ item.bucket_name }}"
+          endpoint: "https://s3.{{ item.region }}.amazonaws.com"
+          access_key_id: "{{ item.access_key }}"
+          access_key_secret: "{{ item.secret_key }}"
+          region: "{{ item.region }}"
         EOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
-
-    - name: Create OperatorPolicy for NetObserv operator
-      shell: |
-        oc apply -f - <<'EOF'
-        apiVersion: policy.open-cluster-management.io/v1beta1
-        kind: OperatorPolicy
-        metadata:
-          name: netobserv-operator-install
-          namespace: {{ policy_namespace }}
-        spec:
-          complianceType: musthave
-          complianceConfig:
-            catalogSourceUnhealthy: NonCompliant
-            deploymentsUnavailable: NonCompliant
-            upgradesAvailable: Compliant
-          remediationAction: enforce
-          removalBehavior:
-            clusterServiceVersions: Delete
-            customResourceDefinitions: Delete
-            operatorGroups: DeleteIfUnused
-            subscriptions: Delete
-          severity: critical
-          upgradeApproval: Automatic
-          subscription:
-            channel: stable
-            name: netobserv-operator
-            namespace: openshift-netobserv-operator
-            source: redhat-operators
-            sourceNamespace: openshift-marketplace
-        EOF
-      environment:
-        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-      delegate_to: localhost
+      no_log: true
+      loop: "{{ cluster_s3_info }}"
 
     # =========================================================================
-    # Create ACM Policy wrapping the OperatorPolicies
+    # Create ACM Policy with operator install + LokiStack + FlowCollector
     # =========================================================================
     - name: Create NetObserv Policy
       shell: |
-        oc apply -f - <<'EOF'
+        oc apply -f - <<'POLICYEOF'
         apiVersion: policy.open-cluster-management.io/v1
         kind: Policy
         metadata:
@@ -287,7 +407,7 @@
           remediationAction: enforce
           policy-templates:
             # ================================================================
-            # Create required namespaces first
+            # 1. Create required namespaces
             # ================================================================
             - objectDefinition:
                 apiVersion: policy.open-cluster-management.io/v1
@@ -310,9 +430,15 @@
                         kind: Namespace
                         metadata:
                           name: openshift-netobserv-operator
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: openshift-logging
 
             # ================================================================
-            # Loki OperatorPolicy
+            # 2. Loki OperatorPolicy
             # ================================================================
             - objectDefinition:
                 apiVersion: policy.open-cluster-management.io/v1
@@ -345,12 +471,15 @@
                           severity: critical
                           upgradeApproval: Automatic
                           subscription:
-                            channel: stable
+                            channel: {{ loki_channel }}
                             name: loki-operator
                             namespace: openshift-operators-redhat
                             source: redhat-operators
                             sourceNamespace: openshift-marketplace
 
+            # ================================================================
+            # 3. NetObserv OperatorPolicy
+            # ================================================================
             - objectDefinition:
                 apiVersion: policy.open-cluster-management.io/v1
                 kind: ConfigurationPolicy
@@ -382,47 +511,177 @@
                           severity: critical
                           upgradeApproval: Automatic
                           subscription:
-                            channel: stable
+                            channel: {{ netobserv_channel }}
                             name: netobserv-operator
                             namespace: openshift-netobserv-operator
                             source: redhat-operators
                             sourceNamespace: openshift-marketplace
-        EOF
+
+            # ================================================================
+            # 4. Loki S3 credentials secret (hub template injection)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: loki-operatorpolicy
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: loki-s3-credentials
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Secret
+                        metadata:
+                          name: loki-s3-credentials
+                          namespace: openshift-logging
+                        type: Opaque
+                        data:
+                          bucketname: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "bucketname" hub}}{% endraw %}'
+                          endpoint: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "endpoint" hub}}{% endraw %}'
+                          access_key_id: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "access_key_id" hub}}{% endraw %}'
+                          access_key_secret: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "access_key_secret" hub}}{% endraw %}'
+                          region: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "region" hub}}{% endraw %}'
+
+            # ================================================================
+            # 5. LokiStack with S3 backend
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: loki-s3-credentials
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: lokistack-config
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: loki.grafana.com/v1
+                        kind: LokiStack
+                        metadata:
+                          name: loki
+                          namespace: openshift-logging
+                        spec:
+                          size: 1x.small
+                          storage:
+                            schemas:
+                            - version: v13
+                              effectiveDate: "2024-10-18"
+                            secret:
+                              name: loki-s3-credentials
+                              type: s3
+                          tenants:
+                            mode: openshift-network
+                          limits:
+                            global:
+                              retention:
+                                days: 7
+                          rules:
+                            enabled: false
+
+            # ================================================================
+            # 6. FlowCollector with LokiStack backend
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: lokistack-config
+                  namespace: ""
+                  compliance: Compliant
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: netobserv-operatorpolicy
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: flowcollector-config
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: flows.netobserv.io/v1beta2
+                        kind: FlowCollector
+                        metadata:
+                          name: cluster
+                        spec:
+                          namespace: netobserv
+                          deploymentModel: Direct
+                          agent:
+                            type: eBPF
+                            ebpf:
+                              sampling: 50
+                              logLevel: info
+                              resources:
+                                requests:
+                                  cpu: 100m
+                                  memory: 50Mi
+                                limits:
+                                  memory: 800Mi
+                          loki:
+                            enable: true
+                            mode: LokiStack
+                            lokiStack:
+                              name: loki
+                              namespace: openshift-logging
+        POLICYEOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
 
-    - name: Wait for Policy to be created
+    # =========================================================================
+    # Wait for policy compliance
+    # =========================================================================
+    - name: Wait for NetObserv policy to be Compliant
       shell: |
-        oc get policy {{ policy_name }} -n {{ policy_namespace }} -o jsonpath='{.metadata.name}'
+        oc get policy {{ policy_name }} -n {{ policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
-      register: policy_check
-      until: policy_check.stdout == policy_name
-      retries: 5
-      delay: 3
+      register: policy_compliance
+      until: policy_compliance.stdout == "Compliant"
+      retries: 120
+      delay: 15
       changed_when: false
+      ignore_errors: true
 
-    - name: Display success message
+    - name: Display policy compliance result
       debug:
         msg: |
-          ✓ NetObserv Policy Created Successfully
-          
-          Policy: {{ policy_name }}
-          Namespace: {{ policy_namespace }}
-          Placement: {{ placement_name }}
-          Target Clusters: {{ netobserv_clusters | join(', ') }}
-          
-          The policy will deploy:
-          - Loki operator (openshift-logging namespace)
-          - NetObserv operator (netobserv namespace)
-          
-          Next steps:
-          1. Wait for operators to install on target clusters
-          2. Configure S3 buckets per cluster (manual or separate playbook)
-          3. Create LokiStack and FlowCollector resources
-          
-          Monitor policy status:
-            oc get policy {{ policy_name }} -n {{ policy_namespace }}
+          NetObserv Policy Status: {{ policy_compliance.stdout | default('Unknown') }}
+          {% if policy_compliance.stdout == 'Compliant' %}
+          All components deployed successfully:
+          - Loki operator installed
+          - NetObserv operator installed
+          - S3 credentials secret created per cluster
+          - LokiStack configured with S3 backend
+          - FlowCollector collecting network flows via eBPF
+          {% else %}
+          Policy is not yet Compliant. Check status:
             oc describe policy {{ policy_name }} -n {{ policy_namespace }}
+          {% endif %}
+
+          Target clusters: {{ netobserv_clusters | join(', ') }}
+
+          Verify on each cluster:
+            oc get lokistack loki -n openshift-logging
+            oc get flowcollector cluster
