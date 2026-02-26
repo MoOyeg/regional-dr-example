@@ -144,6 +144,8 @@ Commands:
     app             Deploy DR-protected sample application (Quarkus + MySQL)
     certs           Install cert-manager and Let's Encrypt wildcard certificate
     netobserv       Install NetObserv for network traffic monitoring
+    acs             Install ACS (Advanced Cluster Security) for cluster security
+    virt            Deploy VM DR example (OpenShift Virtualization + Regional DR)
     validate        Validate configuration and credentials
     list            List configured clusters
     run <playbook>  Run a specific playbook
@@ -169,6 +171,10 @@ Examples:
     $0 netobserv                      # Install NetObserv on clusters with netobserv: true
     $0 netobserv --limit cluster1     # Install on specific cluster
     $0 netobserv --destroy            # Remove NetObserv, Loki, and S3 bucket
+    $0 acs                            # Install ACS Central + SecuredCluster on all clusters
+    $0 acs --destroy                  # Remove ACS from all clusters
+    $0 virt                           # Deploy VM DR example on spoke clusters
+    $0 virt --destroy                 # Remove VM DR example and CNV policy
     $0 operators
     $0 infra-dr
     $0 app                            # Deploy DR-protected sample application
@@ -231,6 +237,38 @@ NetObserv Command (./ansible-runner.sh netobserv):
        oc port-forward -n netobserv svc/netobserv-ui 3000:3000
        # Open http://localhost:3000
 
+ACS Command (./ansible-runner.sh acs):
+    Installs Red Hat Advanced Cluster Security (RHACS) with Central on the hub
+    and SecuredCluster on all managed clusters via ACM Policy.
+
+    Prerequisites:
+    1. Clusters deployed: $0 deploy
+    2. Operators installed: $0 operators
+    3. Clusters imported: $0 import
+
+    What it does:
+    1. Installs ACS operator on hub cluster
+    2. Creates Central CR with route exposure, PVC, and scanner
+    3. Generates init bundle via Central REST API
+    4. Creates ACM Policy to deploy ACS operator on managed clusters
+    5. Injects init bundle TLS secrets via hub templates
+    6. Creates SecuredCluster CR on all managed clusters
+
+    Configuration in inventory/group_vars/all.yml:
+       acs_channel: "stable"           # ACS operator channel
+       acs_deploy_all_clusters: true   # Deploy to all clusters (or set acs: true per cluster)
+
+    Verify installation:
+       oc get central -n stackrox
+       oc get route central -n stackrox
+       oc get securedcluster -n stackrox
+       oc get pods -n stackrox
+
+    Central console:
+       URL: oc get route central -n stackrox -o jsonpath='{.spec.host}'
+       User: admin
+       Pass: oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+
 DR Application Command (./ansible-runner.sh app):
     Deploys TWO DR-protected instances of a sample application (Quarkus + MySQL):
 
@@ -275,6 +313,41 @@ DR Application Command (./ansible-runner.sh app):
        oc get drplacementcontrol -n quarkus-web-app-direct
        oc get pods -n quarkus-web-app          # GitOps instance on spoke
        oc get pods -n quarkus-web-app-direct   # Direct instance on spoke
+
+VM DR Example Command (./ansible-runner.sh virt):
+    Deploys a DR-protected VirtualMachine between spoke clusters using
+    OpenShift Virtualization operator (via ACM Policy) and GitOps (ArgoCD).
+
+    Prerequisites:
+    1. Clusters deployed: $0 deploy
+    2. Operators installed: $0 operators
+    3. Clusters imported: $0 import
+    4. DR infrastructure configured: $0 infra-dr
+    5. DR app deployed (for GitOps setup): $0 app
+    6. app_git_url configured pointing to repo with vm-app/ directory
+
+    What it does:
+    1. Installs OpenShift Virtualization operator on spokes via ACM Policy
+    2. Waits for HyperConverged CR readiness on each spoke
+    3. Deploys Fedora VM with persistent data disk via ArgoCD ApplicationSet
+    4. Creates DRPlacementControl for VM failover/relocate
+    5. Verifies VM is running and test data is written
+
+    Failover:
+       oc patch drplacementcontrol vm-dr-example-gitops-drpc -n openshift-gitops \\
+         --type=merge --patch='{"spec":{"action":"Failover","failoverCluster":"<cluster>"}}'
+
+    Relocate (failback):
+       oc patch drplacementcontrol vm-dr-example-gitops-drpc -n openshift-gitops \\
+         --type=merge --patch='{"spec":{"action":"Relocate","preferredCluster":"<cluster>"}}'
+
+    Verify installation:
+       oc get hyperconverged -n openshift-cnv       # CNV operator on spokes
+       oc get vm -n vm-example                      # VM on preferred spoke
+       oc get vmi -n vm-example                     # VM instance
+       oc get pvc -n vm-example                     # Persistent data disk
+       oc get applicationset -n openshift-gitops    # ArgoCD ApplicationSet
+       oc get drplacementcontrol -n openshift-gitops # DR protection
 
 Environment Variables:
     AWS_ACCESS_KEY_ID_1         Primary AWS access key
@@ -427,6 +500,38 @@ case "${1:-}" in
         for arg in "$@"; do
             if [ "$arg" = "--destroy" ]; then
                 playbook="destroy-netobserv.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    acs)
+        build_image
+        shift
+        # Check for --destroy flag and switch playbook
+        filtered_args=()
+        playbook="setup-acs.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-acs.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    virt)
+        build_image
+        shift
+        # Check for --destroy flag and switch playbook
+        filtered_args=()
+        playbook="setup-virt.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-virt.yml"
             else
                 filtered_args+=("$arg")
             fi

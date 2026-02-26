@@ -1,0 +1,1008 @@
+---
+# =============================================================================
+# ACS (Advanced Cluster Security) Setup
+# =============================================================================
+# This playbook:
+# 1. Installs ACS operator + Central directly on the hub cluster (Play 1)
+# 2. Generates init bundle and prepares hub-side secrets (Play 2)
+# 3. Creates ACM Policy to deploy ACS operator + SecuredCluster on managed clusters (Play 3)
+#
+# The Policy uses hub-side templates ({{hub fromSecret hub}}) to inject
+# per-cluster init bundle TLS secrets and Central endpoint configuration.
+#
+# Prerequisites:
+# - ACM installed on hub (run ./ansible-runner.sh operators first)
+# - Spoke clusters imported (run ./ansible-runner.sh import first)
+# =============================================================================
+
+# =============================================================================
+# Play 1: Install ACS operator and Central on hub
+# =============================================================================
+- name: "Play 1: Install ACS operator and Central on hub"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found. Deploy the hub cluster first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify cluster connectivity
+      shell: oc whoami
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Check ACM CSV is Succeeded
+      shell: |
+        oc get csv -n open-cluster-management \
+          -o jsonpath='{.items[?(@.spec.displayName=="Advanced Cluster Management for Kubernetes")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acm_csv_status
+      changed_when: false
+
+    - name: Fail if ACM is not installed
+      fail:
+        msg: >-
+          ACM operator is not in Succeeded state (got: '{{ acm_csv_status.stdout }}').
+          Run './ansible-runner.sh operators' first.
+      when: "'Succeeded' not in acm_csv_status.stdout"
+
+    - name: Discover latest ACS operator channel
+      shell: |
+        oc get packagemanifest rhacs-operator -n openshift-marketplace \
+          -o jsonpath='{.status.channels[*].name}' | tr ' ' '\n' | grep '^stable' | sort -V | tail -1
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acs_channel_result
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set discovered ACS channel
+      set_fact:
+        acs_channel: "{{ acs_channel_result.stdout | trim }}"
+      when: acs_channel_result is succeeded and acs_channel_result.stdout | trim | length > 0
+
+    - name: Display ACS operator channel
+      debug:
+        msg: "ACS operator channel: {{ acs_channel }}"
+
+  tasks:
+    # =========================================================================
+    # Create namespaces
+    # =========================================================================
+    - name: Wait for stackrox namespace to finish terminating (if applicable)
+      shell: |
+        STATUS=$(oc get namespace stackrox -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+        if [ "$STATUS" = "Terminating" ]; then
+          exit 1
+        fi
+        echo "$STATUS"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: stackrox_ns_status
+      until: stackrox_ns_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Create stackrox namespace
+      shell: oc create namespace stackrox
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: create_stackrox_ns
+      failed_when: create_stackrox_ns.rc != 0 and 'already exists' not in create_stackrox_ns.stderr
+
+    - name: Wait for rhacs-operator namespace to finish terminating (if applicable)
+      shell: |
+        STATUS=$(oc get namespace rhacs-operator -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+        if [ "$STATUS" = "Terminating" ]; then
+          exit 1
+        fi
+        echo "$STATUS"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhacs_ns_status
+      until: rhacs_ns_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Create rhacs-operator namespace
+      shell: oc create namespace rhacs-operator
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: create_rhacs_ns
+      failed_when: create_rhacs_ns.rc != 0 and 'already exists' not in create_rhacs_ns.stderr
+
+    # =========================================================================
+    # Install ACS operator
+    # =========================================================================
+    - name: Create ACS OperatorGroup
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: rhacs-operator
+          namespace: rhacs-operator
+        spec:
+          upgradeStrategy: Default
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ACS Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: rhacs-operator
+          namespace: rhacs-operator
+        spec:
+          channel: {{ acs_channel }}
+          installPlanApproval: Automatic
+          name: rhacs-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ACS operator CSV to succeed
+      shell: |
+        oc get csv -n rhacs-operator \
+          -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' | grep rhacs
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acs_csv_status
+      until: "'Succeeded' in acs_csv_status.stdout"
+      retries: 30
+      delay: 20
+      changed_when: false
+
+    - name: Wait for Central CRD to be available
+      shell: oc get crd centrals.platform.stackrox.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_crd_check
+      until: central_crd_check.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    # =========================================================================
+    # Create Central CR
+    # =========================================================================
+    - name: Create Central CR
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: platform.stackrox.io/v1alpha1
+        kind: Central
+        metadata:
+          name: {{ acs_central_name }}
+          namespace: stackrox
+        spec:
+          central:
+            exposure:
+              loadBalancer:
+                enabled: false
+                port: 443
+              nodePort:
+                enabled: false
+              route:
+                enabled: true
+            persistence:
+              persistentVolumeClaim:
+                claimName: stackrox-db
+                size: {{ acs_central_pvc_size | default('100Gi') }}
+            db:
+              isEnabled: Default
+              persistence:
+                persistentVolumeClaim:
+                  claimName: central-db
+                  size: {{ acs_central_pvc_size | default('100Gi') }}
+          egress:
+            connectivityPolicy: Online
+          scanner:
+            analyzer:
+              scaling:
+                autoScaling: Enabled
+                maxReplicas: {{ acs_scanner_max_replicas | default(5) }}
+                minReplicas: {{ acs_scanner_min_replicas | default(2) }}
+                replicas: {{ acs_scanner_replicas | default(3) }}
+            scannerComponent: Enabled
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for Central to be ready
+      shell: |
+        oc get central {{ acs_central_name }} -n stackrox \
+          -o jsonpath='{.status.conditions[?(@.type=="Deployed")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_status
+      until: "'True' in central_status.stdout"
+      retries: 60
+      delay: 15
+      changed_when: false
+
+    - name: Display Central installation success
+      debug:
+        msg: |
+          ACS Central Installed on Hub
+          Cluster: {{ cluster_name }}
+          Central: {{ acs_central_name }}
+          Namespace: stackrox
+          ACS Channel: {{ acs_channel }}
+
+# =============================================================================
+# Play 2: Generate init bundle and prepare hub-side secrets
+# =============================================================================
+- name: "Play 2: Generate init bundle and prepare hub-side secrets"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_namespace: "acs-policy"
+    init_bundle_name: "acm-init-bundle"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify Central is deployed
+      shell: |
+        oc get central {{ acs_central_name | default('stackrox-central-services') }} -n stackrox \
+          -o jsonpath='{.status.conditions[?(@.type=="Deployed")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_deployed_check
+      changed_when: false
+
+    - name: Fail if Central is not deployed
+      fail:
+        msg: >-
+          Central is not in Deployed=True state (got: '{{ central_deployed_check.stdout }}').
+          Play 1 must complete successfully before Play 2 can run.
+      when: "'True' not in central_deployed_check.stdout"
+
+    - name: Get Central route URL
+      shell: |
+        oc get route central -n stackrox -o jsonpath='{.spec.host}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_route_result
+      retries: 10
+      delay: 10
+      until: central_route_result.stdout | length > 0
+      changed_when: false
+
+    - name: Set Central endpoint fact
+      set_fact:
+        central_route: "{{ central_route_result.stdout | trim }}"
+        central_endpoint: "{{ central_route_result.stdout | trim }}:443"
+
+    - name: Get Central admin password
+      shell: |
+        oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_password_result
+      # no_log: true  # DEBUG
+
+    - name: Set Central admin password fact
+      set_fact:
+        central_admin_password: "{{ central_password_result.stdout | trim }}"
+      # no_log: true  # DEBUG
+
+    - name: Build list of ACS target clusters (all)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | map(attribute='cluster_name') | list }}"
+      when: acs_deploy_all_clusters | default(true)
+
+    - name: Build list of ACS target clusters (selective)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('acs', 'defined') | selectattr('acs', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (acs_deploy_all_clusters | default(true))
+
+    - name: Display ACS target clusters
+      debug:
+        msg: "ACS SecuredCluster will be deployed on: {{ acs_clusters | join(', ') }}"
+
+    - name: End play if no target clusters
+      meta: end_play
+      when: acs_clusters | length == 0
+
+  tasks:
+    # =========================================================================
+    # Check for existing init bundle and revoke if needed
+    # =========================================================================
+    - name: Check if init bundle already exists
+      shell: |
+        curl -sk -u "admin:${ACS_PASSWORD}" \
+          "https://{{ central_route }}/v1/cluster-init/init-bundles" | \
+          jq -r '.items[]? | select(.name == "{{ init_bundle_name }}") | .name'
+      environment:
+        ACS_PASSWORD: "{{ central_admin_password }}"
+      delegate_to: localhost
+      register: existing_bundle
+      changed_when: false
+      # no_log: true  # DEBUG
+
+    - name: Get existing init bundle ID for revocation
+      shell: |
+        curl -sk -u "admin:${ACS_PASSWORD}" \
+          "https://{{ central_route }}/v1/cluster-init/init-bundles" | \
+          jq -r '.items[]? | select(.name == "{{ init_bundle_name }}") | .id'
+      environment:
+        ACS_PASSWORD: "{{ central_admin_password }}"
+      delegate_to: localhost
+      register: existing_bundle_id
+      changed_when: false
+      # no_log: true  # DEBUG
+      when: existing_bundle.stdout | trim | length > 0
+
+    - name: Revoke existing init bundle
+      shell: |
+        curl -sk -u "admin:${ACS_PASSWORD}" \
+          -X PATCH "https://{{ central_route }}/v1/cluster-init/init-bundles/revoke" \
+          -H "Content-Type: application/json" \
+          -d '{"ids": ["{{ existing_bundle_id.stdout | trim }}"], "confirmImpactedClustersIds": []}'
+      environment:
+        ACS_PASSWORD: "{{ central_admin_password }}"
+      delegate_to: localhost
+      # no_log: true  # DEBUG
+      when:
+        - existing_bundle.stdout | trim | length > 0
+        - existing_bundle_id.stdout | trim | length > 0
+
+    # =========================================================================
+    # Generate new init bundle
+    # =========================================================================
+    - name: Generate init bundle via Central API
+      shell: |
+        RESPONSE=$(curl -sk -u "admin:${ACS_PASSWORD}" \
+          -X POST "https://{{ central_route }}/v1/cluster-init/init-bundles" \
+          -H "Content-Type: application/json" \
+          -d '{"name": "{{ init_bundle_name }}"}')
+        # Validate response is non-empty and contains expected field
+        # Note: jq 1.5 returns 0 on empty input (no values = no error), so check $RESPONSE first
+        if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.kubectlBundle' > /dev/null 2>&1; then
+          echo "$RESPONSE"
+        else
+          echo "ERROR: Init bundle API did not return kubectlBundle field" >&2
+          echo "Response length: $(echo -n "$RESPONSE" | wc -c)" >&2
+          echo "API Response keys: $(echo "$RESPONSE" | jq -r 'keys | join(", ")' 2>/dev/null || echo 'invalid JSON or empty')" >&2
+          echo "Error details: $(echo "$RESPONSE" | jq -r '.message // .error // empty' 2>/dev/null)" >&2
+          exit 1
+        fi
+      environment:
+        ACS_PASSWORD: "{{ central_admin_password }}"
+      delegate_to: localhost
+      register: init_bundle_response
+      retries: 18
+      delay: 10
+      until: init_bundle_response.rc == 0 and init_bundle_response.stdout | trim | length > 0
+      # no_log: true  # DEBUG
+
+    - name: Validate init bundle response
+      fail:
+        msg: >-
+          Init bundle generation failed after retries.
+          rc={{ init_bundle_response.rc }},
+          stdout={{ init_bundle_response.stdout | default('') | truncate(200) }},
+          stderr={{ init_bundle_response.stderr | default('') | truncate(500) }}.
+      when: init_bundle_response.rc != 0 or init_bundle_response.stdout | trim | length == 0
+
+    - name: Parse init bundle JSON response
+      set_fact:
+        init_bundle_json: "{{ init_bundle_response.stdout | trim | from_json }}"
+      # no_log: true  # DEBUG
+
+    - name: Extract and decode init bundle Kubernetes secrets
+      set_fact:
+        init_bundle_k8s_secrets: "{{ init_bundle_json.kubectlBundle | b64decode }}"
+      # no_log: true  # DEBUG
+
+    - name: Save init bundle secrets to artifacts
+      copy:
+        content: "{{ init_bundle_k8s_secrets }}"
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/acs-init-bundle-secrets.yml"
+        mode: '0600'
+      delegate_to: localhost
+      # no_log: true  # DEBUG
+
+    # =========================================================================
+    # Apply init bundle secrets to hub stackrox namespace
+    # =========================================================================
+    - name: Apply init bundle secrets to hub stackrox namespace
+      shell: |
+        oc apply -n stackrox -f {{ artifacts_dir }}/{{ cluster_name }}/acs-init-bundle-secrets.yml
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Extract TLS cert/key fields from the init bundle secrets
+    # =========================================================================
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in acs_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+    - name: Display managedcluster mapping
+      debug:
+        msg: |
+          ManagedCluster Name Mapping:
+          {% for cluster, mc_name in managedcluster_names.items() %}
+          - {{ cluster }} -> {{ mc_name }}
+          {% endfor %}
+
+    - name: Extract sensor-tls secret data
+      shell: |
+        oc get secret sensor-tls -n stackrox -o json | jq -r '.data'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sensor_tls_data
+      # no_log: true  # DEBUG
+
+    - name: Extract collector-tls secret data
+      shell: |
+        oc get secret collector-tls -n stackrox -o json | jq -r '.data'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: collector_tls_data
+      # no_log: true  # DEBUG
+
+    - name: Extract admission-control-tls secret data
+      shell: |
+        oc get secret admission-control-tls -n stackrox -o json | jq -r '.data'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: admission_control_tls_data
+      # no_log: true  # DEBUG
+
+    - name: Set TLS data facts
+      set_fact:
+        sensor_tls: "{{ sensor_tls_data.stdout | from_json }}"
+        collector_tls: "{{ collector_tls_data.stdout | from_json }}"
+        admission_control_tls: "{{ admission_control_tls_data.stdout | from_json }}"
+      # no_log: true  # DEBUG
+
+    # =========================================================================
+    # Create policy namespace and per-cluster hub-side secrets
+    # =========================================================================
+    - name: Create ACS policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create per-cluster hub-side ACS config secret
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: acs-config-{{ managedcluster_names[item] }}
+          namespace: {{ policy_namespace }}
+        type: Opaque
+        data:
+          central_endpoint: "{{ central_endpoint | b64encode }}"
+          sensor_ca_pem: "{{ sensor_tls['ca.pem'] }}"
+          sensor_cert_pem: "{{ sensor_tls['sensor-cert.pem'] }}"
+          sensor_key_pem: "{{ sensor_tls['sensor-key.pem'] }}"
+          acs_host: "{{ central_endpoint | b64encode }}"
+          collector_ca_pem: "{{ collector_tls['ca.pem'] }}"
+          collector_cert_pem: "{{ collector_tls['collector-cert.pem'] }}"
+          collector_key_pem: "{{ collector_tls['collector-key.pem'] }}"
+          admission_control_ca_pem: "{{ admission_control_tls['ca.pem'] }}"
+          admission_control_cert_pem: "{{ admission_control_tls['admission-control-cert.pem'] }}"
+          admission_control_key_pem: "{{ admission_control_tls['admission-control-key.pem'] }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      # no_log: true  # DEBUG
+      loop: "{{ acs_clusters }}"
+
+    - name: Display init bundle preparation success
+      debug:
+        msg: |
+          ACS Init Bundle Prepared
+          Central Route: {{ central_route }}
+          Central Endpoint: {{ central_endpoint }}
+          Init Bundle: {{ init_bundle_name }}
+          Hub secrets created for: {{ acs_clusters | join(', ') }}
+
+# =============================================================================
+# Play 3: Create ACM Policy for SecuredCluster deployment on managed clusters
+# =============================================================================
+- name: "Play 3: Create ACM Policy for SecuredCluster on managed clusters"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "acs-secured-cluster-policy"
+    policy_namespace: "acs-policy"
+    placement_name: "acs-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of ACS target clusters (all)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | map(attribute='cluster_name') | list }}"
+      when: acs_deploy_all_clusters | default(true)
+
+    - name: Build list of ACS target clusters (selective)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('acs', 'defined') | selectattr('acs', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (acs_deploy_all_clusters | default(true))
+
+    - name: End play if no target clusters
+      meta: end_play
+      when: acs_clusters | length == 0
+
+    - name: Verify ACS policy namespace exists
+      shell: oc get namespace {{ policy_namespace }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in acs_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+    - name: Discover latest ACS operator channel
+      shell: |
+        oc get packagemanifest rhacs-operator -n openshift-marketplace \
+          -o jsonpath='{.status.channels[*].name}' | tr ' ' '\n' | grep '^stable' | sort -V | tail -1
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: acs_channel_result
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set discovered ACS channel
+      set_fact:
+        acs_channel: "{{ acs_channel_result.stdout | trim }}"
+      when: acs_channel_result is succeeded and acs_channel_result.stdout | trim | length > 0
+
+    - name: Display operator channel
+      debug:
+        msg: "ACS operator channel for managed clusters: {{ acs_channel }}"
+
+  tasks:
+    # =========================================================================
+    # Label managed clusters for placement
+    # =========================================================================
+    - name: Label managed clusters with acs=true
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} acs=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ acs_clusters }}"
+      changed_when: false
+
+    # =========================================================================
+    # Create Placement, PlacementBinding, ManagedClusterSetBinding
+    # =========================================================================
+    - name: Bind global ManagedClusterSet to ACS policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for ACS clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    acs: "true"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create PlacementBinding
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ policy_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create ACM Policy with operator install + init bundle secrets + SecuredCluster
+    # =========================================================================
+    - name: Create ACS Secured Cluster Policy
+      shell: |
+        oc apply -f - <<'POLICYEOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: Policy
+        metadata:
+          name: {{ policy_name }}
+          namespace: {{ policy_namespace }}
+          annotations:
+            policy.open-cluster-management.io/categories: SC System and Communications Protection
+            policy.open-cluster-management.io/standards: NIST SP 800-53
+            policy.open-cluster-management.io/controls: SC-1 System and Communications Protection Policy and Procedures
+        spec:
+          disabled: false
+          remediationAction: enforce
+          policy-templates:
+            # ================================================================
+            # 1. Create required namespaces
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: acs-namespaces
+                spec:
+                  remediationAction: enforce
+                  severity: low
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: stackrox
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: rhacs-operator
+
+            # ================================================================
+            # 2. ACS OperatorPolicy (install rhacs-operator)
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1beta1
+                kind: OperatorPolicy
+                metadata:
+                  name: acs-operator-install
+                spec:
+                  complianceType: musthave
+                  complianceConfig:
+                    catalogSourceUnhealthy: NonCompliant
+                    deploymentsUnavailable: NonCompliant
+                    upgradesAvailable: Compliant
+                  remediationAction: enforce
+                  removalBehavior:
+                    clusterServiceVersions: Delete
+                    customResourceDefinitions: Delete
+                    operatorGroups: DeleteIfUnused
+                    subscriptions: Delete
+                  severity: critical
+                  upgradeApproval: Automatic
+                  subscription:
+                    channel: {{ acs_channel }}
+                    name: rhacs-operator
+                    namespace: rhacs-operator
+                    source: redhat-operators
+                    sourceNamespace: openshift-marketplace
+
+            # ================================================================
+            # 3. Init bundle secret - sensor-tls (hub template injection)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1beta1
+                  kind: OperatorPolicy
+                  name: acs-operator-install
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: acs-sensor-tls-secret
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Secret
+                        metadata:
+                          name: sensor-tls
+                          namespace: stackrox
+                        type: Opaque
+                        data:
+                          ca.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "sensor_ca_pem" hub}}{% endraw %}'
+                          sensor-cert.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "sensor_cert_pem" hub}}{% endraw %}'
+                          sensor-key.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "sensor_key_pem" hub}}{% endraw %}'
+                          acs-host: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "acs_host" hub}}{% endraw %}'
+
+            # ================================================================
+            # 4. Init bundle secret - collector-tls (hub template injection)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: acs-sensor-tls-secret
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: acs-collector-tls-secret
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Secret
+                        metadata:
+                          name: collector-tls
+                          namespace: stackrox
+                        type: Opaque
+                        data:
+                          ca.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "collector_ca_pem" hub}}{% endraw %}'
+                          collector-cert.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "collector_cert_pem" hub}}{% endraw %}'
+                          collector-key.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "collector_key_pem" hub}}{% endraw %}'
+
+            # ================================================================
+            # 5. Init bundle secret - admission-control-tls (hub template injection)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: acs-collector-tls-secret
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: acs-admission-control-tls-secret
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Secret
+                        metadata:
+                          name: admission-control-tls
+                          namespace: stackrox
+                        type: Opaque
+                        data:
+                          ca.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "admission_control_ca_pem" hub}}{% endraw %}'
+                          admission-control-cert.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "admission_control_cert_pem" hub}}{% endraw %}'
+                          admission-control-key.pem: '{% raw %}{{hub fromSecret "acs-policy" (printf "acs-config-%s" .ManagedClusterName) "admission_control_key_pem" hub}}{% endraw %}'
+
+            # ================================================================
+            # 6. SecuredCluster CR (depends on all TLS secrets)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  name: acs-admission-control-tls-secret
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: acs-secured-cluster
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: platform.stackrox.io/v1alpha1
+                        kind: SecuredCluster
+                        metadata:
+                          name: stackrox-secured-cluster-services
+                          namespace: stackrox
+                        spec:
+                          auditLogs:
+                            collection: Auto
+                          admissionControl:
+                            listenOnCreates: false
+                            listenOnUpdates: false
+                            listenOnEvents: true
+                          centralEndpoint: '{{ central_endpoint }}'
+                          clusterName: '{% raw %}{{hub .ManagedClusterName hub}}{% endraw %}'
+                          perNode:
+                            collector:
+                              collection: EBPF
+                              imageFlavor: Regular
+                            taintToleration: TolerateTaints
+        POLICYEOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Wait for policy compliance
+    # =========================================================================
+    - name: Wait for ACS policy to be Compliant
+      shell: |
+        oc get policy {{ policy_name }} -n {{ policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: policy_compliance
+      until: policy_compliance.stdout == "Compliant"
+      retries: 120
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    - name: Get Central route for display
+      shell: |
+        oc get route central -n stackrox -o jsonpath='{.spec.host}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_route_display
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display ACS deployment result
+      debug:
+        msg: |
+          ACS Deployment Complete
+          Policy Status: {{ policy_compliance.stdout | default('Unknown') }}
+          {% if policy_compliance.stdout == 'Compliant' %}
+          All components deployed successfully:
+          - ACS operator installed on managed clusters
+          - Init bundle TLS secrets injected
+          - SecuredCluster CR created
+          {% else %}
+          Policy is not yet Compliant. Check status:
+            oc describe policy {{ policy_name }} -n {{ policy_namespace }}
+          {% endif %}
+
+          Target clusters: {{ acs_clusters | join(', ') }}
+
+          Central console:
+            https://{{ central_route_display.stdout | default('(check hub route)') }}
+            Username: admin
+            Password: oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+
+          Verify on each cluster:
+            oc get securedcluster -n stackrox
+            oc get pods -n stackrox

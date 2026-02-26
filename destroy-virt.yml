@@ -1,0 +1,281 @@
+---
+# =============================================================================
+# VM DR Example — Cleanup
+# =============================================================================
+# Play 1: Remove GitOps DR resources from hub
+# Play 2: Clean up VM resources on managed clusters (safety net)
+# Play 3: Remove ACM Policy and CNV operator policy from hub
+# =============================================================================
+
+# =============================================================================
+# Play 1: Remove GitOps DR resources from hub
+# =============================================================================
+- name: "Play 1: Remove GitOps DR resources from hub"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Delete DRPlacementControl first (must be removed before Placement)
+    # =========================================================================
+    - name: Delete VM DRPlacementControl
+      shell: |
+        oc delete drplacementcontrol {{ virt_app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for DRPC deletion
+      shell: |
+        oc get drplacementcontrol {{ virt_app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: drpc_delete_check
+      until: '"deleted" in drpc_delete_check.stdout'
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete ApplicationSet (this cascades to Application resources)
+    # =========================================================================
+    - name: Delete VM ApplicationSet
+      shell: |
+        oc delete applicationset {{ virt_app_name }}-gitops-appset \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete Placement and stale PlacementDecisions
+    # =========================================================================
+    - name: Delete stale PlacementDecisions
+      shell: |
+        oc delete placementdecision \
+          -l cluster.open-cluster-management.io/placement={{ virt_app_name }}-gitops-placement \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete VM Placement
+      shell: |
+        oc delete placement {{ virt_app_name }}-gitops-placement \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display hub DR cleanup result
+      debug:
+        msg: |
+          VM DR Hub Cleanup Complete:
+          - Deleted DRPlacementControl: {{ virt_app_name }}-gitops-drpc
+          - Deleted ApplicationSet: {{ virt_app_name }}-gitops-appset
+          - Deleted Placement: {{ virt_app_name }}-gitops-placement
+
+# =============================================================================
+# Play 2: Clean up VM resources on managed clusters (safety net)
+# =============================================================================
+- name: "Play 2: Clean up VM resources on managed clusters"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Verify kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Stop and delete VMs
+    # =========================================================================
+    - name: Delete all VirtualMachines in vm namespace
+      shell: |
+        oc delete vm --all -n {{ virt_namespace }} --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from VMs if stuck
+      shell: |
+        for vm in $(oc get vm -n {{ virt_namespace }} -o name 2>/dev/null); do
+          oc patch "$vm" -n {{ virt_namespace }} --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for VM deletion
+      shell: |
+        oc get vm -n {{ virt_namespace }} 2>&1 | grep -qE "No resources|not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: vm_delete_check
+      until: '"deleted" in vm_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete namespace
+    # =========================================================================
+    - name: Delete VM namespace
+      shell: |
+        oc delete namespace {{ virt_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display spoke cleanup complete
+      debug:
+        msg: |
+          VM Cleanup Complete - {{ cluster_name }}
+          Removed: VirtualMachines, {{ virt_namespace }} namespace
+
+# =============================================================================
+# Play 3: Remove ACM Policy and CNV operator policy from hub
+# =============================================================================
+- name: "Play 3: Remove ACM Policy and CNV operator policy from hub"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_namespace: "cnv-policy"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of virt clusters (all spokes)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('cluster_role', 'defined') | selectattr('cluster_role', 'equalto', 'spoke') | map(attribute='cluster_name') | list + groups['openshift_clusters'] | map('extract', hostvars) | rejectattr('cluster_role', 'defined') | map(attribute='cluster_name') | list }}"
+      when: virt_deploy_all_clusters | default(true)
+
+    - name: Build list of virt clusters (selective)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('virt', 'defined') | selectattr('virt', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (virt_deploy_all_clusters | default(true))
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in virt_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+  tasks:
+    # =========================================================================
+    # Remove labels from managed clusters
+    # =========================================================================
+    - name: Remove cnv=true label from managed clusters
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} cnv- --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete CNV policy namespace (cascades Policy, Placement, PlacementBinding)
+    # =========================================================================
+    - name: Delete CNV policy namespace
+      shell: |
+        oc delete namespace {{ policy_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for CNV policy namespace deletion
+      shell: |
+        oc get namespace {{ policy_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: ns_delete_check
+      until: '"deleted" in ns_delete_check.stdout'
+      retries: 20
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display hub policy cleanup result
+      debug:
+        msg: |
+          CNV Policy Cleanup Complete:
+          - Removed cnv=true labels from: {{ virt_clusters | join(', ') }}
+          - Deleted policy namespace: {{ policy_namespace }}
+          Note: CNV operator remains installed on spoke clusters.
+          To fully remove the operator, delete the HyperConverged CR and
+          Subscription/CSV on each spoke cluster manually.

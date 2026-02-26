@@ -207,6 +207,42 @@
           Run './ansible-runner.sh operators' first.
       when: "'Succeeded' not in acm_csv_status.stdout"
 
+    - name: Discover latest Loki operator channel
+      shell: |
+        oc get packagemanifest loki-operator -n openshift-marketplace \
+          -o jsonpath='{.status.channels[*].name}' | tr ' ' '\n' | grep '^stable' | sort -V | tail -1
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: loki_channel_result
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set discovered Loki channel
+      set_fact:
+        loki_channel: "{{ loki_channel_result.stdout | trim }}"
+      when: loki_channel_result is succeeded and loki_channel_result.stdout | trim | length > 0
+
+    - name: Discover latest NetObserv operator channel
+      shell: |
+        oc get packagemanifest netobserv-operator -n openshift-marketplace \
+          -o jsonpath='{.status.channels[*].name}' | tr ' ' '\n' | grep '^stable' | sort -V | tail -1
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: netobserv_channel_result
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set discovered NetObserv channel
+      set_fact:
+        netobserv_channel: "{{ netobserv_channel_result.stdout | trim }}"
+      when: netobserv_channel_result is succeeded and netobserv_channel_result.stdout | trim | length > 0
+
+    - name: Display operator channels
+      debug:
+        msg: "Operator channels - Loki: {{ loki_channel }}, NetObserv: {{ netobserv_channel }}"
+
     - name: Build list of spoke clusters with netobserv enabled
       set_fact:
         netobserv_clusters: "{{ groups['openshift_clusters'] |
@@ -375,7 +411,7 @@
           namespace: {{ policy_namespace }}
         type: Opaque
         stringData:
-          bucketname: "{{ item.bucket_name }}"
+          bucketnames: "{{ item.bucket_name }}"
           endpoint: "https://s3.{{ item.region }}.amazonaws.com"
           access_key_id: "{{ item.access_key }}"
           access_key_secret: "{{ item.secret_key }}"
@@ -438,92 +474,72 @@
                           name: openshift-logging
 
             # ================================================================
-            # 2. Loki OperatorPolicy
+            # 2. Loki OperatorPolicy (direct policy-template so
+            #    extraDependencies can wait for the CSV to be Succeeded
+            #    before creating CRs that need the CRDs)
             # ================================================================
             - objectDefinition:
-                apiVersion: policy.open-cluster-management.io/v1
-                kind: ConfigurationPolicy
+                apiVersion: policy.open-cluster-management.io/v1beta1
+                kind: OperatorPolicy
                 metadata:
-                  name: loki-operatorpolicy
+                  name: loki-operator-install
                 spec:
+                  complianceType: musthave
+                  complianceConfig:
+                    catalogSourceUnhealthy: NonCompliant
+                    deploymentsUnavailable: NonCompliant
+                    upgradesAvailable: Compliant
                   remediationAction: enforce
-                  severity: high
-                  object-templates:
-                    - complianceType: musthave
-                      objectDefinition:
-                        apiVersion: policy.open-cluster-management.io/v1beta1
-                        kind: OperatorPolicy
-                        metadata:
-                          name: loki-operator-install
-                          namespace: openshift-operators-redhat
-                        spec:
-                          complianceType: musthave
-                          complianceConfig:
-                            catalogSourceUnhealthy: NonCompliant
-                            deploymentsUnavailable: NonCompliant
-                            upgradesAvailable: Compliant
-                          remediationAction: enforce
-                          removalBehavior:
-                            clusterServiceVersions: Delete
-                            customResourceDefinitions: Delete
-                            operatorGroups: DeleteIfUnused
-                            subscriptions: Delete
-                          severity: critical
-                          upgradeApproval: Automatic
-                          subscription:
-                            channel: {{ loki_channel }}
-                            name: loki-operator
-                            namespace: openshift-operators-redhat
-                            source: redhat-operators
-                            sourceNamespace: openshift-marketplace
+                  removalBehavior:
+                    clusterServiceVersions: Delete
+                    customResourceDefinitions: Delete
+                    operatorGroups: DeleteIfUnused
+                    subscriptions: Delete
+                  severity: critical
+                  upgradeApproval: Automatic
+                  subscription:
+                    channel: {{ loki_channel }}
+                    name: loki-operator
+                    namespace: openshift-operators-redhat
+                    source: redhat-operators
+                    sourceNamespace: openshift-marketplace
 
             # ================================================================
-            # 3. NetObserv OperatorPolicy
+            # 3. NetObserv OperatorPolicy (direct policy-template)
             # ================================================================
             - objectDefinition:
-                apiVersion: policy.open-cluster-management.io/v1
-                kind: ConfigurationPolicy
+                apiVersion: policy.open-cluster-management.io/v1beta1
+                kind: OperatorPolicy
                 metadata:
-                  name: netobserv-operatorpolicy
+                  name: netobserv-operator-install
                 spec:
+                  complianceType: musthave
+                  complianceConfig:
+                    catalogSourceUnhealthy: NonCompliant
+                    deploymentsUnavailable: NonCompliant
+                    upgradesAvailable: Compliant
                   remediationAction: enforce
-                  severity: high
-                  object-templates:
-                    - complianceType: musthave
-                      objectDefinition:
-                        apiVersion: policy.open-cluster-management.io/v1beta1
-                        kind: OperatorPolicy
-                        metadata:
-                          name: netobserv-operator-install
-                          namespace: openshift-netobserv-operator
-                        spec:
-                          complianceType: musthave
-                          complianceConfig:
-                            catalogSourceUnhealthy: NonCompliant
-                            deploymentsUnavailable: NonCompliant
-                            upgradesAvailable: Compliant
-                          remediationAction: enforce
-                          removalBehavior:
-                            clusterServiceVersions: Delete
-                            customResourceDefinitions: Delete
-                            operatorGroups: DeleteIfUnused
-                            subscriptions: Delete
-                          severity: critical
-                          upgradeApproval: Automatic
-                          subscription:
-                            channel: {{ netobserv_channel }}
-                            name: netobserv-operator
-                            namespace: openshift-netobserv-operator
-                            source: redhat-operators
-                            sourceNamespace: openshift-marketplace
+                  removalBehavior:
+                    clusterServiceVersions: Delete
+                    customResourceDefinitions: Delete
+                    operatorGroups: DeleteIfUnused
+                    subscriptions: Delete
+                  severity: critical
+                  upgradeApproval: Automatic
+                  subscription:
+                    channel: {{ netobserv_channel }}
+                    name: netobserv-operator
+                    namespace: openshift-netobserv-operator
+                    source: redhat-operators
+                    sourceNamespace: openshift-marketplace
 
             # ================================================================
             # 4. Loki S3 credentials secret (hub template injection)
             # ================================================================
             - extraDependencies:
-                - apiVersion: policy.open-cluster-management.io/v1
-                  kind: ConfigurationPolicy
-                  name: loki-operatorpolicy
+                - apiVersion: policy.open-cluster-management.io/v1beta1
+                  kind: OperatorPolicy
+                  name: loki-operator-install
                   namespace: ""
                   compliance: Compliant
               objectDefinition:
@@ -544,7 +560,7 @@
                           namespace: openshift-logging
                         type: Opaque
                         data:
-                          bucketname: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "bucketname" hub}}{% endraw %}'
+                          bucketnames: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "bucketnames" hub}}{% endraw %}'
                           endpoint: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "endpoint" hub}}{% endraw %}'
                           access_key_id: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "access_key_id" hub}}{% endraw %}'
                           access_key_secret: '{% raw %}{{hub fromSecret "netobserv-policy" (printf "netobserv-s3-creds-%s" .ManagedClusterName) "access_key_secret" hub}}{% endraw %}'
@@ -577,6 +593,7 @@
                           namespace: openshift-logging
                         spec:
                           size: 1x.small
+                          storageClassName: gp3-csi
                           storage:
                             schemas:
                             - version: v13
@@ -602,9 +619,9 @@
                   name: lokistack-config
                   namespace: ""
                   compliance: Compliant
-                - apiVersion: policy.open-cluster-management.io/v1
-                  kind: ConfigurationPolicy
-                  name: netobserv-operatorpolicy
+                - apiVersion: policy.open-cluster-management.io/v1beta1
+                  kind: OperatorPolicy
+                  name: netobserv-operator-install
                   namespace: ""
                   compliance: Compliant
               objectDefinition:

@@ -67,6 +67,26 @@
           Wait for MCH to finish installing or check hub operator status.
       when: "'Running' not in mch_status.stdout"
 
+    # =========================================================================
+    # Enable ODF Multicluster Console plugin on hub
+    # =========================================================================
+    - name: Enable odf-multicluster-console plugin on hub
+      shell: |
+        CURRENT=$(oc get console.operator.openshift.io cluster \
+          -o jsonpath='{.spec.plugins}' 2>/dev/null)
+        if echo "$CURRENT" | grep -q "odf-multicluster-console"; then
+          echo "already enabled"
+        elif [ -z "$CURRENT" ] || [ "$CURRENT" = "[]" ]; then
+          oc patch console.operator.openshift.io cluster --type=merge \
+            -p='{"spec":{"plugins":["odf-multicluster-console"]}}'
+        else
+          oc patch console.operator.openshift.io cluster --type=json \
+            -p='[{"op":"add","path":"/spec/plugins/-","value":"odf-multicluster-console"}]'
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
     - name: Display hub readiness validation success
       debug:
         msg: |
@@ -76,6 +96,7 @@
           Cluster: {{ cluster_name }}
           ACM CSV: Succeeded
           MultiClusterHub: Running
+          ODF Multicluster Console: Enabled
 
 # =============================================================================
 # Play 2: Enable Submariner networking with globalnet
@@ -356,6 +377,26 @@
       delay: 20
 
     # =========================================================================
+    # Enable ODF Console plugin on spoke
+    # =========================================================================
+    - name: Enable odf-console plugin on spoke
+      shell: |
+        CURRENT=$(oc get console.operator.openshift.io cluster \
+          -o jsonpath='{.spec.plugins}' 2>/dev/null)
+        if echo "$CURRENT" | grep -q "odf-console"; then
+          echo "already enabled"
+        elif [ -z "$CURRENT" ] || [ "$CURRENT" = "[]" ]; then
+          oc patch console.operator.openshift.io cluster --type=merge \
+            -p='{"spec":{"plugins":["odf-console"]}}'
+        else
+          oc patch console.operator.openshift.io cluster --type=json \
+            -p='[{"op":"add","path":"/spec/plugins/-","value":"odf-console"}]'
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
     # Label Storage Nodes
     # =========================================================================
     - name: Label worker nodes for ODF storage
@@ -379,6 +420,10 @@
           namespace: openshift-storage
         spec:
           manageNodes: false
+          network:
+            multiClusterService:
+              clusterID: {{ cluster_name }}
+              enabled: true
           storageDeviceSets:
           - name: ocs-deviceset
             count: {{ odf_device_set_count }}
@@ -409,6 +454,19 @@
       until: "'Ready' in sc_status.stdout"
       retries: 60
       delay: 30
+
+    - name: Create ServiceExport for ocs-provider-server
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: multicluster.x-k8s.io/v1alpha1
+        kind: ServiceExport
+        metadata:
+          name: ocs-provider-server
+          namespace: openshift-storage
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
 
     - name: Display ODF StorageCluster success
       debug:

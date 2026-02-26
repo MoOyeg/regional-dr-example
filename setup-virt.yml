@@ -1,0 +1,723 @@
+---
+# =============================================================================
+# VM DR Example — Setup
+# =============================================================================
+# Play 1: Install OpenShift Virtualization operator via ACM Policy (hub only)
+# Play 2: Wait for Virtualization operator readiness on spokes (hub only)
+# Play 3: Deploy VM via GitOps with DR protection (hub only)
+# Play 4: Verify VM deployment and data (hub only)
+# =============================================================================
+#
+# Prerequisites:
+# 1. Clusters deployed: ./ansible-runner.sh deploy
+# 2. Operators installed: ./ansible-runner.sh operators
+# 3. Clusters imported: ./ansible-runner.sh import
+# 4. DR infrastructure configured: ./ansible-runner.sh infra-dr
+# 5. DR app deployed (for GitOps setup): ./ansible-runner.sh app
+# 6. app_git_url configured pointing to repo with vm-app/ directory
+# =============================================================================
+
+# =============================================================================
+# Play 1: Install OpenShift Virtualization operator via ACM Policy
+# =============================================================================
+- name: "Play 1: Install OpenShift Virtualization operator via ACM Policy"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "cnv-operator-policy"
+    policy_namespace: "cnv-policy"
+    placement_name: "cnv-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of virt clusters (all spokes)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('cluster_role', 'defined') | selectattr('cluster_role', 'equalto', 'spoke') | map(attribute='cluster_name') | list + groups['openshift_clusters'] | map('extract', hostvars) | rejectattr('cluster_role', 'defined') | map(attribute='cluster_name') | list }}"
+      when: virt_deploy_all_clusters | default(true)
+
+    - name: Build list of virt clusters (selective)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('virt', 'defined') | selectattr('virt', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (virt_deploy_all_clusters | default(true))
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in virt_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+    - name: Display target clusters
+      debug:
+        msg: "Will install OpenShift Virtualization on: {{ virt_clusters | join(', ') }}"
+
+    # Auto-discover latest stable CNV channel
+    - name: Discover latest CNV operator channel
+      shell: |
+        oc get packagemanifest kubevirt-hyperconverged -n openshift-marketplace \
+          -o jsonpath='{.status.defaultChannel}' 2>/dev/null || echo ""
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: cnv_channel_discovery
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set CNV operator channel
+      set_fact:
+        virt_channel: "{{ cnv_channel_discovery.stdout | trim if cnv_channel_discovery.stdout | trim | length > 0 else virt_channel | default('stable') }}"
+
+    - name: Display CNV operator channel
+      debug:
+        msg: "CNV operator channel: {{ virt_channel }}"
+
+  tasks:
+    # =========================================================================
+    # Label managed clusters for placement
+    # =========================================================================
+    - name: Label managed clusters with cnv=true
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} cnv=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+      changed_when: false
+
+    # =========================================================================
+    # Create policy namespace
+    # =========================================================================
+    - name: Create CNV policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Placement, PlacementBinding, ManagedClusterSetBinding
+    # =========================================================================
+    - name: Bind global ManagedClusterSet to CNV policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for CNV clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    cnv: "true"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create PlacementBinding for CNV policy
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ policy_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # ACM Policy: Namespace + OperatorPolicy + HyperConverged CR
+    # =========================================================================
+    - name: Create CNV operator ACM Policy
+      shell: |
+        oc apply -f - <<'POLICYEOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: Policy
+        metadata:
+          name: {{ policy_name }}
+          namespace: {{ policy_namespace }}
+          annotations:
+            policy.open-cluster-management.io/categories: CM Configuration Management
+            policy.open-cluster-management.io/standards: NIST SP 800-53
+            policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+        spec:
+          disabled: false
+          remediationAction: enforce
+          policy-templates:
+            # ================================================================
+            # 1. Create openshift-cnv namespace
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: cnv-namespace
+                spec:
+                  remediationAction: enforce
+                  severity: low
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: v1
+                        kind: Namespace
+                        metadata:
+                          name: openshift-cnv
+
+            # ================================================================
+            # 2. Install kubevirt-hyperconverged operator
+            # ================================================================
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1beta1
+                kind: OperatorPolicy
+                metadata:
+                  name: cnv-operator-install
+                spec:
+                  complianceType: musthave
+                  complianceConfig:
+                    catalogSourceUnhealthy: NonCompliant
+                    deploymentsUnavailable: NonCompliant
+                    upgradesAvailable: Compliant
+                  remediationAction: enforce
+                  removalBehavior:
+                    clusterServiceVersions: Delete
+                    customResourceDefinitions: Delete
+                    operatorGroups: DeleteIfUnused
+                    subscriptions: Delete
+                  severity: critical
+                  upgradeApproval: Automatic
+                  operatorGroup:
+                    name: openshift-cnv
+                    namespace: openshift-cnv
+                    targetNamespaces:
+                      - openshift-cnv
+                  subscription:
+                    channel: {{ virt_channel }}
+                    name: kubevirt-hyperconverged
+                    namespace: openshift-cnv
+                    source: redhat-operators
+                    sourceNamespace: openshift-marketplace
+
+            # ================================================================
+            # 3. Create HyperConverged CR (after operator is ready)
+            # ================================================================
+            - extraDependencies:
+                - apiVersion: policy.open-cluster-management.io/v1beta1
+                  kind: OperatorPolicy
+                  name: cnv-operator-install
+                  namespace: ""
+                  compliance: Compliant
+              objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: cnv-hyperconverged
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: hco.kubevirt.io/v1beta1
+                        kind: HyperConverged
+                        metadata:
+                          name: kubevirt-hyperconverged
+                          namespace: openshift-cnv
+                        spec:
+                          infra: {}
+                          workloads: {}
+        POLICYEOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Wait for policy compliance
+    # =========================================================================
+    - name: Wait for CNV policy to be Compliant
+      shell: |
+        oc get policy {{ policy_name }} -n {{ policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: policy_compliance
+      until: policy_compliance.stdout == "Compliant"
+      retries: 120
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 1 result
+      debug:
+        msg: |
+          ============================================
+          OpenShift Virtualization ACM Policy Created
+          ============================================
+          Policy: {{ policy_name }} in {{ policy_namespace }}
+          Channel: {{ virt_channel }}
+          Target clusters: {{ virt_clusters | join(', ') }}
+          Compliance: {{ policy_compliance.stdout | default('unknown') }}
+
+# =============================================================================
+# Play 2: Wait for Virtualization operator readiness on spokes
+# =============================================================================
+- name: "Play 2: Wait for Virtualization operator readiness on spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Wait for HyperConverged to be Available on each spoke
+      shell: |
+        oc get hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+          -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo ""
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: hco_status
+      until: "'True' in hco_status.stdout"
+      retries: 60
+      delay: 20
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Display Play 2 result
+      debug:
+        msg: |
+          ============================================
+          OpenShift Virtualization Ready on Spokes
+          ============================================
+          Checked clusters: {{ spoke_clusters | join(', ') }}
+
+# =============================================================================
+# Play 3: Deploy VM via GitOps with DR protection
+# =============================================================================
+- name: "Play 3: Deploy VM via GitOps with DR protection"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Verify GitOps operator is installed
+      shell: |
+        oc get argocd openshift-gitops -n {{ gitops_namespace }} \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "missing"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_check
+      changed_when: false
+
+    - name: Fail if GitOps is not installed
+      fail:
+        msg: |
+          OpenShift GitOps is not installed on the hub cluster.
+          Please run './ansible-runner.sh app' first to install GitOps and configure ArgoCD.
+      when: "'Available' not in argocd_check.stdout"
+
+    - name: Verify DRPolicy exists
+      shell: |
+        oc get drpolicy {{ dr_policy_name }} -o jsonpath='{.metadata.name}' 2>/dev/null || echo ""
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: drpolicy_check
+      changed_when: false
+
+    - name: Fail if DRPolicy is missing
+      fail:
+        msg: |
+          DRPolicy '{{ dr_policy_name }}' not found on the hub cluster.
+          Please run './ansible-runner.sh infra-dr' and './ansible-runner.sh app' first.
+      when: drpolicy_check.stdout | trim | length == 0
+
+  tasks:
+    # =========================================================================
+    # Ensure ManagedClusterSetBinding in openshift-gitops (idempotent)
+    # =========================================================================
+    - name: Ensure ManagedClusterSetBinding in openshift-gitops namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ gitops_namespace }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Placement for VM app (managed by DRPlacementControl)
+    # =========================================================================
+    - name: Create Placement for VM GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ virt_app_name }}-gitops-placement
+          namespace: {{ gitops_namespace }}
+          annotations:
+            cluster.open-cluster-management.io/experimental-scheduling-disable: "true"
+        spec:
+          clusterSets:
+            - {{ managed_cluster_set_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # ApplicationSet with ClusterDecisionResource generator
+    # =========================================================================
+    - name: Create ApplicationSet for VM GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: argoproj.io/v1alpha1
+        kind: ApplicationSet
+        metadata:
+          name: {{ virt_app_name }}-gitops-appset
+          namespace: {{ gitops_namespace }}
+        spec:
+          generators:
+            - clusterDecisionResource:
+                configMapRef: acm-placement
+                labelSelector:
+                  matchLabels:
+                    cluster.open-cluster-management.io/placement: {{ virt_app_name }}-gitops-placement
+                requeueAfterSeconds: 180
+          template:
+            metadata:
+              name: '{{ virt_app_name }}-gitops-{{ "{{" }}name{{ "}}" }}'
+              namespace: {{ gitops_namespace }}
+              labels:
+                app: {{ virt_app_name }}
+                app.kubernetes.io/part-of: {{ virt_app_name }}
+            spec:
+              project: default
+              source:
+                repoURL: {{ app_git_url }}
+                targetRevision: {{ app_git_branch }}
+                path: {{ virt_git_path }}
+              destination:
+                server: '{{ "{{" }}server{{ "}}" }}'
+                namespace: {{ virt_namespace }}
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                syncOptions:
+                  - CreateNamespace=true
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # DRPlacementControl for VM GitOps instance
+    # =========================================================================
+    - name: Create DRPlacementControl for VM GitOps application
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: ramendr.openshift.io/v1alpha1
+        kind: DRPlacementControl
+        metadata:
+          name: {{ virt_app_name }}-gitops-drpc
+          namespace: {{ gitops_namespace }}
+          labels:
+            app: {{ virt_app_name }}
+        spec:
+          preferredCluster: {{ spoke_clusters[0] }}
+          drPolicyRef:
+            name: {{ dr_policy_name }}
+          placementRef:
+            kind: Placement
+            name: {{ virt_app_name }}-gitops-placement
+          pvcSelector:
+            matchLabels:
+              appname: {{ virt_app_name }}
+          kubeObjectProtection:
+            captureInterval: 5m
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Delete stale PlacementDecision so Ramen can take over scheduling
+      shell: |
+        oc delete placementdecision \
+          -l cluster.open-cluster-management.io/placement={{ virt_app_name }}-gitops-placement \
+          -n {{ gitops_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Wait for deployment
+    # =========================================================================
+    - name: Wait for VM Placement decision
+      shell: |
+        oc get placementdecision -n {{ gitops_namespace }} \
+          -l cluster.open-cluster-management.io/placement={{ virt_app_name }}-gitops-placement \
+          -o jsonpath='{.items[0].status.decisions[0].clusterName}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: vm_placement_decision
+      until: "vm_placement_decision.stdout | length > 0"
+      retries: 20
+      delay: 10
+      ignore_errors: true
+
+    - name: Wait for ArgoCD Application to sync
+      shell: |
+        oc get application.argoproj.io -n {{ gitops_namespace }} \
+          -l app={{ virt_app_name }} \
+          -o jsonpath='{.items[0].status.sync.status}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_app_sync
+      until: "'Synced' in argocd_app_sync.stdout"
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: Check DRPlacementControl status
+      shell: |
+        oc get drplacementcontrol {{ virt_app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: vm_drpc_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 3 result
+      debug:
+        msg: |
+          ============================================
+          VM GitOps Deployment Created
+          ============================================
+          ApplicationSet: {{ virt_app_name }}-gitops-appset
+          Placement Decision: {{ vm_placement_decision.stdout | default('unknown') }}
+          ArgoCD Sync: {{ argocd_app_sync.stdout | default('unknown') }}
+          DRPC Status: {{ vm_drpc_status.stdout | default('unknown') }}
+
+# =============================================================================
+# Play 4: Verify VM deployment and data
+# =============================================================================
+- name: "Play 4: Verify VM deployment and data"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Wait for VM to be Running on preferred cluster
+      shell: |
+        oc get vm {{ virt_app_name }} -n {{ virt_namespace }} \
+          -o jsonpath='{.status.printableStatus}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: vm_status
+      until: "'Running' in vm_status.stdout"
+      retries: 40
+      delay: 15
+      ignore_errors: true
+
+    - name: Verify PVC is bound on preferred cluster
+      shell: |
+        oc get pvc vm-data-pvc -n {{ virt_namespace }} \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: pvc_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Verify VMI is running on preferred cluster
+      shell: |
+        oc get vmi {{ virt_app_name }} -n {{ virt_namespace }} \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: vmi_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Verify test data was written by cloud-init
+      shell: |
+        POD=$(oc get pod -n {{ virt_namespace }} -l kubevirt.io/vm={{ virt_app_name }} \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          oc exec -n {{ virt_namespace }} "$POD" -- \
+            cat /proc/1/root/mnt/data/testfile.txt 2>/dev/null || echo "data not yet available"
+        else
+          echo "virt-launcher pod not found"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ spoke_clusters[0] }}/kubeconfig"
+      delegate_to: localhost
+      register: test_data_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display VM DR Example deployment success
+      debug:
+        msg: |
+          ============================================
+          VM DR Example — Deployment Complete
+          ============================================
+          VM: {{ virt_app_name }}
+          Namespace: {{ virt_namespace }}
+          Preferred Cluster: {{ spoke_clusters[0] }}
+          VM Status: {{ vm_status.stdout | default('unknown') }}
+          VMI Status: {{ vmi_status.stdout | default('unknown') }}
+          PVC Status: {{ pvc_status.stdout | default('unknown') }}
+          Test Data: {{ test_data_check.stdout | default('not checked') }}
+
+          DR Policy: {{ dr_policy_name }} ({{ dr_replication_interval }} async)
+          DRPC: {{ virt_app_name }}-gitops-drpc in {{ gitops_namespace }}
+
+          To failover:
+            oc patch drplacementcontrol {{ virt_app_name }}-gitops-drpc -n {{ gitops_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Failover","failoverCluster":"{{ spoke_clusters[1] }}"}}'
+
+          To relocate (failback):
+            oc patch drplacementcontrol {{ virt_app_name }}-gitops-drpc -n {{ gitops_namespace }} \
+              --type=merge --patch='{"spec":{"action":"Relocate","preferredCluster":"{{ spoke_clusters[0] }}"}}'

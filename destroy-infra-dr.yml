@@ -106,9 +106,22 @@
       when: not kubeconfig_stat.stat.exists
 
   tasks:
-    - name: Delete StorageCluster
+    # =========================================================================
+    # Delete StorageCluster (no wait, then handle finalizers)
+    # =========================================================================
+    - name: Delete StorageCluster (no wait)
       shell: |
-        oc delete storagecluster ocs-storagecluster -n openshift-storage --ignore-not-found
+        oc delete storagecluster ocs-storagecluster -n openshift-storage --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from StorageCluster if stuck
+      shell: |
+        for cr in $(oc get storagecluster -n openshift-storage -o name 2>/dev/null); do
+          oc patch "$cr" -n openshift-storage --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -116,16 +129,41 @@
 
     - name: Wait for StorageCluster removal
       shell: |
-        oc get storagecluster ocs-storagecluster -n openshift-storage
+        oc get storagecluster -n openshift-storage 2>&1 | grep -qE "No resources|not found" && echo "deleted" || echo "pending"
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       register: sc_check
-      until: sc_check.rc != 0
-      retries: 40
-      delay: 30
+      until: '"deleted" in sc_check.stdout'
+      retries: 30
+      delay: 10
+      changed_when: false
       ignore_errors: true
 
+    # =========================================================================
+    # Clean up CephCluster sub-resources that may block namespace deletion
+    # =========================================================================
+    - name: Delete CephCluster resources (no wait)
+      shell: |
+        oc delete cephcluster --all -n openshift-storage --ignore-not-found --wait=false 2>/dev/null || true
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from CephCluster if stuck
+      shell: |
+        for cr in $(oc get cephcluster -n openshift-storage -o name 2>/dev/null); do
+          oc patch "$cr" -n openshift-storage --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove ODF operator
+    # =========================================================================
     - name: Remove ODF storage labels from worker nodes
       shell: |
         oc label nodes -l cluster.ocs.openshift.io/openshift-storage \
@@ -135,17 +173,18 @@
       delegate_to: localhost
       ignore_errors: true
 
-    - name: Delete OCS Operator Subscription
+    - name: Delete ODF Operator Subscription
       shell: |
+        oc delete subscription odf-operator -n openshift-storage --ignore-not-found
         oc delete subscription ocs-operator -n openshift-storage --ignore-not-found
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       ignore_errors: true
 
-    - name: Delete OCS ClusterServiceVersions
+    - name: Delete all ClusterServiceVersions in openshift-storage
       shell: |
-        oc delete csv -n openshift-storage -l operators.coreos.com/ocs-operator.openshift-storage --ignore-not-found
+        oc delete csv --all -n openshift-storage --ignore-not-found
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -159,12 +198,43 @@
       delegate_to: localhost
       ignore_errors: true
 
+    # =========================================================================
+    # Delete openshift-storage namespace
+    # =========================================================================
     - name: Delete openshift-storage namespace
       shell: |
-        oc delete namespace openshift-storage --ignore-not-found
+        oc delete namespace openshift-storage --ignore-not-found --timeout=120s
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
+      ignore_errors: true
+
+    - name: Force-clear finalizers on stuck resources in openshift-storage namespace
+      shell: |
+        NS_PHASE=$(oc get namespace openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        if [ "$NS_PHASE" = "Terminating" ]; then
+          for resource in $(oc api-resources --verbs=list --namespaced -o name 2>/dev/null); do
+            for item in $(oc get "$resource" -n openshift-storage -o name 2>/dev/null); do
+              oc patch "$item" -n openshift-storage --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+          done
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for openshift-storage namespace deletion
+      shell: |
+        oc get namespace openshift-storage 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: ns_delete_check
+      until: '"deleted" in ns_delete_check.stdout'
+      retries: 20
+      delay: 10
+      changed_when: false
       ignore_errors: true
 
     - name: Display ODF removal result
@@ -174,10 +244,10 @@
           ODF StorageCluster Removed
           ============================================
           Cluster: {{ cluster_name }}
-          Removed: StorageCluster, OCS Operator, openshift-storage namespace
+          Removed: StorageCluster, ODF Operator, openshift-storage namespace
 
 # =============================================================================
-# Play 2: Remove Submariner networking
+# Play 3: Remove Submariner networking
 # =============================================================================
 - name: Remove Submariner networking
   hosts: openshift_clusters
@@ -222,24 +292,81 @@
         all_managed_clusters: "{{ ['local-cluster'] + spoke_clusters }}"
 
   tasks:
-    - name: Delete Submariner ManagedClusterAddOn
+    # =========================================================================
+    # Delete Submariner ManagedClusterAddOn (no wait, then handle finalizers)
+    # =========================================================================
+    - name: Delete Submariner ManagedClusterAddOn (no wait)
       shell: |
-        oc delete managedclusteraddon submariner -n {{ item }} --ignore-not-found
+        oc delete managedclusteraddon submariner -n {{ item }} --ignore-not-found --wait=false
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       loop: "{{ all_managed_clusters }}"
       ignore_errors: true
 
-    - name: Delete SubmarinerConfig
+    - name: Remove finalizers from Submariner ManagedClusterAddOn if stuck
       shell: |
-        oc delete submarinerconfig submariner -n {{ item }} --ignore-not-found
+        oc patch managedclusteraddon submariner -n {{ item }} --type=merge \
+          -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       loop: "{{ all_managed_clusters }}"
       ignore_errors: true
 
+    - name: Wait for ManagedClusterAddOn deletion
+      shell: |
+        oc get managedclusteraddon submariner -n {{ item }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: addon_delete_check
+      until: '"deleted" in addon_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete SubmarinerConfig (no wait, then handle finalizers)
+    # =========================================================================
+    - name: Delete SubmarinerConfig (no wait)
+      shell: |
+        oc delete submarinerconfig submariner -n {{ item }} --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Remove finalizers from SubmarinerConfig if stuck
+      shell: |
+        oc patch submarinerconfig submariner -n {{ item }} --type=merge \
+          -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    - name: Wait for SubmarinerConfig deletion
+      shell: |
+        oc get submarinerconfig submariner -n {{ item }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: smconfig_delete_check
+      until: '"deleted" in smconfig_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      loop: "{{ all_managed_clusters }}"
+      ignore_errors: true
+
+    # =========================================================================
+    # Clean up remaining Submariner resources
+    # =========================================================================
     - name: Delete Submariner AWS credentials secrets
       shell: |
         oc delete secret {{ item }}-aws-creds -n {{ item }} --ignore-not-found
@@ -266,9 +393,21 @@
       delegate_to: localhost
       ignore_errors: true
 
-    - name: Delete Submariner Broker
+    # =========================================================================
+    # Delete Submariner Broker and broker namespace
+    # =========================================================================
+    - name: Delete Submariner Broker (no wait)
       shell: |
-        oc delete broker submariner-broker -n {{ managed_cluster_set_name }}-broker --ignore-not-found
+        oc delete broker submariner-broker -n {{ managed_cluster_set_name }}-broker --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from Submariner Broker if stuck
+      shell: |
+        oc patch broker submariner-broker -n {{ managed_cluster_set_name }}-broker --type=merge \
+          -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -276,12 +415,43 @@
 
     - name: Delete broker namespace
       shell: |
-        oc delete namespace {{ managed_cluster_set_name }}-broker --ignore-not-found
+        oc delete namespace {{ managed_cluster_set_name }}-broker --ignore-not-found --timeout=120s
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
       ignore_errors: true
 
+    - name: Force-clear finalizers on stuck resources in broker namespace
+      shell: |
+        NS_PHASE=$(oc get namespace {{ managed_cluster_set_name }}-broker -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        if [ "$NS_PHASE" = "Terminating" ]; then
+          for resource in $(oc api-resources --verbs=list --namespaced -o name 2>/dev/null); do
+            for item in $(oc get "$resource" -n {{ managed_cluster_set_name }}-broker -o name 2>/dev/null); do
+              oc patch "$item" -n {{ managed_cluster_set_name }}-broker --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+          done
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for broker namespace deletion
+      shell: |
+        oc get namespace {{ managed_cluster_set_name }}-broker 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: broker_ns_check
+      until: '"deleted" in broker_ns_check.stdout'
+      retries: 20
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete ManagedClusterSet
+    # =========================================================================
     - name: Delete ManagedClusterSet
       shell: |
         oc delete managedclusterset {{ managed_cluster_set_name }} --ignore-not-found

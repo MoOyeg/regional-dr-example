@@ -1,0 +1,371 @@
+---
+# =============================================================================
+# ACS Cleanup
+# =============================================================================
+# Play 1: Remove ACM Policy, Central, and hub-side resources (hub only)
+# Play 2: Clean up ACS resources on managed clusters (safety net)
+# =============================================================================
+
+# =============================================================================
+# Play 1: Remove ACM Policy and hub-side resources
+# =============================================================================
+- name: "Play 1: Remove ACM Policy and hub-side resources"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    policy_name: "acs-secured-cluster-policy"
+    policy_namespace: "acs-policy"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of ACS clusters (all)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | map(attribute='cluster_name') | list }}"
+      when: acs_deploy_all_clusters | default(true)
+
+    - name: Build list of ACS clusters (selective)
+      set_fact:
+        acs_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('acs', 'defined') | selectattr('acs', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (acs_deploy_all_clusters | default(true))
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in acs_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+  tasks:
+    # =========================================================================
+    # Remove labels from managed clusters
+    # =========================================================================
+    - name: Remove acs=true label from managed clusters
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} acs- --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ acs_clusters }}"
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete ACM policy namespace (cascades Policy, Placement, secrets)
+    # =========================================================================
+    - name: Delete ACS policy namespace
+      shell: |
+        oc delete namespace {{ policy_namespace }} --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for ACS policy namespace deletion
+      shell: |
+        oc get namespace {{ policy_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: ns_delete_check
+      until: '"deleted" in ns_delete_check.stdout'
+      retries: 20
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Revoke init bundle on Central (if Central is still running)
+    # =========================================================================
+    - name: Check if Central route exists
+      shell: |
+        oc get route central -n stackrox -o jsonpath='{.spec.host}' 2>/dev/null || echo ""
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_route_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Get Central admin password
+      shell: |
+        oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_password_result
+      no_log: true
+      ignore_errors: true
+      when: central_route_check.stdout | trim | length > 0
+
+    - name: Revoke init bundle via Central API
+      shell: |
+        BUNDLE_ID=$(curl -sk -u "admin:${ACS_PASSWORD}" \
+          "https://{{ central_route_check.stdout | trim }}/v1/cluster-init/init-bundles" | \
+          jq -r '.items[]? | select(.name == "acm-init-bundle") | .id')
+        if [ -n "$BUNDLE_ID" ]; then
+          curl -sk -u "admin:${ACS_PASSWORD}" \
+            -X PATCH "https://{{ central_route_check.stdout | trim }}/v1/cluster-init/init-bundles/revoke" \
+            -H "Content-Type: application/json" \
+            -d "{\"ids\": [\"$BUNDLE_ID\"], \"confirmImpactedClustersIds\": []}"
+        fi
+      environment:
+        ACS_PASSWORD: "{{ central_password_result.stdout | trim }}"
+      delegate_to: localhost
+      no_log: true
+      ignore_errors: true
+      when:
+        - central_route_check.stdout | trim | length > 0
+        - central_password_result is succeeded
+
+    # =========================================================================
+    # Remove SecuredCluster from hub (hub also runs SecuredCluster)
+    # =========================================================================
+    - name: Delete SecuredCluster CR on hub (no wait)
+      shell: |
+        oc delete securedcluster --all -n stackrox --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from SecuredCluster CR on hub if stuck
+      shell: |
+        for cr in $(oc get securedcluster -n stackrox -o name 2>/dev/null); do
+          oc patch "$cr" -n stackrox --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for SecuredCluster deletion on hub
+      shell: |
+        oc get securedcluster -n stackrox 2>&1 | grep -qE "No resources|not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_sc_delete_check
+      until: '"deleted" in hub_sc_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove Central from hub
+    # =========================================================================
+    - name: Delete Central CR (no wait)
+      shell: |
+        oc delete central {{ acs_central_name | default('stackrox-central-services') }} -n stackrox --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from Central CR if stuck
+      shell: |
+        for cr in $(oc get central -n stackrox -o name 2>/dev/null); do
+          oc patch "$cr" -n stackrox --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for Central deletion
+      shell: |
+        oc get central -n stackrox 2>&1 | grep -qE "No resources|not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_delete_check
+      until: '"deleted" in central_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove ACS operator from hub
+    # =========================================================================
+    - name: Delete ACS Subscription on hub
+      shell: |
+        oc delete subscription --all -n rhacs-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ACS CSVs on hub
+      shell: |
+        oc delete csv --all -n rhacs-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete namespaces on hub
+    # =========================================================================
+    - name: Delete stackrox namespace on hub
+      shell: |
+        oc delete namespace stackrox --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete rhacs-operator namespace on hub
+      shell: |
+        oc delete namespace rhacs-operator --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove init bundle artifacts file
+      file:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/acs-init-bundle-secrets.yml"
+        state: absent
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display hub cleanup result
+      debug:
+        msg: |
+          ACS Hub Cleanup Complete:
+          - Removed acs=true labels from: {{ acs_clusters | join(', ') }}
+          - Deleted ACS policy namespace: {{ policy_namespace }}
+          - Revoked init bundle on Central
+          - Deleted Central CR
+          - Deleted ACS operator subscription/CSV
+          - Deleted stackrox and rhacs-operator namespaces
+
+# =============================================================================
+# Play 2: Clean up ACS resources on managed clusters (safety net)
+# =============================================================================
+- name: "Play 2: Clean up ACS resources on managed clusters"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster (already cleaned in Play 1)
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Verify kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Delete SecuredCluster CR
+    # =========================================================================
+    - name: Delete SecuredCluster CR (no wait)
+      shell: |
+        oc delete securedcluster --all -n stackrox --ignore-not-found --wait=false
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove finalizers from SecuredCluster CR if stuck
+      shell: |
+        for cr in $(oc get securedcluster -n stackrox -o name 2>/dev/null); do
+          oc patch "$cr" -n stackrox --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for SecuredCluster deletion
+      shell: |
+        oc get securedcluster -n stackrox 2>&1 | grep -qE "No resources|not found" && echo "deleted" || echo "pending"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sc_delete_check
+      until: '"deleted" in sc_delete_check.stdout'
+      retries: 18
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # =========================================================================
+    # Operator cleanup (safety net if ACM policy removal didn't cascade)
+    # =========================================================================
+    - name: Delete ACS Subscription
+      shell: |
+        oc delete subscription --all -n rhacs-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ACS CSVs
+      shell: |
+        oc delete csv --all -n rhacs-operator --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    # =========================================================================
+    # Delete namespaces
+    # =========================================================================
+    - name: Delete stackrox namespace
+      shell: |
+        oc delete namespace stackrox --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete rhacs-operator namespace
+      shell: |
+        oc delete namespace rhacs-operator --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display spoke cleanup complete
+      debug:
+        msg: |
+          ACS Cleanup Complete - {{ cluster_name }}
+          Removed: SecuredCluster, ACS operator, stackrox namespace, rhacs-operator namespace

@@ -1,0 +1,53 @@
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: vm-dr-example
+  namespace: vm-example
+  labels:
+    app: vm-dr-example
+    appname: vm-dr-example
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        app: vm-dr-example
+        kubevirt.io/vm: vm-dr-example
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 1Gi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: datadisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/containerdisks/fedora:latest
+        - name: datadisk
+          persistentVolumeClaim:
+            claimName: vm-data-pvc
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: redhat
+              chpasswd:
+                expire: false
+              runcmd:
+                - mkfs.ext4 /dev/vdb || true
+                - mkdir -p /mnt/data
+                - mount /dev/vdb /mnt/data
+                - echo "vm-dr-example data written at $(date)" > /mnt/data/testfile.txt

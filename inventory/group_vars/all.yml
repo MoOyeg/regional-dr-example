@@ -112,11 +112,50 @@ cert_secret_name: "acme-wildcard-cert-secret"
 #   netobserv: true         # Enable NetObserv on this cluster
 # =========================================================================
 
-# Loki operator channel
-loki_channel: "stable"
+# Loki operator channel (fallback; setup-netobserv.yml auto-discovers the latest stable-X.Y channel)
+loki_channel: "stable-6.4"
 
-# NetObserv operator channel
+# NetObserv operator channel (fallback; setup-netobserv.yml auto-discovers the latest stable channel)
 netobserv_channel: "stable"
+
+# ACS (Advanced Cluster Security) Configuration
+# =========================================================================
+# The acs command will install RHACS (Red Hat Advanced Cluster Security)
+# with Central on the hub cluster and SecuredCluster on all managed clusters.
+#
+# Prerequisites:
+# - ACM installed on hub (run ./ansible-runner.sh operators first)
+# - Spoke clusters imported (run ./ansible-runner.sh import first)
+#
+# What it does:
+# 1. Installs ACS operator directly on hub cluster
+# 2. Creates Central CR on hub (with route, PVC, scanner)
+# 3. Generates init bundle via Central API
+# 4. Creates ACM Policy to deploy ACS operator + SecuredCluster on managed clusters
+# 5. Injects init bundle TLS secrets to managed clusters via hub templates
+#
+# Configuration in inventory/host_vars/<cluster>.yml:
+#   acs: true    # Enable ACS SecuredCluster on this cluster (only needed if acs_deploy_all_clusters: false)
+# =========================================================================
+
+# ACS operator channel (fallback; setup-acs.yml auto-discovers the latest stable channel)
+acs_channel: "stable"
+
+# Central instance name
+acs_central_name: "stackrox-central-services"
+
+# Central PVC storage size
+acs_central_pvc_size: "100Gi"
+
+# Scanner autoscaling settings
+acs_scanner_min_replicas: 2
+acs_scanner_max_replicas: 5
+acs_scanner_replicas: 3
+
+# Whether to deploy SecuredCluster to ALL managed clusters or only those with acs: true
+# When true: deploys to all managed clusters (uses global ManagedClusterSet)
+# When false: deploys only to clusters with acs: true in host_vars
+acs_deploy_all_clusters: true
 
 # DR Application Deployment
 # =========================================================================
@@ -179,4 +218,39 @@ app_pvc_storage_class: "ocs-storagecluster-ceph-rbd"
 
 # OpenShift GitOps operator channel (installed on hub for ArgoCD push mode)
 gitops_channel: "latest"
+
+# VM DR Example (OpenShift Virtualization + Regional DR)
+# =========================================================================
+# The virt command deploys a DR-protected VirtualMachine between spoke clusters:
+#
+# 1. Installs OpenShift Virtualization operator on spokes via ACM Policy
+# 2. Deploys a Fedora VM with persistent data disk via GitOps (ArgoCD)
+# 3. Protects the VM with DRPlacementControl for failover/relocate
+#
+# Prerequisites:
+# 1. Clusters deployed: ./ansible-runner.sh deploy
+# 2. Operators installed: ./ansible-runner.sh operators
+# 3. Clusters imported: ./ansible-runner.sh import
+# 4. DR infrastructure configured: ./ansible-runner.sh infra-dr
+# 5. DR app deployed (for GitOps setup): ./ansible-runner.sh app
+# 6. app_git_url configured pointing to repo with vm-app/ directory
+#
+# Configuration in inventory/host_vars/<cluster>.yml:
+#   virt: true    # Enable CNV on this cluster (only needed if virt_deploy_all_clusters: false)
+# =========================================================================
+
+# OpenShift Virtualization operator channel (fallback; setup-virt.yml auto-discovers)
+virt_channel: "stable"
+
+# VM application namespace on spoke clusters
+virt_namespace: "vm-example"
+
+# VM application name (used for naming RHACM resources)
+virt_app_name: "vm-dr-example"
+
+# Whether to deploy CNV operator to ALL spoke clusters or only those with virt: true
+virt_deploy_all_clusters: true
+
+# Path within the Git repo to the VM manifests directory
+virt_git_path: "vm-app"
 

@@ -145,7 +145,7 @@
 
     - name: Wait for FlowCollector deletion
       shell: |
-        oc get flowcollector cluster 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+        oc get flowcollector cluster >/dev/null 2>&1 && echo "pending" || echo "deleted"
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -169,7 +169,7 @@
 
     - name: Wait for LokiStack deletion
       shell: |
-        oc get lokistack loki -n {{ loki_namespace }} 2>&1 | grep -q "not found" && echo "deleted" || echo "pending"
+        oc get lokistack loki -n {{ loki_namespace }} >/dev/null 2>&1 && echo "pending" || echo "deleted"
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
