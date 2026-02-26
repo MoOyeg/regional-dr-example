@@ -2,15 +2,89 @@
 # =============================================================================
 # VM DR Example — Cleanup
 # =============================================================================
-# Play 1: Remove GitOps DR resources from hub
-# Play 2: Clean up VM resources on managed clusters (safety net)
-# Play 3: Remove ACM Policy and CNV operator policy from hub
+# Play 1: Remove metal MachineSets from spoke clusters (spokes)
+# Play 2: Remove GitOps DR resources from hub
+# Play 3: Clean up VM resources on managed clusters (spokes)
+# Play 4: Remove ACM Policy, metal MachineSet policy, and CNV policy from hub
 # =============================================================================
 
 # =============================================================================
-# Play 1: Remove GitOps DR resources from hub
+# Play 1: Remove metal MachineSets from spoke clusters
 # =============================================================================
-- name: "Play 1: Remove GitOps DR resources from hub"
+- name: "Play 1: Remove metal MachineSets from spoke clusters"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Verify kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Scale MachineSet to 0 first, then delete
+    # =========================================================================
+    - name: Scale metal MachineSet to 0 replicas
+      shell: |
+        for ms in $(oc get machineset -n openshift-machine-api \
+          -l machine.openshift.io/cluster-api-machine-role=metal \
+          -o name 2>/dev/null); do
+          oc scale "$ms" -n openshift-machine-api --replicas=0
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Wait for metal Machines to be deleted
+      shell: |
+        COUNT=$(oc get machines -n openshift-machine-api \
+          -l machine.openshift.io/cluster-api-machine-role=metal \
+          -o name 2>/dev/null | wc -l)
+        echo "$COUNT"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: metal_machine_count
+      until: "metal_machine_count.stdout | int == 0"
+      retries: 40
+      delay: 30
+      changed_when: false
+      ignore_errors: true
+
+    - name: Delete metal MachineSets
+      shell: |
+        oc delete machineset -n openshift-machine-api \
+          -l machine.openshift.io/cluster-api-machine-role=metal \
+          --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display spoke metal cleanup result
+      debug:
+        msg: |
+          Metal MachineSet Cleanup - {{ cluster_name }}
+          Removed: metal MachineSets and associated EC2 instances
+
+# =============================================================================
+# Play 2: Remove GitOps DR resources from hub
+# =============================================================================
+- name: "Play 2: Remove GitOps DR resources from hub"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -103,9 +177,9 @@
           - Deleted Placement: {{ virt_app_name }}-gitops-placement
 
 # =============================================================================
-# Play 2: Clean up VM resources on managed clusters (safety net)
+# Play 3: Clean up VM resources on managed clusters (safety net)
 # =============================================================================
-- name: "Play 2: Clean up VM resources on managed clusters"
+- name: "Play 3: Clean up VM resources on managed clusters"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -180,9 +254,9 @@
           Removed: VirtualMachines, {{ virt_namespace }} namespace
 
 # =============================================================================
-# Play 3: Remove ACM Policy and CNV operator policy from hub
+# Play 4: Remove ACM Policy, metal MachineSet policy, and CNV policy from hub
 # =============================================================================
-- name: "Play 3: Remove ACM Policy and CNV operator policy from hub"
+- name: "Play 4: Remove ACM Policy, metal MachineSet policy, and CNV policy from hub"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -247,6 +321,36 @@
       ignore_errors: true
 
     # =========================================================================
+    # Delete metal MachineSet policy and ConfigMaps (before namespace deletion)
+    # =========================================================================
+    - name: Delete metal MachineSet policy
+      shell: |
+        oc delete policy metal-machineset-policy -n {{ policy_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete metal MachineSet PlacementBinding
+      shell: |
+        oc delete placementbinding metal-machineset-policy-binding \
+          -n {{ policy_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete metal-machineset-config ConfigMaps from policy namespace
+      shell: |
+        oc delete configmap metal-machineset-config-{{ managedcluster_names[item] }} \
+          -n {{ policy_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+      ignore_errors: true
+
+    # =========================================================================
     # Delete CNV policy namespace (cascades Policy, Placement, PlacementBinding)
     # =========================================================================
     - name: Delete CNV policy namespace
@@ -275,6 +379,7 @@
         msg: |
           CNV Policy Cleanup Complete:
           - Removed cnv=true labels from: {{ virt_clusters | join(', ') }}
+          - Deleted metal MachineSet policy and ConfigMaps
           - Deleted policy namespace: {{ policy_namespace }}
           Note: CNV operator remains installed on spoke clusters.
           To fully remove the operator, delete the HyperConverged CR and

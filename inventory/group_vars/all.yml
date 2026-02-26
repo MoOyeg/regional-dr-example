@@ -254,3 +254,10 @@ virt_deploy_all_clusters: true
 # Path within the Git repo to the VM manifests directory
 virt_git_path: "vm-app"
 
+# Bare metal MachineSet for hardware virtualization support
+# Instance type must support nested/hardware virtualization (e.g., m5.metal, c5.metal, i3.metal)
+virt_metal_instance_type: "m5.metal"
+virt_metal_replicas: 1
+virt_metal_volume_size: 120
+virt_metal_volume_type: "gp3"
+

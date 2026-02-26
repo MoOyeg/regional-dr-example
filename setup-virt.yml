@@ -2,10 +2,13 @@
 # =============================================================================
 # VM DR Example — Setup
 # =============================================================================
-# Play 1: Install OpenShift Virtualization operator via ACM Policy (hub only)
-# Play 2: Wait for Virtualization operator readiness on spokes (hub only)
-# Play 3: Deploy VM via GitOps with DR protection (hub only)
-# Play 4: Verify VM deployment and data (hub only)
+# Play 1: Discover spoke cluster infrastructure for metal MachineSet (spokes)
+# Play 2: Create metal MachineSet ACM Policy with per-spoke ConfigMaps (hub)
+# Play 3: Wait for metal nodes to be Ready (hub)
+# Play 4: Install OpenShift Virtualization operator via ACM Policy (hub)
+# Play 5: Wait for Virtualization operator readiness on spokes (hub)
+# Play 6: Deploy VM via GitOps with DR protection (hub)
+# Play 7: Verify VM deployment and data (hub)
 # =============================================================================
 #
 # Prerequisites:
@@ -18,9 +21,483 @@
 # =============================================================================
 
 # =============================================================================
-# Play 1: Install OpenShift Virtualization operator via ACM Policy
+# Play 1: Discover spoke cluster infrastructure for metal MachineSet
 # =============================================================================
-- name: "Play 1: Install OpenShift Virtualization operator via ACM Policy"
+- name: "Play 1: Discover spoke cluster infrastructure for metal MachineSet"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Discover infrastructure ID
+    # =========================================================================
+    - name: Get cluster infrastructure ID
+      shell: |
+        oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: infra_id_result
+      changed_when: false
+
+    - name: Set infrastructure ID fact
+      set_fact:
+        metal_infra_id: "{{ infra_id_result.stdout | trim }}"
+
+    # =========================================================================
+    # Discover existing worker MachineSet provider config
+    # =========================================================================
+    - name: Get first worker MachineSet name
+      shell: |
+        oc get machineset -n openshift-machine-api -o jsonpath='{.items[0].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: machineset_name_result
+      changed_when: false
+
+    - name: Get MachineSet provider spec
+      shell: |
+        oc get machineset {{ machineset_name_result.stdout | trim }} -n openshift-machine-api \
+          -o json | jq '{
+            ami: .spec.template.spec.providerSpec.value.ami.id,
+            subnet_filter_name: (.spec.template.spec.providerSpec.value.subnet.filters[0].values[0] // ""),
+            sg_filter_name: (.spec.template.spec.providerSpec.value.securityGroups[0].filters[0].values[0] // ""),
+            iam_profile: .spec.template.spec.providerSpec.value.iamInstanceProfile.id,
+            region: .spec.template.spec.providerSpec.value.placement.region,
+            az: .spec.template.spec.providerSpec.value.placement.availabilityZone
+          }'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: provider_spec_result
+      changed_when: false
+
+    - name: Set provider spec facts
+      set_fact:
+        metal_provider_spec: "{{ provider_spec_result.stdout | from_json }}"
+
+    - name: Display discovered infrastructure details
+      debug:
+        msg: |
+          Discovered infrastructure for {{ cluster_name }}:
+          Infrastructure ID: {{ metal_infra_id }}
+          AMI: {{ metal_provider_spec.ami }}
+          Subnet Filter: {{ metal_provider_spec.subnet_filter_name }}
+          SG Filter: {{ metal_provider_spec.sg_filter_name }}
+          IAM Profile: {{ metal_provider_spec.iam_profile }}
+          Region: {{ metal_provider_spec.region }}
+          AZ: {{ metal_provider_spec.az }}
+
+# =============================================================================
+# Play 2: Create metal MachineSet ACM Policy with per-spoke ConfigMaps
+# =============================================================================
+- name: "Play 2: Create metal MachineSet ACM Policy"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    metal_policy_name: "metal-machineset-policy"
+    policy_namespace: "cnv-policy"
+    placement_name: "cnv-placement"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build list of virt clusters (all spokes)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('cluster_role', 'defined') | selectattr('cluster_role', 'equalto', 'spoke') | map(attribute='cluster_name') | list + groups['openshift_clusters'] | map('extract', hostvars) | rejectattr('cluster_role', 'defined') | map(attribute='cluster_name') | list }}"
+      when: virt_deploy_all_clusters | default(true)
+
+    - name: Build list of virt clusters (selective)
+      set_fact:
+        virt_clusters: "{{ groups['openshift_clusters'] | map('extract', hostvars) | selectattr('virt', 'defined') | selectattr('virt', 'equalto', true) | map(attribute='cluster_name') | list }}"
+      when: not (virt_deploy_all_clusters | default(true))
+
+    - name: Build managedcluster name mapping
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for target_cluster in virt_clusters %}
+          {% set target_vars = hostvars[target_cluster] %}
+          {% if target_vars.managedcluster_name is defined %}
+          "{{ target_cluster }}": "{{ target_vars.managedcluster_name }}"
+          {% elif target_vars.cluster_role | default('spoke') == 'hub' %}
+          "{{ target_cluster }}": "local-cluster"
+          {% else %}
+          "{{ target_cluster }}": "{{ target_cluster }}"
+          {% endif %}
+          {% if not loop.last %},{% endif %}
+          {% endfor %}
+          }
+
+    - name: Verify spoke infrastructure facts are available
+      fail:
+        msg: >-
+          Infrastructure facts not discovered for {{ item }}.
+          Ensure Play 1 completed successfully for all spoke clusters.
+      when: hostvars[item].metal_infra_id is not defined
+      loop: "{{ virt_clusters }}"
+
+  tasks:
+    # =========================================================================
+    # Create policy namespace (idempotent -- may already exist from CNV)
+    # =========================================================================
+    - name: Create CNV policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ policy_namespace }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Enable CNV/MTV integration preview in MultiClusterHub
+    # =========================================================================
+    - name: Enable cnv-mtv-integrations-preview in MultiClusterHub
+      shell: |
+        oc patch multiclusterhub multiclusterhub -n open-cluster-management \
+          --type=merge \
+          -p='{"spec":{"overrides":{"components":[{"name":"cnv-mtv-integrations-preview","enabled":true}]}}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Label managed clusters for placement (needed before policy creation)
+    # =========================================================================
+    - name: Label managed clusters with cnv=true
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} cnv=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+      changed_when: false
+
+    # =========================================================================
+    # Placement, PlacementBinding, ManagedClusterSetBinding
+    # =========================================================================
+    - name: Bind global ManagedClusterSet to CNV policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: global
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSet: global
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Placement for CNV clusters
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta1
+        kind: Placement
+        metadata:
+          name: {{ placement_name }}
+          namespace: {{ policy_namespace }}
+        spec:
+          clusterSets:
+            - global
+          predicates:
+            - requiredClusterSelector:
+                labelSelector:
+                  matchLabels:
+                    cnv: "true"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Create per-spoke ConfigMap with MachineSet parameters
+    # =========================================================================
+    - name: Create metal-machineset-config ConfigMap for each spoke
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: metal-machineset-config-{{ managedcluster_names[item] }}
+          namespace: {{ policy_namespace }}
+        data:
+          infra_id: "{{ hostvars[item].metal_infra_id }}"
+          ami: "{{ hostvars[item].metal_provider_spec.ami }}"
+          subnet_filter: "{{ hostvars[item].metal_provider_spec.subnet_filter_name }}"
+          sg_filter: "{{ hostvars[item].metal_provider_spec.sg_filter_name }}"
+          iam_profile: "{{ hostvars[item].metal_provider_spec.iam_profile }}"
+          region: "{{ hostvars[item].metal_provider_spec.region }}"
+          az: "{{ hostvars[item].metal_provider_spec.az }}"
+          instance_type: "{{ virt_metal_instance_type | default('m5.metal') }}"
+          replicas: "{{ virt_metal_replicas | default(1) | string }}"
+          volume_size: "{{ virt_metal_volume_size | default(120) | string }}"
+          volume_type: "{{ virt_metal_volume_type | default('gp3') }}"
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+
+    # =========================================================================
+    # PlacementBinding for metal MachineSet policy
+    # =========================================================================
+    - name: Create PlacementBinding for metal MachineSet policy
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: PlacementBinding
+        metadata:
+          name: {{ metal_policy_name }}-binding
+          namespace: {{ policy_namespace }}
+        placementRef:
+          apiGroup: cluster.open-cluster-management.io
+          kind: Placement
+          name: {{ placement_name }}
+        subjects:
+          - apiGroup: policy.open-cluster-management.io
+            kind: Policy
+            name: {{ metal_policy_name }}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # ACM Policy: MachineSet with hub templates
+    # =========================================================================
+    - name: Create metal MachineSet ACM Policy
+      shell: |
+        oc apply -f - <<'POLICYEOF'
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: Policy
+        metadata:
+          name: {{ metal_policy_name }}
+          namespace: {{ policy_namespace }}
+          annotations:
+            policy.open-cluster-management.io/categories: CM Configuration Management
+            policy.open-cluster-management.io/standards: NIST SP 800-53
+            policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+        spec:
+          disabled: false
+          remediationAction: enforce
+          policy-templates:
+            - objectDefinition:
+                apiVersion: policy.open-cluster-management.io/v1
+                kind: ConfigurationPolicy
+                metadata:
+                  name: metal-machineset
+                spec:
+                  remediationAction: enforce
+                  severity: high
+                  object-templates:
+                    - complianceType: musthave
+                      objectDefinition:
+                        apiVersion: machine.openshift.io/v1beta1
+                        kind: MachineSet
+                        metadata:
+                          name: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}-metal-{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "az" hub}}{% endraw %}'
+                          namespace: openshift-machine-api
+                          labels:
+                            machine.openshift.io/cluster-api-cluster: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}'
+                        spec:
+                          replicas: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "replicas" | toInt hub}}{% endraw %}'
+                          selector:
+                            matchLabels:
+                              machine.openshift.io/cluster-api-cluster: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}'
+                              machine.openshift.io/cluster-api-machineset: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}-metal-{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "az" hub}}{% endraw %}'
+                          template:
+                            metadata:
+                              labels:
+                                machine.openshift.io/cluster-api-cluster: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}'
+                                machine.openshift.io/cluster-api-machine-role: metal
+                                machine.openshift.io/cluster-api-machine-type: metal
+                                machine.openshift.io/cluster-api-machineset: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "infra_id" hub}}{% endraw %}-metal-{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "az" hub}}{% endraw %}'
+                            spec:
+                              metadata:
+                                labels:
+                                  node-role.kubernetes.io/metal: ""
+                                  node-role.kubernetes.io/worker: ""
+                              providerSpec:
+                                value:
+                                  apiVersion: machine.openshift.io/v1beta1
+                                  kind: AWSMachineProviderConfig
+                                  ami:
+                                    id: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "ami" hub}}{% endraw %}'
+                                  blockDevices:
+                                    - ebs:
+                                        volumeSize: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "volume_size" | toInt hub}}{% endraw %}'
+                                        volumeType: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "volume_type" hub}}{% endraw %}'
+                                        encrypted: true
+                                  credentialsSecret:
+                                    name: aws-cloud-credentials
+                                  iamInstanceProfile:
+                                    id: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "iam_profile" hub}}{% endraw %}'
+                                  instanceType: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "instance_type" hub}}{% endraw %}'
+                                  placement:
+                                    availabilityZone: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "az" hub}}{% endraw %}'
+                                    region: '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "region" hub}}{% endraw %}'
+                                  securityGroups:
+                                    - filters:
+                                        - name: tag:Name
+                                          values:
+                                            - '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "sg_filter" hub}}{% endraw %}'
+                                  subnet:
+                                    filters:
+                                      - name: tag:Name
+                                        values:
+                                          - '{% raw %}{{hub fromConfigMap "cnv-policy" (printf "metal-machineset-config-%s" .ManagedClusterName) "subnet_filter" hub}}{% endraw %}'
+                                  userDataSecret:
+                                    name: worker-user-data
+        POLICYEOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Wait for policy compliance
+    # =========================================================================
+    - name: Wait for metal MachineSet policy to be Compliant
+      shell: |
+        oc get policy {{ metal_policy_name }} -n {{ policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: metal_policy_compliance
+      until: metal_policy_compliance.stdout == "Compliant"
+      retries: 30
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 2 result
+      debug:
+        msg: |
+          ============================================
+          Metal MachineSet ACM Policy Created
+          ============================================
+          Policy: {{ metal_policy_name }} in {{ policy_namespace }}
+          Target clusters: {{ virt_clusters | join(', ') }}
+          Instance type: {{ virt_metal_instance_type | default('m5.metal') }}
+          Replicas: {{ virt_metal_replicas | default(1) }}
+          Compliance: {{ metal_policy_compliance.stdout | default('unknown') }}
+
+# =============================================================================
+# Play 3: Wait for metal nodes to be Ready on spoke clusters
+# =============================================================================
+- name: "Play 3: Wait for metal nodes to be Ready"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+  tasks:
+    - name: Wait for metal Machine to be Running on each spoke
+      shell: |
+        MACHINE_COUNT=$(oc get machines -n openshift-machine-api \
+          -l machine.openshift.io/cluster-api-machine-role=metal \
+          -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -c "Running" || echo "0")
+        echo "$MACHINE_COUNT"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: metal_machine_status
+      until: "metal_machine_status.stdout | int >= (virt_metal_replicas | default(1) | int)"
+      retries: 60
+      delay: 30
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Wait for metal nodes to be Ready on each spoke
+      shell: |
+        oc get nodes -l node-role.kubernetes.io/metal= \
+          -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | \
+          grep -c "True" || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: metal_node_ready
+      until: "metal_node_ready.stdout | int >= (virt_metal_replicas | default(1) | int)"
+      retries: 30
+      delay: 30
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Display Play 3 result
+      debug:
+        msg: |
+          ============================================
+          Metal Nodes Status
+          ============================================
+          {% for result in metal_node_ready.results %}
+          {{ result.item }}: {{ result.stdout | default('0') }} Ready metal node(s)
+          {% endfor %}
+
+# =============================================================================
+# Play 4: Install OpenShift Virtualization operator via ACM Policy
+# =============================================================================
+- name: "Play 4: Install OpenShift Virtualization operator via ACM Policy"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -98,71 +575,8 @@
 
   tasks:
     # =========================================================================
-    # Label managed clusters for placement
+    # Create PlacementBinding for CNV policy (placement already created in Play 2)
     # =========================================================================
-    - name: Label managed clusters with cnv=true
-      shell: |
-        oc label managedcluster {{ managedcluster_names[item] }} cnv=true --overwrite
-      environment:
-        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-      delegate_to: localhost
-      loop: "{{ virt_clusters }}"
-      changed_when: false
-
-    # =========================================================================
-    # Create policy namespace
-    # =========================================================================
-    - name: Create CNV policy namespace
-      shell: |
-        oc apply -f - <<'EOF'
-        apiVersion: v1
-        kind: Namespace
-        metadata:
-          name: {{ policy_namespace }}
-        EOF
-      environment:
-        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-      delegate_to: localhost
-
-    # =========================================================================
-    # Placement, PlacementBinding, ManagedClusterSetBinding
-    # =========================================================================
-    - name: Bind global ManagedClusterSet to CNV policy namespace
-      shell: |
-        oc apply -f - <<'EOF'
-        apiVersion: cluster.open-cluster-management.io/v1beta2
-        kind: ManagedClusterSetBinding
-        metadata:
-          name: global
-          namespace: {{ policy_namespace }}
-        spec:
-          clusterSet: global
-        EOF
-      environment:
-        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-      delegate_to: localhost
-
-    - name: Create Placement for CNV clusters
-      shell: |
-        oc apply -f - <<'EOF'
-        apiVersion: cluster.open-cluster-management.io/v1beta1
-        kind: Placement
-        metadata:
-          name: {{ placement_name }}
-          namespace: {{ policy_namespace }}
-        spec:
-          clusterSets:
-            - global
-          predicates:
-            - requiredClusterSelector:
-                labelSelector:
-                  matchLabels:
-                    cnv: "true"
-        EOF
-      environment:
-        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
-      delegate_to: localhost
-
     - name: Create PlacementBinding for CNV policy
       shell: |
         oc apply -f - <<'EOF'
@@ -306,7 +720,7 @@
       changed_when: false
       ignore_errors: true
 
-    - name: Display Play 1 result
+    - name: Display Play 4 result
       debug:
         msg: |
           ============================================
@@ -318,9 +732,9 @@
           Compliance: {{ policy_compliance.stdout | default('unknown') }}
 
 # =============================================================================
-# Play 2: Wait for Virtualization operator readiness on spokes
+# Play 5: Wait for Virtualization operator readiness on spokes
 # =============================================================================
-- name: "Play 2: Wait for Virtualization operator readiness on spokes"
+- name: "Play 5: Wait for Virtualization operator readiness on spokes"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -362,7 +776,7 @@
       loop: "{{ spoke_clusters }}"
       ignore_errors: true
 
-    - name: Display Play 2 result
+    - name: Display Play 5 result
       debug:
         msg: |
           ============================================
@@ -371,9 +785,9 @@
           Checked clusters: {{ spoke_clusters | join(', ') }}
 
 # =============================================================================
-# Play 3: Deploy VM via GitOps with DR protection
+# Play 6: Deploy VM via GitOps with DR protection
 # =============================================================================
-- name: "Play 3: Deploy VM via GitOps with DR protection"
+- name: "Play 6: Deploy VM via GitOps with DR protection"
   hosts: openshift_clusters
   gather_facts: false
 
@@ -602,7 +1016,7 @@
       changed_when: false
       ignore_errors: true
 
-    - name: Display Play 3 result
+    - name: Display Play 6 result
       debug:
         msg: |
           ============================================
@@ -614,9 +1028,9 @@
           DRPC Status: {{ vm_drpc_status.stdout | default('unknown') }}
 
 # =============================================================================
-# Play 4: Verify VM deployment and data
+# Play 7: Verify VM deployment and data
 # =============================================================================
-- name: "Play 4: Verify VM deployment and data"
+- name: "Play 7: Verify VM deployment and data"
   hosts: openshift_clusters
   gather_facts: false
 
