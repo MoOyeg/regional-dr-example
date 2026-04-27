@@ -1,0 +1,43 @@
+---
+# Inform-only: spec.enforcementActions is omitted, so Central will alert but
+# not block. Add enforcementActions to enforce.
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-sample-fixable-important
+  namespace: stackrox
+spec:
+  policyName: "GitOps Sample - Fixable Important+ CVE"
+  description: "Flags deployments containing at least one fixable Important or Critical CVE."
+  rationale: >-
+    If a fix is already published upstream, leaving it unpatched in production
+    is unjustified risk: the patch path is known and cheap.
+  remediation: >-
+    Rebuild the image against patched base layers, or pin to a tag whose
+    Scanner report shows zero fixable Important+ findings.
+  categories:
+    - Vulnerability Management
+  severity: HIGH_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Fixable Important or Critical CVE"
+      policyGroups:
+        - fieldName: "Fixable"
+          booleanOperator: OR
+          values:
+            - value: "true"
+        - fieldName: "Severity"
+          booleanOperator: OR
+          values:
+            - value: ">=IMPORTANT"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*
+    - name: "Don't alert on stackrox itself"
+      deployment:
+        scope:
+          namespace: stackrox

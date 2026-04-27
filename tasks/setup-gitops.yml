@@ -1,0 +1,71 @@
+---
+# =============================================================================
+# Reusable: Install OpenShift GitOps and wait for default ArgoCD instance
+# =============================================================================
+# Idempotent. Installs only the operator + default ArgoCD; does NOT register
+# managed clusters with ArgoCD (that's DR-app-specific via ACM GitOpsCluster
+# and lives in deploy-app.yml).
+#
+# Required vars (set by the caller):
+#   artifacts_dir       Path to artifacts/ (for kubeconfig lookup)
+#   cluster_name        Hub cluster name (the host the play is iterating on)
+#   gitops_namespace    Usually "openshift-gitops"
+#   gitops_channel      Operator channel (defaulted from group_vars)
+# =============================================================================
+
+- name: Create OpenShift GitOps Operator Subscription
+  shell: |
+    oc apply -f - <<'EOF'
+    apiVersion: operators.coreos.com/v1alpha1
+    kind: Subscription
+    metadata:
+      name: openshift-gitops-operator
+      namespace: openshift-operators
+    spec:
+      channel: {{ gitops_channel }}
+      installPlanApproval: Automatic
+      name: openshift-gitops-operator
+      source: redhat-operators
+      sourceNamespace: openshift-marketplace
+    EOF
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+
+- name: Wait for GitOps operator CSV to succeed
+  shell: |
+    oc get csv -n openshift-operators \
+      -o jsonpath='{.items[?(@.spec.displayName=="Red Hat OpenShift GitOps")].status.phase}'
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  register: gitops_csv_status
+  until: "'Succeeded' in gitops_csv_status.stdout"
+  retries: 30
+  delay: 20
+  changed_when: false
+
+- name: Wait for openshift-gitops namespace to be created
+  shell: |
+    oc get namespace {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  register: gitops_ns_status
+  until: "'Active' in gitops_ns_status.stdout"
+  retries: 20
+  delay: 10
+  changed_when: false
+
+- name: Wait for default ArgoCD instance to be available
+  shell: |
+    oc get argocd openshift-gitops -n {{ gitops_namespace }} \
+      -o jsonpath='{.status.phase}' 2>/dev/null || echo "pending"
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  register: argocd_status
+  until: "'Available' in argocd_status.stdout"
+  retries: 30
+  delay: 15
+  changed_when: false

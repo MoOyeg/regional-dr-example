@@ -1,0 +1,814 @@
+---
+# =============================================================================
+# Test: Application DR Failover and Failback
+# =============================================================================
+# This playbook tests DR failover and failback for both application instances:
+# 1. GitOps instance (quarkus-web-app namespace, managed via ArgoCD)
+# 2. Direct instance (quarkus-web-app-direct namespace, managed via oc apply)
+#
+# Phases:
+# - Pre-flight: Verify app is running on preferred cluster, write test data
+# - Failover: Patch DRPC to failover to secondary cluster, verify app comes up
+# - Validate: Confirm PVC data migrated, app is accessible on secondary
+# - Failback (Relocate): Patch DRPC to relocate back, verify app returns
+# - Post-check: Confirm app is healthy on original cluster
+#
+# Usage:
+#   ./ansible-runner.sh test-failover                 # Test both instances
+#   ./ansible-runner.sh test-failover -e instance=gitops   # GitOps only
+#   ./ansible-runner.sh test-failover -e instance=direct   # Direct only
+#
+# Prerequisites:
+# - DR app deployed: ./ansible-runner.sh app
+# - DRPC in Deployed/Relocate phase (not mid-failover)
+# =============================================================================
+
+# =============================================================================
+# Play 1: Pre-flight validation
+# =============================================================================
+- name: "Pre-flight: Validate DR readiness for failover test"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    - name: Display test plan
+      debug:
+        msg: |
+          ============================================
+          DR Failover Test Plan
+          ============================================
+          Instance(s): {{ test_instance }}
+          Primary Cluster: {{ primary_cluster }}
+          Secondary Cluster: {{ secondary_cluster }}
+          App Name: {{ app_name }}
+          DR Policy: {{ dr_policy_name }}
+
+          Phase 1: Verify app running on primary
+          Phase 2: Failover to secondary ({{ secondary_cluster }})
+          Phase 3: Validate app on secondary
+          Phase 4: Relocate back to primary ({{ primary_cluster }})
+          Phase 5: Validate app restored on primary
+
+    # --- GitOps instance pre-flight ---
+    - name: "GitOps: Check DRPC phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_drpc_phase
+      changed_when: false
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Verify app running on primary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_app_replicas
+      changed_when: false
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Get app Route URL on primary"
+      shell: |
+        oc get route {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_primary_route
+      changed_when: false
+      when: test_instance in ['both', 'gitops']
+
+    # --- Direct instance pre-flight ---
+    - name: "Direct: Check DRPC phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_drpc_phase
+      changed_when: false
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Verify app running on primary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_app_replicas
+      changed_when: false
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Get app Route URL on primary"
+      shell: |
+        oc get route {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_primary_route
+      changed_when: false
+      when: test_instance in ['both', 'direct']
+
+    - name: Display pre-flight results
+      debug:
+        msg: |
+          ============================================
+          Pre-flight Results
+          ============================================
+          {% if test_instance in ['both', 'gitops'] %}
+          GitOps Instance:
+            DRPC Phase: {{ gitops_drpc_phase.stdout | default('unknown') }}
+            App Replicas: {{ gitops_app_replicas.stdout | default('0') }}
+            Route: {{ gitops_primary_route.stdout | default('not-found') }}
+          {% endif %}
+          {% if test_instance in ['both', 'direct'] %}
+          Direct Instance:
+            DRPC Phase: {{ direct_drpc_phase.stdout | default('unknown') }}
+            App Replicas: {{ direct_app_replicas.stdout | default('0') }}
+            Route: {{ direct_primary_route.stdout | default('not-found') }}
+          {% endif %}
+
+# =============================================================================
+# Play 2: Write test data before failover
+# =============================================================================
+- name: "Write test data before failover"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+    test_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    - name: "GitOps: Write test data to MySQL before failover"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ app_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ] && [ "$MYSQL_POD" != "" ]; then
+          oc exec -n {{ app_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "CREATE TABLE IF NOT EXISTS failover_test (id INT AUTO_INCREMENT PRIMARY KEY, marker VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO failover_test (marker) VALUES ('pre-failover-{{ test_timestamp }}');
+             SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;"
+        else
+          echo "SKIP: MySQL pod not found"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_test_data
+      ignore_errors: true
+      when: test_instance in ['both', 'gitops']
+
+    - name: "Direct: Write test data to MySQL before failover"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ direct_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ] && [ "$MYSQL_POD" != "" ]; then
+          oc exec -n {{ direct_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "CREATE TABLE IF NOT EXISTS failover_test (id INT AUTO_INCREMENT PRIMARY KEY, marker VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO failover_test (marker) VALUES ('pre-failover-{{ test_timestamp }}');
+             SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;"
+        else
+          echo "SKIP: MySQL pod not found"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_test_data
+      ignore_errors: true
+      when: test_instance in ['both', 'direct']
+
+    - name: Display test data written
+      debug:
+        msg: |
+          Test marker: pre-failover-{{ test_timestamp }}
+          {% if test_instance in ['both', 'gitops'] %}
+          GitOps MySQL: {{ 'OK' if gitops_test_data.rc | default(1) == 0 else 'SKIPPED/FAILED' }}
+          {% endif %}
+          {% if test_instance in ['both', 'direct'] %}
+          Direct MySQL: {{ 'OK' if direct_test_data.rc | default(1) == 0 else 'SKIPPED/FAILED' }}
+          {% endif %}
+
+# =============================================================================
+# Play 3: Execute Failover to secondary cluster
+# =============================================================================
+- name: "Execute Failover to secondary cluster"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    # --- Failover GitOps instance ---
+    - name: "GitOps: Patch DRPC for Failover to {{ secondary_cluster }}"
+      shell: |
+        oc patch drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} --type=merge \
+          --patch='{"spec":{"action":"Failover","failoverCluster":"{{ secondary_cluster }}"}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: test_instance in ['both', 'gitops']
+
+    # --- Failover Direct instance ---
+    - name: "Direct: Patch DRPC for Failover to {{ secondary_cluster }}"
+      shell: |
+        oc patch drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} --type=merge \
+          --patch='{"spec":{"action":"Failover","failoverCluster":"{{ secondary_cluster }}"}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: test_instance in ['both', 'direct']
+
+    - name: Display failover initiated
+      debug:
+        msg: |
+          ============================================
+          Failover Initiated
+          ============================================
+          Target Cluster: {{ secondary_cluster }}
+          {% if test_instance in ['both', 'gitops'] %}
+          GitOps DRPC: {{ app_name }}-gitops-drpc patched
+          {% endif %}
+          {% if test_instance in ['both', 'direct'] %}
+          Direct DRPC: {{ app_name }}-direct-drpc patched
+          {% endif %}
+
+          Waiting for workloads to migrate...
+
+# =============================================================================
+# Play 4: Wait for failover completion and validate
+# =============================================================================
+- name: "Validate Failover on secondary cluster"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+    test_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    # --- Wait for GitOps DRPC FailedOver ---
+    - name: "GitOps: Wait for DRPC to reach FailedOver phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_failover_phase
+      until: "'FailedOver' in gitops_failover_phase.stdout"
+      retries: 60
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Wait for app deployment on secondary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_secondary_replicas
+      until: "(gitops_secondary_replicas.stdout | default('0') | int) >= 1"
+      retries: 40
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Verify MySQL running on secondary"
+      shell: |
+        oc get deployment mysql -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_secondary_mysql
+      until: "(gitops_secondary_mysql.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Verify test data survived failover"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ app_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ]; then
+          oc exec -n {{ app_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;" 2>/dev/null || echo "QUERY_FAILED"
+        else
+          echo "MYSQL_POD_NOT_FOUND"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_failover_data
+      ignore_errors: true
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Get app Route URL on secondary"
+      shell: |
+        oc get route {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_secondary_route
+      changed_when: false
+      when: test_instance in ['both', 'gitops']
+
+    # --- Wait for Direct DRPC FailedOver ---
+    - name: "Direct: Wait for DRPC to reach FailedOver phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_failover_phase
+      until: "'FailedOver' in direct_failover_phase.stdout"
+      retries: 60
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Wait for app deployment on secondary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_secondary_replicas
+      until: "(direct_secondary_replicas.stdout | default('0') | int) >= 1"
+      retries: 40
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Verify MySQL running on secondary"
+      shell: |
+        oc get deployment mysql -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_secondary_mysql
+      until: "(direct_secondary_mysql.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Verify test data survived failover"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ direct_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ]; then
+          oc exec -n {{ direct_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;" 2>/dev/null || echo "QUERY_FAILED"
+        else
+          echo "MYSQL_POD_NOT_FOUND"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_failover_data
+      ignore_errors: true
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Get app Route URL on secondary"
+      shell: |
+        oc get route {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ secondary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_secondary_route
+      changed_when: false
+      when: test_instance in ['both', 'direct']
+
+    - name: Display failover validation results
+      debug:
+        msg: |
+          ============================================
+          Failover Validation Results
+          ============================================
+          {% if test_instance in ['both', 'gitops'] %}
+          GitOps Instance:
+            DRPC Phase: {{ gitops_failover_phase.stdout | default('unknown') }}
+            App Running on {{ secondary_cluster }}: {{ 'YES' if (gitops_secondary_replicas.stdout | default('0') | int) >= 1 else 'NO' }}
+            MySQL Running: {{ 'YES' if (gitops_secondary_mysql.stdout | default('0') | int) >= 1 else 'NO' }}
+            Test Data Intact: {{ 'YES' if 'pre-failover' in (gitops_failover_data.stdout | default('')) else 'NO/PENDING' }}
+            Route: {{ gitops_secondary_route.stdout | default('not-found') }}
+          {% endif %}
+          {% if test_instance in ['both', 'direct'] %}
+          Direct Instance:
+            DRPC Phase: {{ direct_failover_phase.stdout | default('unknown') }}
+            App Running on {{ secondary_cluster }}: {{ 'YES' if (direct_secondary_replicas.stdout | default('0') | int) >= 1 else 'NO' }}
+            MySQL Running: {{ 'YES' if (direct_secondary_mysql.stdout | default('0') | int) >= 1 else 'NO' }}
+            Test Data Intact: {{ 'YES' if 'pre-failover' in (direct_failover_data.stdout | default('')) else 'NO/PENDING' }}
+            Route: {{ direct_secondary_route.stdout | default('not-found') }}
+          {% endif %}
+
+# =============================================================================
+# Play 5: Relocate (failback) to primary cluster
+# =============================================================================
+- name: "Relocate (failback) to primary cluster"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    # --- Relocate GitOps instance ---
+    - name: "GitOps: Patch DRPC for Relocate back to {{ primary_cluster }}"
+      shell: |
+        oc patch drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} --type=merge \
+          --patch='{"spec":{"action":"Relocate","preferredCluster":"{{ primary_cluster }}"}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: test_instance in ['both', 'gitops']
+
+    # --- Relocate Direct instance ---
+    - name: "Direct: Patch DRPC for Relocate back to {{ primary_cluster }}"
+      shell: |
+        oc patch drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} --type=merge \
+          --patch='{"spec":{"action":"Relocate","preferredCluster":"{{ primary_cluster }}"}}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: test_instance in ['both', 'direct']
+
+    - name: Display relocate initiated
+      debug:
+        msg: |
+          ============================================
+          Relocate (Failback) Initiated
+          ============================================
+          Target Cluster: {{ primary_cluster }}
+          Waiting for workloads to migrate back...
+
+# =============================================================================
+# Play 6: Validate relocate completion
+# =============================================================================
+- name: "Validate Relocate back to primary cluster"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    direct_namespace: "{{ app_namespace }}-direct"
+    test_instance: "{{ instance | default('both') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Build list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: Set primary and secondary clusters
+      set_fact:
+        primary_cluster: "{{ spoke_clusters[0] }}"
+        secondary_cluster: "{{ spoke_clusters[1] }}"
+
+  tasks:
+    # --- Wait for GitOps DRPC Relocated ---
+    - name: "GitOps: Wait for DRPC to reach Relocated phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-gitops-drpc \
+          -n {{ gitops_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_relocate_phase
+      until: "'Relocated' in gitops_relocate_phase.stdout"
+      retries: 60
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Wait for app deployment on primary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_restored_replicas
+      until: "(gitops_restored_replicas.stdout | default('0') | int) >= 1"
+      retries: 40
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Verify MySQL running on primary"
+      shell: |
+        oc get deployment mysql -n {{ app_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_restored_mysql
+      until: "(gitops_restored_mysql.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 15
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Verify test data survived round-trip"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ app_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ]; then
+          oc exec -n {{ app_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;" 2>/dev/null || echo "QUERY_FAILED"
+        else
+          echo "MYSQL_POD_NOT_FOUND"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_restored_data
+      ignore_errors: true
+      when: test_instance in ['both', 'gitops']
+
+    - name: "GitOps: Get app Route URL on primary"
+      shell: |
+        oc get route {{ app_name }} -n {{ app_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: gitops_restored_route
+      changed_when: false
+      when: test_instance in ['both', 'gitops']
+
+    # --- Wait for Direct DRPC Relocated ---
+    - name: "Direct: Wait for DRPC to reach Relocated phase"
+      shell: |
+        oc get drplacementcontrol {{ app_name }}-direct-drpc \
+          -n {{ direct_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_relocate_phase
+      until: "'Relocated' in direct_relocate_phase.stdout"
+      retries: 60
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Wait for app deployment on primary cluster"
+      shell: |
+        oc get deployment {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_restored_replicas
+      until: "(direct_restored_replicas.stdout | default('0') | int) >= 1"
+      retries: 40
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Verify MySQL running on primary"
+      shell: |
+        oc get deployment mysql -n {{ direct_namespace }} \
+          -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_restored_mysql
+      until: "(direct_restored_mysql.stdout | default('0') | int) >= 1"
+      retries: 30
+      delay: 15
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Verify test data survived round-trip"
+      shell: |
+        MYSQL_POD=$(oc get pods -n {{ direct_namespace }} -l app={{ app_name }},component=mysql \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$MYSQL_POD" ]; then
+          oc exec -n {{ direct_namespace }} "$MYSQL_POD" -- \
+            mysql -u root -prootpassword quarkusdb -e \
+            "SELECT * FROM failover_test ORDER BY id DESC LIMIT 5;" 2>/dev/null || echo "QUERY_FAILED"
+        else
+          echo "MYSQL_POD_NOT_FOUND"
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_restored_data
+      ignore_errors: true
+      when: test_instance in ['both', 'direct']
+
+    - name: "Direct: Get app Route URL on primary"
+      shell: |
+        oc get route {{ app_name }} -n {{ direct_namespace }} \
+          -o jsonpath='{.spec.host}' 2>/dev/null || echo "not-found"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ primary_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: direct_restored_route
+      changed_when: false
+      when: test_instance in ['both', 'direct']
+
+    # --- Final Summary ---
+    - name: Display final test results
+      debug:
+        msg: |
+          ============================================
+          DR Failover Test Complete
+          ============================================
+          Primary: {{ primary_cluster }}
+          Secondary: {{ secondary_cluster }}
+
+          {% if test_instance in ['both', 'gitops'] %}
+          GitOps Instance ({{ app_namespace }}):
+            Failover:  DRPC={{ gitops_relocate_phase.stdout | default('unknown') }} | App={{ 'PASS' if (gitops_restored_replicas.stdout | default('0') | int) >= 1 else 'FAIL' }} | MySQL={{ 'PASS' if (gitops_restored_mysql.stdout | default('0') | int) >= 1 else 'FAIL' }}
+            Data:      {{ 'PASS - pre-failover marker found' if 'pre-failover' in (gitops_restored_data.stdout | default('')) else 'FAIL - marker not found' }}
+            Route:     {{ gitops_restored_route.stdout | default('not-found') }}
+          {% endif %}
+
+          {% if test_instance in ['both', 'direct'] %}
+          Direct Instance ({{ direct_namespace }}):
+            Failover:  DRPC={{ direct_relocate_phase.stdout | default('unknown') }} | App={{ 'PASS' if (direct_restored_replicas.stdout | default('0') | int) >= 1 else 'FAIL' }} | MySQL={{ 'PASS' if (direct_restored_mysql.stdout | default('0') | int) >= 1 else 'FAIL' }}
+            Data:      {{ 'PASS - pre-failover marker found' if 'pre-failover' in (direct_restored_data.stdout | default('')) else 'FAIL - marker not found' }}
+            Route:     {{ direct_restored_route.stdout | default('not-found') }}
+          {% endif %}
+
+          Test Summary:
+            Phase 1 (Pre-flight):     DONE
+            Phase 2 (Failover):       {{ primary_cluster }} -> {{ secondary_cluster }}
+            Phase 3 (Validate):       App verified on {{ secondary_cluster }}
+            Phase 4 (Relocate):       {{ secondary_cluster }} -> {{ primary_cluster }}
+            Phase 5 (Post-validate):  App restored on {{ primary_cluster }}

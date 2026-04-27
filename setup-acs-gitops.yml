@@ -1,0 +1,223 @@
+---
+# =============================================================================
+# ACS Policy as Code Demo
+# =============================================================================
+# Creates an ArgoCD Application on the hub cluster that syncs SecurityPolicy
+# CRs (config.stackrox.io/v1alpha1) from acs-gitops/ in app_git_url into the
+# stackrox namespace. Central's config-controller reconciles each CR into a
+# live ACS policy.
+#
+# Implements the workflow from the RHACS 4.10 docs:
+#   https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/4.10/html-single/operating/index#managing-policies-as-code
+#
+# Prerequisites:
+#   - ACS Central deployed on hub:    ./ansible-runner.sh acs
+#   - app_git_url pointing at a repo containing the acs-gitops/ directory
+#
+# OpenShift GitOps is installed automatically if not already present (via the
+# shared tasks/setup-gitops.yml task file, which deploy-app.yml also uses).
+# =============================================================================
+
+- name: "ACS policy-as-code demo: create ArgoCD Application managing SecurityPolicy CRs"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    acs_namespace: "stackrox"
+    argocd_app_name: "acs-policy-as-code"
+    appproject_name: "acs-policy-as-code"
+    acs_gitops_path: "{{ acs_gitops_git_path | default('acs-gitops') }}"
+    gitops_channel: "{{ gitops_channel | default('latest') }}"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Fail if kubeconfig missing
+      fail:
+        msg: "Kubeconfig not found for hub cluster {{ cluster_name }}. Deploy it first."
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Fail if app_git_url is not configured
+      fail:
+        msg: >-
+          app_git_url is not configured. Set it in inventory/group_vars/all.yml
+          to the Git repository URL containing the acs-gitops/ directory.
+      when: app_git_url | default('') == ''
+
+    - name: Verify Central is Deployed on the hub
+      shell: |
+        oc get central {{ acs_central_name | default('stackrox-central-services') }} \
+          -n {{ acs_namespace }} \
+          -o jsonpath='{.status.conditions[?(@.type=="Deployed")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_deployed
+      changed_when: false
+      failed_when: "'True' not in central_deployed.stdout"
+
+    - name: Verify SecurityPolicy CRD exists (rhacs-operator must be installed)
+      shell: oc get crd securitypolicies.config.stackrox.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sp_crd_check
+      changed_when: false
+      failed_when: sp_crd_check.rc != 0
+
+    - name: Verify policy-as-code is enabled on Central
+      shell: |
+        oc get central {{ acs_central_name | default('stackrox-central-services') }} \
+          -n {{ acs_namespace }} \
+          -o jsonpath='{.spec.configAsCode.configAsCodeComponent}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: cac_state
+      changed_when: false
+      failed_when: cac_state.stdout == "Disabled"
+
+  tasks:
+    # =========================================================================
+    # Install OpenShift GitOps operator (no-op if already installed)
+    # Shared with deploy-app.yml — installs the operator and waits for the
+    # default ArgoCD instance in the openshift-gitops namespace.
+    # =========================================================================
+    - name: Install OpenShift GitOps and wait for ArgoCD readiness
+      include_tasks: tasks/setup-gitops.yml
+
+    - name: Allow ArgoCD to manage SecurityPolicy CRs in the stackrox namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: argoproj.io/v1beta1
+        kind: AppProject
+        metadata:
+          name: {{ appproject_name }}
+          namespace: {{ gitops_namespace }}
+        spec:
+          description: "ACS policies managed as code via GitOps"
+          sourceRepos:
+            - "{{ app_git_url }}"
+          destinations:
+            - namespace: {{ acs_namespace }}
+              server: https://kubernetes.default.svc
+          clusterResourceWhitelist: []
+          namespaceResourceWhitelist:
+            - group: config.stackrox.io
+              kind: SecurityPolicy
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create ArgoCD Application syncing SecurityPolicy CRs into stackrox namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: {{ argocd_app_name }}
+          namespace: {{ gitops_namespace }}
+        spec:
+          project: {{ appproject_name }}
+          source:
+            repoURL: {{ app_git_url }}
+            targetRevision: {{ app_git_branch | default('main') }}
+            path: {{ acs_gitops_path }}
+            directory:
+              recurse: true
+              exclude: '**/*.md'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: {{ acs_namespace }}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - ApplyOutOfSyncOnly=true
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for ArgoCD Application to be Synced
+      shell: |
+        oc get application.argoproj.io {{ argocd_app_name }} -n {{ gitops_namespace }} \
+          -o jsonpath='{.status.sync.status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: app_sync_status
+      until: app_sync_status.stdout == "Synced"
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    - name: Wait for ArgoCD Application to be Healthy
+      shell: |
+        oc get application.argoproj.io {{ argocd_app_name }} -n {{ gitops_namespace }} \
+          -o jsonpath='{.status.health.status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: app_health_status
+      until: app_health_status.stdout == "Healthy"
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    - name: List SecurityPolicy CRs synced into stackrox
+      shell: |
+        oc get securitypolicy.config.stackrox.io -n {{ acs_namespace }} \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.policyState}{"\n"}{end}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: synced_policies
+      changed_when: false
+      ignore_errors: true
+
+    - name: Get Central route for display
+      shell: |
+        oc get route central -n {{ acs_namespace }} -o jsonpath='{.spec.host}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: central_route_display
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display ACS policy-as-code demo result
+      debug:
+        msg: |
+          ACS Policy as Code Demo Deployed
+          ArgoCD Application : {{ argocd_app_name }} (namespace {{ gitops_namespace }})
+          Source repo        : {{ app_git_url }}
+          Source path        : {{ acs_gitops_path }} @ {{ app_git_branch | default('main') }}
+          Sync status        : {{ app_sync_status.stdout | default('Unknown') }}
+          Health status      : {{ app_health_status.stdout | default('Unknown') }}
+
+          Synced SecurityPolicies (name<TAB>policyState):
+          {{ synced_policies.stdout | default('(none)') }}
+
+          Central console:
+            https://{{ central_route_display.stdout | default('(unknown)') }}
+            Username: admin
+            Password: oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+
+          Edit acs-gitops/*.yaml in {{ app_git_url }} and push — ArgoCD
+          (auto-sync, prune=true, selfHeal=true) reapplies the CRs and
+          Central's config-controller reconciles them into live policies.

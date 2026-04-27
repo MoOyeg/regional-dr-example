@@ -44,7 +44,9 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
     ./aws/install && \
     rm -rf aws awscliv2.zip
 
-# Create workspace directory
+# Create workspace directory with write permissions
+RUN mkdir -p /workspace && chmod 777 /workspace
+
 WORKDIR /workspace
 
 # Set entrypoint and default command

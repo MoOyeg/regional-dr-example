@@ -1,0 +1,39 @@
+---
+# Inform-only: spec.enforcementActions is omitted, so Central will alert but
+# not block. Add enforcementActions to enforce.
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-sample-no-host-pid
+  namespace: stackrox
+spec:
+  policyName: "GitOps Sample - No Host PID Namespace"
+  description: "Flags pods that share the host PID namespace."
+  rationale: >-
+    hostPID: true lets the container see and signal every process on the node,
+    which makes lateral movement and privilege escalation trivial.
+  remediation: >-
+    Remove hostPID from the pod spec. If a debugging tool genuinely needs it,
+    run it as an ephemeral debug pod rather than a permanent workload.
+  categories:
+    - Privileges
+  severity: HIGH_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Pod uses hostPID"
+      policyGroups:
+        - fieldName: "Host PID"
+          booleanOperator: OR
+          values:
+            - value: "true"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*
+    - name: "Don't alert on kube-system"
+      deployment:
+        scope:
+          namespace: kube-system

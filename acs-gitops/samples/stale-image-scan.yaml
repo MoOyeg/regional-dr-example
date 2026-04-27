@@ -1,0 +1,35 @@
+---
+# Inform-only: spec.enforcementActions is omitted, so Central will alert but
+# not block. Add enforcementActions to enforce.
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-sample-stale-image-scan
+  namespace: stackrox
+spec:
+  policyName: "GitOps Sample - Stale Image Scan"
+  description: "Flags deployments whose image was last scanned more than 30 days ago."
+  rationale: >-
+    Vulnerability data goes stale fast. A scan older than a month almost
+    certainly misses CVEs disclosed since.
+  remediation: >-
+    Trigger a fresh scan via roxctl or Central, or rebuild the image so the
+    next scan runs against the current Scanner database.
+  categories:
+    - Vulnerability Management
+  severity: MEDIUM_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Image scan older than 30 days"
+      policyGroups:
+        - fieldName: "Image Scan Age"
+          booleanOperator: OR
+          values:
+            - value: "30"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*

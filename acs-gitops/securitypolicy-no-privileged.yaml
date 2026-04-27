@@ -1,0 +1,38 @@
+---
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-no-privileged
+  namespace: stackrox
+spec:
+  policyName: "GitOps Demo - No Privileged Containers"
+  description: "Flags deployments running privileged containers. Managed via GitOps."
+  rationale: >-
+    Privileged containers bypass most container isolation and grant
+    near-host-level access. Avoid privileged unless absolutely required.
+  remediation: >-
+    Remove securityContext.privileged: true from the pod spec. If host
+    capabilities are genuinely required, request only the specific Linux
+    capabilities needed.
+  categories:
+    - Privileges
+  severity: HIGH_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Privileged container"
+      policyGroups:
+        - fieldName: "Privileged Container"
+          booleanOperator: OR
+          values:
+            - value: "true"
+  exclusions:
+    - name: "Don't alert on stackrox itself"
+      deployment:
+        scope:
+          namespace: stackrox
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*

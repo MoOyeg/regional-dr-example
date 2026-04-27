@@ -1,0 +1,42 @@
+---
+# Example of a "cloned default" style policy: this mirrors the shape of
+# Central's built-in "Required Image Label" policy but raises the bar so a
+# specific maintainer label must be present on every running image. Created in
+# Central by cloning the default policy, then exported via:
+#   Policy Management -> kebab menu -> "Save as Custom Resource".
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-required-maintainer-label
+  namespace: stackrox
+spec:
+  policyName: "GitOps Demo - Required Maintainer Label"
+  description: "Flags images that do not declare a maintainer label."
+  rationale: >-
+    Every image running in production must trace back to a team that owns it.
+    The maintainer label is the cheapest place to record that ownership.
+  remediation: >-
+    Add LABEL maintainer="<team-name>" (or maintainer="<email>") to the
+    Containerfile / Dockerfile and rebuild the image.
+  categories:
+    - DevOps Best Practices
+  severity: MEDIUM_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Image is missing maintainer label"
+      policyGroups:
+        - fieldName: "Required Image Label"
+          booleanOperator: OR
+          values:
+            - value: "maintainer=.+"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*
+    - name: "Don't alert on kube-system"
+      deployment:
+        scope:
+          namespace: kube-system

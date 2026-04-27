@@ -1,0 +1,37 @@
+---
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-no-latest-tag
+  namespace: stackrox
+spec:
+  policyName: "GitOps Demo - No Latest Image Tag"
+  description: "Flags deployments using the :latest image tag. Managed via GitOps."
+  rationale: >-
+    Using :latest makes deployments non-reproducible and surprises rollbacks.
+    Pin to an immutable tag or digest.
+  remediation: >-
+    Update the deployment to use an explicit image tag (e.g. v1.2.3) or a
+    sha256 digest reference.
+  categories:
+    - DevOps Best Practices
+  severity: LOW_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "Image tag is latest"
+      policyGroups:
+        - fieldName: "Image Tag"
+          booleanOperator: OR
+          values:
+            - value: "latest"
+  exclusions:
+    - name: "Don't alert on kube-system"
+      deployment:
+        scope:
+          namespace: kube-system
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*

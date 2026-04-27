@@ -145,7 +145,9 @@ Commands:
     certs           Install cert-manager and Let's Encrypt wildcard certificate
     netobserv       Install NetObserv for network traffic monitoring
     acs             Install ACS (Advanced Cluster Security) for cluster security
+    acs-gitops      Demo: manage ACS policies/config declaratively via ArgoCD
     virt            Deploy VM DR example (OpenShift Virtualization + Regional DR)
+    test-failover   Test DR failover and failback for app instances
     validate        Validate configuration and credentials
     list            List configured clusters
     run <playbook>  Run a specific playbook
@@ -173,8 +175,13 @@ Examples:
     $0 netobserv --destroy            # Remove NetObserv, Loki, and S3 bucket
     $0 acs                            # Install ACS Central + SecuredCluster on all clusters
     $0 acs --destroy                  # Remove ACS from all clusters
+    $0 acs-gitops                     # Demo ACS policies/config managed via ArgoCD
+    $0 acs-gitops --destroy           # Remove ACS GitOps Application and synced resources
     $0 virt                           # Deploy VM DR example on spoke clusters
     $0 virt --destroy                 # Remove VM DR example and CNV policy
+    $0 test-failover                    # Test failover+failback for both app instances
+    $0 test-failover -e instance=gitops # Test GitOps instance only
+    $0 test-failover -e instance=direct # Test Direct instance only
     $0 operators
     $0 infra-dr
     $0 app                            # Deploy DR-protected sample application
@@ -268,6 +275,37 @@ ACS Command (./ansible-runner.sh acs):
        URL: oc get route central -n stackrox -o jsonpath='{.spec.host}'
        User: admin
        Pass: oc get secret central-htpasswd -n stackrox -o jsonpath='{.data.password}' | base64 -d
+
+ACS GitOps Demo Command (./ansible-runner.sh acs-gitops):
+    Demonstrates managing ACS policies and declarative configuration through
+    OpenShift GitOps (ArgoCD). An ArgoCD Application on the hub continuously
+    syncs the acs-gitops/ directory in your Git repo into the stackrox
+    namespace, applying SecurityPolicy CRs (policy-as-code) and labeled
+    ConfigMaps (declarative config) to Central.
+
+    Prerequisites:
+    1. ACS installed: $0 acs   (Central must be running on hub)
+    2. app_git_url configured in inventory/group_vars/all.yml
+       (Git repo URL containing the acs-gitops/ directory)
+
+    OpenShift GitOps is installed automatically if not already present
+    (shared install via tasks/setup-gitops.yml — same one $0 app uses).
+
+    What it does:
+    1. Verifies ACS Central is Deployed on the hub cluster
+    2. Installs OpenShift GitOps and waits for ArgoCD to be Available
+    3. Creates an ArgoCD Application (acs-gitops-demo) syncing from
+       app_git_url path acs-gitops/ into namespace stackrox
+    4. ArgoCD applies SecurityPolicy CRs and labeled ConfigMaps; the
+       rhacs-operator and Central reconcile them into live ACS config
+
+    Edit acs-gitops/ in your Git repo to change policies or declarative
+    config — ArgoCD will sync the changes automatically.
+
+    Verify:
+       oc get application.argoproj.io acs-gitops-demo -n openshift-gitops
+       oc get securitypolicy.config.stackrox.io -n stackrox
+       oc get cm -n stackrox -l rhacs.redhat.com/configuration=true
 
 DR Application Command (./ansible-runner.sh app):
     Deploys TWO DR-protected instances of a sample application (Quarkus + MySQL):
@@ -523,6 +561,22 @@ case "${1:-}" in
         run_ansible "$playbook" "${filtered_args[@]}"
         ;;
 
+    acs-gitops)
+        build_image
+        shift
+        # Check for --destroy flag and switch playbook
+        filtered_args=()
+        playbook="setup-acs-gitops.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-acs-gitops.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
     virt)
         build_image
         shift
@@ -537,6 +591,12 @@ case "${1:-}" in
             fi
         done
         run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    test-failover)
+        build_image
+        shift
+        run_ansible "test-failover.yml" "$@"
         ;;
 
     validate)

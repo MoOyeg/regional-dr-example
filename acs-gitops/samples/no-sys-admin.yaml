@@ -1,0 +1,40 @@
+---
+# Inform-only: spec.enforcementActions is omitted, so Central will alert but
+# not block. Add enforcementActions to enforce.
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-sample-no-sys-admin
+  namespace: stackrox
+spec:
+  policyName: "GitOps Sample - Drop CAP_SYS_ADMIN"
+  description: "Flags containers that request CAP_SYS_ADMIN."
+  rationale: >-
+    CAP_SYS_ADMIN grants near-root privileges on the host. Almost no workload
+    actually needs it; it's the most common cause of container escape risk.
+  remediation: >-
+    Remove SYS_ADMIN from securityContext.capabilities.add. If a specific host
+    operation is required, request only the narrowest capability that allows
+    it.
+  categories:
+    - Privileges
+  severity: HIGH_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "CAP_SYS_ADMIN added"
+      policyGroups:
+        - fieldName: "Add Capabilities"
+          booleanOperator: OR
+          values:
+            - value: "SYS_ADMIN"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*
+    - name: "Don't alert on kube-system"
+      deployment:
+        scope:
+          namespace: kube-system

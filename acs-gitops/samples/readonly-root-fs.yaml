@@ -1,0 +1,43 @@
+---
+# Inform-only: spec.enforcementActions is omitted, so Central will alert but
+# not block. Add enforcementActions to enforce.
+apiVersion: config.stackrox.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: gitops-sample-readonly-root-fs
+  namespace: stackrox
+spec:
+  policyName: "GitOps Sample - Read-Only Root Filesystem"
+  description: "Flags containers without a read-only root filesystem."
+  rationale: >-
+    A writable root filesystem lets a compromised process drop tools, replace
+    binaries, or persist across restarts.
+  remediation: >-
+    Set securityContext.readOnlyRootFilesystem: true on every container. Mount
+    emptyDir / PVCs at the specific paths that need to be writable.
+  categories:
+    - Security Best Practices
+  severity: MEDIUM_SEVERITY
+  lifecycleStages:
+    - DEPLOY
+  eventSource: NOT_APPLICABLE
+  policySections:
+    - sectionName: "readOnlyRootFilesystem not set"
+      policyGroups:
+        - fieldName: "Read-Only Root Filesystem"
+          booleanOperator: OR
+          values:
+            - value: "false"
+  exclusions:
+    - name: "Don't alert on openshift namespaces"
+      deployment:
+        scope:
+          namespace: openshift-.*
+    - name: "Don't alert on kube-system"
+      deployment:
+        scope:
+          namespace: kube-system
+    - name: "Don't alert on stackrox itself"
+      deployment:
+        scope:
+          namespace: stackrox

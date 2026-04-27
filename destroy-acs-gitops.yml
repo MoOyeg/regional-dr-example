@@ -1,0 +1,95 @@
+---
+# =============================================================================
+# Destroy ACS Policy as Code Demo
+# =============================================================================
+# Removes the ArgoCD Application that manages SecurityPolicy CRs. Because the
+# Application uses syncPolicy.automated.prune=true, deleting it via the
+# resources-finalizer.argocd.argoproj.io finalizer also prunes every synced
+# SecurityPolicy from the stackrox namespace; Central's config-controller then
+# removes the corresponding live policies.
+# =============================================================================
+
+- name: "ACS policy-as-code demo: remove ArgoCD Application and synced SecurityPolicy CRs"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    acs_namespace: "stackrox"
+    argocd_app_name: "acs-policy-as-code"
+    appproject_name: "acs-policy-as-code"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: Skip if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Add resources-finalizer so ArgoCD prunes synced resources on delete
+      shell: |
+        oc patch application.argoproj.io {{ argocd_app_name }} \
+          -n {{ gitops_namespace }} \
+          --type=merge \
+          -p '{"metadata":{"finalizers":["resources-finalizer.argocd.argoproj.io"]}}' \
+          --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ArgoCD Application (triggers cascade prune)
+      shell: |
+        oc delete application.argoproj.io {{ argocd_app_name }} \
+          -n {{ gitops_namespace }} \
+          --ignore-not-found --wait=true --timeout=180s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete ArgoCD AppProject
+      shell: |
+        oc delete appproject {{ appproject_name }} \
+          -n {{ gitops_namespace }} \
+          --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Best-effort cleanup of any leftover demo SecurityPolicies
+      shell: |
+        oc delete securitypolicy.config.stackrox.io \
+          gitops-no-latest-tag \
+          gitops-no-privileged \
+          gitops-required-maintainer-label \
+          gitops-sample-no-sys-admin \
+          gitops-sample-no-host-network \
+          gitops-sample-no-host-pid \
+          gitops-sample-readonly-root-fs \
+          gitops-sample-stale-image-scan \
+          gitops-sample-fixable-important \
+          -n {{ acs_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Display destroy result
+      debug:
+        msg: |
+          ACS policy-as-code demo removed.
+          - ArgoCD Application '{{ argocd_app_name }}' deleted
+          - AppProject '{{ appproject_name }}' deleted
+          - Demo SecurityPolicy CRs pruned (Central removes the live policies)
