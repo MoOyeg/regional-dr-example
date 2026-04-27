@@ -146,6 +146,7 @@ Commands:
     netobserv       Install NetObserv for network traffic monitoring
     acs             Install ACS (Advanced Cluster Security) for cluster security
     acs-gitops      Demo: manage ACS policies/config declaratively via ArgoCD
+    acs-cve-demo    Demo: deploy CVE-2024-53677 vulnerable Struts 2 app for ACS
     virt            Deploy VM DR example (OpenShift Virtualization + Regional DR)
     test-failover   Test DR failover and failback for app instances
     validate        Validate configuration and credentials
@@ -177,6 +178,8 @@ Examples:
     $0 acs --destroy                  # Remove ACS from all clusters
     $0 acs-gitops                     # Demo ACS policies/config managed via ArgoCD
     $0 acs-gitops --destroy           # Remove ACS GitOps Application and synced resources
+    $0 acs-cve-demo                   # Deploy vulnerable CVE-2024-53677 Struts 2 app for ACS to detect
+    $0 acs-cve-demo --destroy         # Remove the CVE-2024-53677 demo app
     $0 virt                           # Deploy VM DR example on spoke clusters
     $0 virt --destroy                 # Remove VM DR example and CNV policy
     $0 test-failover                    # Test failover+failback for both app instances
@@ -306,6 +309,36 @@ ACS GitOps Demo Command (./ansible-runner.sh acs-gitops):
        oc get application.argoproj.io acs-gitops-demo -n openshift-gitops
        oc get securitypolicy.config.stackrox.io -n stackrox
        oc get cm -n stackrox -l rhacs.redhat.com/configuration=true
+
+ACS CVE Demo Command (./ansible-runner.sh acs-cve-demo):
+    Deploys the Apache Struts 2 vulnerable workload from
+    https://github.com/SeanRickerd/CVE-2024-53677 onto the hub cluster via
+    an ArgoCD Application that syncs the acs-cve-2024-53677/ directory in
+    your Git repo. The hub is itself a SecuredCluster, so RHACS Central
+    immediately picks up the workload and flags CVE-2024-53677 plus
+    standard policy violations (privileged, latest tag, no resource limits).
+
+    Prerequisites:
+    1. ACS installed: $0 acs   (Central + SecuredCluster on hub)
+    2. app_git_url configured in inventory/group_vars/all.yml
+       (Git repo URL containing the acs-cve-2024-53677/ directory)
+
+    What it does:
+    1. Verifies ACS Central is Deployed and a SecuredCluster exists on hub
+    2. Installs OpenShift GitOps if not already present
+    3. Creates an AppProject scoped to the 'vulnerables' namespace
+    4. Creates an ArgoCD Application that creates the namespace, deployment,
+       service, and route from acs-cve-2024-53677/ on the hub
+    5. Waits for the Struts2 deployment to be Available
+    6. Prints the route URL and a pointer into the ACS console
+
+    Verify:
+       oc get pods -n vulnerables
+       oc get route ocp-struts2 -n vulnerables
+       # In ACS Central -> Vulnerability Management filter Namespace=vulnerables
+
+    Cleanup:
+       $0 acs-cve-demo --destroy
 
 DR Application Command (./ansible-runner.sh app):
     Deploys TWO DR-protected instances of a sample application (Quarkus + MySQL):
@@ -570,6 +603,21 @@ case "${1:-}" in
         for arg in "$@"; do
             if [ "$arg" = "--destroy" ]; then
                 playbook="destroy-acs-gitops.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    acs-cve-demo)
+        build_image
+        shift
+        filtered_args=()
+        playbook="setup-acs-cve-demo.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-acs-cve-demo.yml"
             else
                 filtered_args+=("$arg")
             fi
