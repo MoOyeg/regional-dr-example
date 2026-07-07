@@ -7,8 +7,8 @@ cluster_name: "cluster1"
 cluster_role: hub
 #cluster_base_domain: "example.com"  # Optional: will auto-detect from Route53 if not provided
 
-# AWS Credential Set to use (1, 2, or 3)
-aws_credential_set: 1
+# AWS account: named profile in ~/.aws/credentials ([cluster1] section)
+aws_profile: "default"
 
 # AWS Configuration
 aws_region: "us-east-2"
@@ -29,6 +29,16 @@ netobserv: true
 # aws_subnet_id: "subnet-zzzzzzzzzzzzzzzzz"
 # aws_security_group_id: "sg-zzzzzzzzzzzzzzzzz"
 
+# Cluster network CIDRs (optional; override the OCP defaults in the install-config).
+# Give Submariner-connected clusters NON-OVERLAPPING pod/service/machine ranges to
+# enable cross-cluster live migration without globalnet (see cluster2/cluster3).
+# The hub is excluded from the Submariner set by default, so these are informational
+# here - uncomment to override.
+#cluster_network_cidr: "10.128.0.0/14"
+#cluster_network_host_prefix: 23
+#service_network_cidr: "172.30.0.0/16"
+#machine_network_cidr: "10.0.0.0/16"
+
 # SSH Key (choose one):
 # Option 1: Place ssh-key.pub in project root (auto-imported to EC2)
 # Option 2: Use existing AWS EC2 key pair:
@@ -41,4 +51,4 @@ aws_create_eip: true
 #aws_route53_zone: "example.com"
 
 # OpenShift version
-openshift_version: "4.20"
+openshift_version: "4.21"

@@ -13,12 +13,29 @@
     - name: Display deployment mode
       debug:
         msg: "Deployment mode: {{ 'Using existing VPC/Subnet' if use_existing_vpc else 'OpenShift installer will create VPC/Subnet' }}"
-    
+
+    # Minimal infrastructure: force SNO (1 master / 0 workers) with a role-specific
+    # instance type - large VM for the hub, bare-metal for spokes (KVM for CNV).
+    - name: Apply minimal-infra topology override
+      set_fact:
+        control_plane_replicas: 1
+        worker_replicas: 0
+        control_plane_instance_type: "{{ minimal_hub_instance_type if (cluster_role | default('spoke')) == 'hub' else minimal_spoke_instance_type }}"
+        aws_instance_type: "{{ minimal_hub_instance_type if (cluster_role | default('spoke')) == 'hub' else minimal_spoke_instance_type }}"
+      when: minimal_infra | default(false) | bool
+
+    - name: Display minimal-infra topology
+      debug:
+        msg: >-
+          Minimal infra: {{ cluster_name }} ({{ cluster_role | default('spoke') }})
+          -> SNO 1 master / 0 workers on {{ control_plane_instance_type }}
+      when: minimal_infra | default(false) | bool
+
     - name: Validate required variables for existing VPC mode
       assert:
         that:
           - cluster_name is defined
-          - aws_credential_set is defined
+          - aws_profile is defined and (aws_profile | length > 0)
           - aws_region is defined
           - aws_instance_type is defined
           - aws_ami_id is defined
@@ -30,23 +47,23 @@
       assert:
         that:
           - cluster_name is defined
-          - aws_credential_set is defined
+          - aws_profile is defined and (aws_profile | length > 0)
           - aws_region is defined
         fail_msg: "Missing required variables for cluster {{ cluster_name }}"
       when: not use_existing_vpc
     
     - name: Set AWS credentials based on credential set
       set_fact:
-        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
-        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
-        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+        aws_access_key: "{{ lookup('ini', 'aws_access_key_id', section=aws_profile, file=aws_shared_credentials_file) }}"
+        aws_secret_key: "{{ lookup('ini', 'aws_secret_access_key', section=aws_profile, file=aws_shared_credentials_file) }}"
+        aws_deploy_region: "{{ aws_region | default(aws_region, true) }}"
     
     - name: Validate AWS credentials are set
       assert:
         that:
           - aws_access_key | length > 0
           - aws_secret_key | length > 0
-        fail_msg: "AWS credentials not found for credential set {{ aws_credential_set }}"
+        fail_msg: "AWS credentials not found for profile {{ aws_profile }}"
 
     - name: Use explicit availability zone when set (IPI mode)
       set_fact:
@@ -114,7 +131,7 @@
         msg: |
           Deploying cluster: {{ cluster_name }}
           Region: {{ aws_region }}
-          Credential Set: {{ aws_credential_set }}
+          AWS Profile: {{ aws_profile }}
           Base Domain: {{ cluster_base_domain }}
           {{ '(auto-detected from Route53)' if route53_zone_result.stdout is defined else '' }}
     
@@ -348,7 +365,7 @@
                 {Key=Name,Value={{ cluster_name }}},
                 {Key=cluster,Value={{ cluster_name }}},
                 {Key=region,Value={{ aws_deploy_region }}},
-                {Key=openshift-version,Value={{ openshift_version | default("4.17") }}},
+                {Key=openshift-version,Value={{ openshift_version | default("4.21") }}},
                 {Key=managed-by,Value=ansible}
               ]' \
               --region {{ aws_deploy_region }} \

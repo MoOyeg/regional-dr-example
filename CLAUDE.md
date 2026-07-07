@@ -18,7 +18,7 @@
 - `destroy-clusters.yml` — Teardown playbook (supports `force_destroy` extra var for --yes flag)
 - `validate.yml` — Pre-flight credential/config checks
 - `inventory/hosts` — Cluster inventory under `[openshift_clusters]` group
-- `inventory/group_vars/all.yml` — Global defaults (OpenShift 4.20, m5.2xlarge, 120GB)
+- `inventory/group_vars/all.yml` — Global defaults (OpenShift 4.21, m5.2xlarge, 120GB)
 - `inventory/host_vars/` — Per-cluster configs (aws_credential_set, region, VPC, AMI, etc.)
 - `templates/install-config.yaml.j2` — SNO install-config (1 master, 0 workers, OVNKubernetes)
 - `Containerfile` — UBI9-based image with Ansible, AWS CLI, oc, openshift-install
@@ -45,7 +45,19 @@
 - If `aws_key_name` is not set in host_vars, deploy playbook auto-imports `ssh-key.pub` as EC2 key pair `<cluster_name>-key`
 - Imported key pairs are tagged with `managed-by=ansible` and deleted during `destroy`
 
+## Minimal Infrastructure Deploy
+- `deploy --minimal` / `infra-dr --minimal` passes `-e minimal_infra=true` (default `false`)
+- Forces every cluster to SNO (1 master / 0 workers) with role-specific instance types
+  (`minimal_hub_instance_type` = large VM for hub, `minimal_spoke_instance_type` = `.metal` for
+  spokes — bare metal is required for KVM/OpenShift Virtualization on AWS). Override in group_vars.
+- Topology override happens at deploy time in `deploy-clusters.yml` pre_tasks (doesn't touch host_vars)
+- Submariner: `setup-submariner.yml` labels the spoke's single node `submariner.io/gateway=true` and
+  omits the dedicated-gateway `gatewayConfig.aws` block, so the SNO node IS the gateway (no extra machine)
+- ODF single-node: `infra-dr.yml` sets `flexibleScaling: true` + device set `replica: 1` /
+  `count: {{ odf_minimal_device_set_count }}` (3 OSDs on the one host, failure domain host, not HA)
+- Hub SNO defaults to `m5.8xlarge` (`minimal_hub_instance_type`) to fit the full hub stack
+
 ## Known Issues / Gotchas
 - `secret.sh` contains plaintext AWS credentials and is NOT gitignored — rotate keys and add to .gitignore
 - The `destroy` command supports `--yes`/`-y` flag which passes `-e force_destroy=true` to the playbook
-- install-config.yaml.j2 is SNO-specific: `bootstrapInPlace` with `/dev/xvda`
+- install-config.yaml.j2 is SNO-specific: `bootstrapInPlace` with `/dev/xvda` (UPI only; IPI SNO omits it)

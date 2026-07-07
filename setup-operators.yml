@@ -135,6 +135,45 @@
       delay: 30
 
     # =========================================================================
+    # OpenShift GitOps (ArgoCD) - REQUIRED before the ODF Multicluster
+    # Orchestrator. ODF MCO 4.21+ sets up a ProtectedApplicationView controller
+    # that indexes argoproj.io ApplicationSets; if the argoproj.io/v1alpha1 CRDs
+    # are absent, odfmo-controller-manager crash-loops ("no matches for
+    # argoproj.io/v1alpha1") and the MCO CSV never reaches Succeeded. Installing
+    # GitOps here creates those CRDs first.
+    # =========================================================================
+    - name: Create OpenShift GitOps Subscription (provides argoproj.io CRDs)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: openshift-gitops-operator
+          namespace: openshift-operators
+        spec:
+          channel: {{ gitops_channel | default('latest') }}
+          installPlanApproval: Automatic
+          name: openshift-gitops-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for argoproj.io ApplicationSet CRD to be available
+      shell: |
+        oc get crd applicationsets.argoproj.io -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: argocd_crd
+      until: "'applicationsets.argoproj.io' in argocd_crd.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    # =========================================================================
     # ODF Multicluster Orchestrator
     # =========================================================================
     - name: Create ODF Multicluster Orchestrator Subscription
@@ -225,6 +264,22 @@
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
 
+    # An OperatorGroup may already exist in this namespace -- either from a
+    # previous run of this playbook, or created by the ODF Multicluster
+    # Orchestrator (ramen-operator-group, owned by an AppliedManifestWork) once
+    # a DRPolicy/MirrorPeer is configured. Two OperatorGroups in one namespace
+    # makes OLM fail the CSV with "TooManyOperatorGroups", so only create ours
+    # when the namespace has none.
+    - name: Check for existing OperatorGroup in openshift-dr-system
+      shell: |
+        oc get operatorgroup -n openshift-dr-system \
+          -o jsonpath='{.items[*].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: dr_existing_operatorgroup
+      changed_when: false
+
     - name: Create DR Cluster OperatorGroup (AllNamespaces mode)
       shell: |
         oc apply -f - <<'EOF'
@@ -237,6 +292,14 @@
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
+      when: dr_existing_operatorgroup.stdout | trim | length == 0
+
+    - name: Report existing OperatorGroup was reused
+      debug:
+        msg: >-
+          Skipped creating openshift-dr-system-operatorgroup on {{ cluster_name }};
+          namespace already has OperatorGroup(s): {{ dr_existing_operatorgroup.stdout | trim }}
+      when: dr_existing_operatorgroup.stdout | trim | length > 0
 
     - name: Create OpenShift DR Cluster Operator Subscription
       shell: |

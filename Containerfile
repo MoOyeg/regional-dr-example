@@ -1,4 +1,4 @@
-ARG OPENSHIFT_VERSION=4.20
+ARG OPENSHIFT_VERSION=4.21
 
 FROM registry.access.redhat.com/ubi9/ubi:latest
 

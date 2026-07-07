@@ -48,7 +48,7 @@ cat > inventory/host_vars/cluster-us-east-1.yml <<EOF
 ---
 cluster_name: "ocp-us-east-1"
 cluster_base_domain: "example.com"
-aws_credential_set: 1
+aws_profile: "account1"        # named profile in ~/.aws/credentials
 aws_region: "us-east-1"
 aws_availability_zone: "us-east-1a"
 aws_instance_type: "m5.2xlarge"
@@ -68,7 +68,7 @@ cat > inventory/host_vars/cluster-us-west-2.yml <<EOF
 ---
 cluster_name: "ocp-us-west-2"
 cluster_base_domain: "example.com"
-aws_credential_set: 2
+aws_profile: "account2"        # named profile in ~/.aws/credentials
 aws_region: "us-west-2"
 aws_availability_zone: "us-west-2a"
 aws_instance_type: "m5.2xlarge"
@@ -88,7 +88,7 @@ cat > inventory/host_vars/cluster-eu-west-1.yml <<EOF
 ---
 cluster_name: "ocp-eu-west-1"
 cluster_base_domain: "example.com"
-aws_credential_set: 3
+aws_profile: "account3"        # named profile in ~/.aws/credentials
 aws_region: "eu-west-1"
 aws_availability_zone: "eu-west-1a"
 aws_instance_type: "m5.2xlarge"

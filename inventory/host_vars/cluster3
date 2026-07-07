@@ -6,8 +6,8 @@
 cluster_name: "cluster3"
 #cluster_base_domain: "example.com"  # Optional: will auto-detect from Route53 if not provided
 
-# AWS Credential Set to use (1, 2, or 3)
-aws_credential_set: 3
+# AWS account: named profile in ~/.aws/credentials ([cluster3] section)
+aws_profile: "cluster2"
 
 # AWS Configuration
 aws_region: "us-east-2"
@@ -28,6 +28,15 @@ cluster_role: spoke
 # aws_subnet_id: "subnet-xxxxxxxxxxxxxxxxx"
 # aws_security_group_id: "sg-xxxxxxxxxxxxxxxxx"
 
+# Submariner / cross-cluster live migration (cclm):
+# NON-OVERLAPPING pod/service/machine CIDRs vs the other spoke (cluster2), so
+# Submariner runs WITHOUT globalnet and routes pods directly. Required for the
+# CCLM data plane (virt-launcher <-> virt-launcher). Keep distinct from cluster2.
+cluster_network_cidr: "10.132.0.0/14"
+cluster_network_host_prefix: 23
+service_network_cidr: "172.31.0.0/16"
+machine_network_cidr: "10.1.0.0/16"
+
 # SSH Key (choose one):
 # Option 1: Place ssh-key.pub in project root (auto-imported to EC2)
 # Option 2: Use existing AWS EC2 key pair:
@@ -40,4 +49,4 @@ cluster_role: spoke
 # aws_route53_zone: "example.com"
 
 # OpenShift version
-openshift_version: "4.20"
+openshift_version: "4.21"

@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# Cross-Cluster Live Migration (CCLM) — Teardown
+# =============================================================================
+# Disables decentralized live migration on both spokes: removes the
+# decentralizedLiveMigration feature gate and the kubevirt-external-ca trust.
+# Does NOT uninstall OpenShift Virtualization (use ./ansible-runner.sh virt --destroy).
+# =============================================================================
+- name: "Disable cross-cluster live migration on spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Remove decentralizedLiveMigration feature gate (ignore if absent)
+      shell: |
+        oc patch hyperconverged kubevirt-hyperconverged -n {{ cnv_namespace }} \
+          --type=json \
+          -p='[{"op":"remove","path":"/spec/featureGates/decentralizedLiveMigration"}]' 2>&1 \
+          | grep -qv "error" || true
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Delete kubevirt-external-ca ConfigMap
+      shell: |
+        oc delete configmap kubevirt-external-ca -n {{ cnv_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Report CCLM disabled
+      debug:
+        msg: "Cross-cluster live migration disabled on {{ cluster_name }}."

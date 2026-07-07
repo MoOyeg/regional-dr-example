@@ -2,8 +2,18 @@
 # Global variables for all clusters
 # These can be overridden in host_vars for specific clusters
 
-# OpenShift version
-openshift_version: "4.20"
+# OpenShift version (minor only - the Containerfile pulls the latest stable-<minor>
+# installer, so "4.21" == the most stable 4.21.z, currently 4.21.22)
+openshift_version: "4.21"
+
+# AWS account selection (sno-cluster-ocpv style): each cluster picks its AWS
+# account via a named profile in ~/.aws/credentials ([section] per account),
+# set as `aws_profile` in that cluster's host_vars. Credentials are read with
+# lookup('ini', ..., section=aws_profile, file=aws_shared_credentials_file).
+# ansible-runner.sh mounts the host's ~/.aws/credentials into the container and
+# sets AWS_SHARED_CREDENTIALS_FILE; otherwise this falls back to $HOME/.aws/credentials.
+aws_profile: ""
+aws_shared_credentials_file: "{{ lookup('env', 'AWS_SHARED_CREDENTIALS_FILE') if (lookup('env', 'AWS_SHARED_CREDENTIALS_FILE') | length > 0) else (lookup('env', 'HOME') + '/.aws/credentials') }}"
 
 # Default AWS settings
 aws_instance_type: "m5.2xlarge"
@@ -16,6 +26,22 @@ control_plane_replicas: 1
 control_plane_instance_type: "m5.2xlarge"
 worker_replicas: 0
 # worker_instance_type: "m5.xlarge"  # Only used when worker_replicas > 0
+
+# Minimal infrastructure deploy
+# =========================================================================
+# When `minimal_infra: true` (e.g. via `ansible-runner.sh deploy --minimal`),
+# EVERY cluster is forced to Single-Node OpenShift (1 master, 0 workers) with a
+# role-specific instance type, overriding whatever is in host_vars:
+#   - hub   -> a large regular EC2 VM (runs the ACM/GitOps/ODF-noobaa control plane)
+#   - spoke -> a bare-metal (.metal) instance, because OpenShift Virtualization
+#              needs hardware virtualization (KVM), which AWS only exposes on
+#              .metal instances. Each spoke's single node also doubles as its
+#              Submariner gateway - no dedicated gateway machine is provisioned
+#              (see tasks/setup-submariner.yml).
+# Override the instance types to trade cost vs capacity.
+minimal_infra: false
+minimal_hub_instance_type: "m5.8xlarge"     # large VM for the hub SNO (ACM+GitOps+ODF+logging+ACS)
+minimal_spoke_instance_type: "c5n.metal"    # bare-metal for spoke SNO (KVM for CNV)
 
 # Cluster role for DR operators (hub or spoke)
 cluster_role: spoke
@@ -35,15 +61,21 @@ cluster_role: spoke
 # =========================================================================
 
 # Operator channels
-acm_channel: "release-2.15"
-odf_channel: "stable-4.20"
+acm_channel: "release-2.17"
+odf_channel: "stable-4.21"
 oadp_channel: "stable"
 
 # ManagedClusterSet name for DR
 managed_cluster_set_name: "dr-clusters"
 
 # Submariner globalnet
-globalnet_enabled: true
+# Disabled: the spokes are installed with NON-OVERLAPPING pod/service/machine
+# CIDRs (see cluster2/cluster3 host_vars), so Submariner routes pods directly
+# without globalnet. This is REQUIRED for cross-cluster live migration (cclm) -
+# globalnet only routes to exported Services, not to the ephemeral virt-launcher
+# pod IPs the VM migration data plane targets. Set back to true only if you
+# revert the spokes to overlapping/default CIDRs.
+globalnet_enabled: false
 globalnet_cidr_range: "242.0.0.0/8"
 # Cable driver: "vxlan" (default) or "libreswan" (IPsec, has known issues with Submariner v0.22+)
 submariner_cable_driver: "vxlan"
@@ -56,6 +88,14 @@ odf_storage_class: "gp3-csi"
 odf_storage_size: "512Gi"
 odf_device_set_count: 1
 odf_device_set_replica: 3
+# Minimal/SNO ODF: with minimal_infra, the StorageCluster uses flexibleScaling
+# (failure domain = host) with replica 1 and this many OSDs on the single node.
+odf_minimal_device_set_count: 3
+# StorageClass ODF creates for virtualization workloads (RWX / volumeMode Block).
+# It is set as the default *virtualization* StorageClass so VM disks land on RWX Block
+# (required for live-migratable VMs and for cross-cluster live migration) instead of the
+# cluster-wide default (gp3-csi, which is RWO Filesystem).
+odf_virt_storage_class: "ocs-storagecluster-ceph-rbd-virtualization"
 
 # Cert-manager / Let's Encrypt settings
 # =========================================================================
@@ -107,7 +147,7 @@ cert_secret_name: "acme-wildcard-cert-secret"
 # Example cluster configuration:
 #   cat inventory/host_vars/cluster-netobserv.yml
 #   cluster_name: cluster-netobserv
-#   aws_credential_set: 1
+#   aws_profile: cluster1        # named profile in ~/.aws/credentials
 #   aws_region: us-east-1
 #   netobserv: true         # Enable NetObserv on this cluster
 # =========================================================================
@@ -260,4 +300,25 @@ virt_metal_instance_type: "m5.metal"
 virt_metal_replicas: 1
 virt_metal_volume_size: 120
 virt_metal_volume_type: "gp3"
+
+# Cross-Cluster Live Migration (cclm)
+# =========================================================================
+# `cclm` enables KubeVirt decentralized live migration BETWEEN the two spoke
+# clusters (non-ACM), carried over the Submariner fabric. It:
+#   1. Enables the `decentralizedLiveMigration` feature gate on HyperConverged
+#      on both spokes (spins up the virt-synchronization-controller, TCP 9185).
+#   2. Cross-imports each spoke's kubevirt-ca into the other's
+#      kubevirt-external-ca (the sync channel is mTLS against the KubeVirt CA).
+# Requires: spokes on non-overlapping CIDRs + Submariner without globalnet, and
+# OpenShift Virtualization installed on both spokes (./ansible-runner.sh virt).
+#
+# `cclm-migrate` performs a live migration; drive it with extra vars, e.g.:
+#   ./ansible-runner.sh cclm-migrate -e cclm_vm=vm-dr-example \
+#       -e cclm_from=cluster2 -e cclm_to=cluster3
+cnv_namespace: "openshift-cnv"
+cclm_sync_port: 9185
+# Namespace the target/source VM live in (defaults to the DR VM namespace)
+cclm_vm_namespace: "{{ virt_namespace }}"
+# Max seconds to wait for a migration to reach Succeeded
+cclm_migration_timeout: 1800
 

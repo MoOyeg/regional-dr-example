@@ -26,9 +26,12 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Source secret.sh if it exists and credentials are not already set
+# AWS credentials come from named profiles in ~/.aws/credentials (see aws_profile
+# in each cluster's host_vars); the file is mounted into the container in
+# run_ansible(). Override the location with AWS_SHARED_CREDENTIALS_FILE.
+# secret.sh (legacy numbered AWS_ACCESS_KEY_ID_1/2/3 export) is still sourced for
+# backward compatibility if present, but is no longer required.
 if [ -f "$SCRIPT_DIR/secret.sh" ] && [ -z "$AWS_ACCESS_KEY_ID_1" ]; then
-    print_info "Loading credentials from secret.sh"
     source "$SCRIPT_DIR/secret.sh"
 fi
 
@@ -56,7 +59,7 @@ build_image() {
     if [ -f "Containerfile" ]; then
         # Extract openshift_version from group_vars for the container build
         local ocp_version
-        ocp_version=$(grep -E '^\s*openshift_version:' "$SCRIPT_DIR/inventory/group_vars/all.yml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "4.19")
+        ocp_version=$(grep -E '^\s*openshift_version:' "$SCRIPT_DIR/inventory/group_vars/all.yml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "4.21")
         print_info "Building with OpenShift version: $ocp_version"
         podman build --build-arg OPENSHIFT_VERSION="$ocp_version" -t "$IMAGE_NAME" -f Containerfile .
         print_info "Image built successfully"
@@ -104,18 +107,18 @@ run_ansible() {
         fi
     fi
 
-    # Pass through all AWS credential sets (1-3)
-    for i in 1 2 3; do
-        local access_key_var="AWS_ACCESS_KEY_ID_${i}"
-        local secret_key_var="AWS_SECRET_ACCESS_KEY_${i}"
-        local region_var="AWS_REGION_${i}"
-
-        if [ -n "${!access_key_var}" ]; then
-            env_vars+=("-e" "${access_key_var}=${!access_key_var}")
-            env_vars+=("-e" "${secret_key_var}=${!secret_key_var}")
-            env_vars+=("-e" "${region_var}=${!region_var:-us-east-1}")
-        fi
-    done
+    # Mount the AWS shared credentials file (named profiles) into the container,
+    # like the sno-cluster-ocpv repo. Each cluster selects its AWS account via
+    # `aws_profile` in host_vars ([section] in this file); the playbooks read it
+    # with lookup('ini', ..., section=aws_profile, file=aws_shared_credentials_file).
+    local host_aws_creds="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
+    if [ -f "$host_aws_creds" ]; then
+        volumes+=("-v" "$host_aws_creds:/tmp/aws-credentials:ro,Z")
+        env_vars+=("-e" "AWS_SHARED_CREDENTIALS_FILE=/tmp/aws-credentials")
+    else
+        print_warn "AWS credentials file not found at $host_aws_creds"
+        print_warn "Create ~/.aws/credentials with a named profile per cluster (see aws_profile in host_vars)"
+    fi
 
     # Run the container
     podman run --rm -it \
@@ -148,6 +151,8 @@ Commands:
     acs-gitops      Demo: manage ACS policies/config declaratively via ArgoCD
     acs-cve-demo    Demo: deploy CVE-2024-53677 vulnerable Struts 2 app for ACS
     virt            Deploy VM DR example (OpenShift Virtualization + Regional DR)
+    cclm            Enable cross-cluster live migration between spokes (over Submariner)
+    cclm-migrate    Live-migrate a running VM between spokes (KubeVirt decentralized LM)
     test-failover   Test DR failover and failback for app instances
     validate        Validate configuration and credentials
     list            List configured clusters
@@ -160,6 +165,8 @@ Options:
     --check             Run in check mode
     --yes               Skip confirmation prompts (for destroy command)
     --destroy           Remove resources (for operators, import, infra-dr, certs commands)
+    --minimal           Minimal infra: SNO everywhere - large VM hub, bare-metal spokes
+                        that double as their own Submariner gateways (deploy, infra-dr)
     -h, --help          Show this help message
 
 Examples:
@@ -167,6 +174,8 @@ Examples:
     $0 generate-configs --limit cluster1
     $0 deploy
     $0 deploy --limit cluster1 -v
+    $0 deploy --minimal               # SNO: large-VM hub + bare-metal spokes (gateways)
+    $0 infra-dr --minimal             # Wire SNO spoke nodes as Submariner gateways
     $0 destroy --yes
     $0 certs                          # Install Let's Encrypt cert with Route53 DNS-01
     $0 certs --limit cluster1         # Install cert on specific cluster
@@ -182,6 +191,9 @@ Examples:
     $0 acs-cve-demo --destroy         # Remove the CVE-2024-53677 demo app
     $0 virt                           # Deploy VM DR example on spoke clusters
     $0 virt --destroy                 # Remove VM DR example and CNV policy
+    $0 cclm                           # Enable cross-cluster live migration on both spokes
+    $0 cclm --destroy                 # Disable CCLM (feature gate + external CA)
+    $0 cclm-migrate -e cclm_vm=vm-dr-example -e cclm_from=cluster2 -e cclm_to=cluster3
     $0 test-failover                    # Test failover+failback for both app instances
     $0 test-failover -e instance=gitops # Test GitOps instance only
     $0 test-failover -e instance=direct # Test Direct instance only
@@ -442,8 +454,8 @@ Configuration:
     - certmanager_channel: Operator channel (default: stable-v1)
 
 Authentication:
-    Set up to 3 AWS credential sets as environment variables.
-    Each cluster specifies which credential set to use via aws_credential_set.
+    Configure a named AWS profile per account in ~/.aws/credentials.
+    Each cluster selects its account via aws_profile in its host_vars.
 
 EOF
 }
@@ -463,7 +475,17 @@ case "${1:-}" in
     deploy)
         build_image
         shift
-        run_ansible "deploy-clusters.yml" "$@"
+        # --minimal: SNO everywhere (large VM hub, bare-metal spokes) -> -e minimal_infra=true
+        filtered_args=()
+        extra_args=""
+        for arg in "$@"; do
+            if [ "$arg" = "--minimal" ]; then
+                extra_args="-e minimal_infra=true"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "deploy-clusters.yml" $extra_args "${filtered_args[@]}"
         ;;
 
     destroy)
@@ -517,17 +539,21 @@ case "${1:-}" in
     infra-dr)
         build_image
         shift
-        # Check for --destroy flag and switch playbook
+        # Check for --destroy flag and switch playbook; --minimal wires the SNO
+        # spoke node as its own Submariner gateway (no dedicated gateway machine).
         filtered_args=()
         playbook="infra-dr.yml"
+        extra_args=""
         for arg in "$@"; do
             if [ "$arg" = "--destroy" ]; then
                 playbook="destroy-infra-dr.yml"
+            elif [ "$arg" = "--minimal" ]; then
+                extra_args="-e minimal_infra=true"
             else
                 filtered_args+=("$arg")
             fi
         done
-        run_ansible "$playbook" "${filtered_args[@]}"
+        run_ansible "$playbook" $extra_args "${filtered_args[@]}"
         ;;
 
     app)
@@ -639,6 +665,28 @@ case "${1:-}" in
             fi
         done
         run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    cclm)
+        build_image
+        shift
+        # Check for --destroy flag and switch playbook
+        filtered_args=()
+        playbook="setup-cclm.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-cclm.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    cclm-migrate)
+        build_image
+        shift
+        run_ansible "cclm-migrate.yml" "$@"
         ;;
 
     test-failover)

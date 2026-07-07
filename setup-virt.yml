@@ -189,11 +189,11 @@
     # =========================================================================
     # Enable CNV/MTV integration preview in MultiClusterHub
     # =========================================================================
-    - name: Enable cnv-mtv-integrations-preview in MultiClusterHub
+    - name: Enable cnv-mtv-integrations in MultiClusterHub
       shell: |
         oc patch multiclusterhub multiclusterhub -n open-cluster-management \
           --type=merge \
-          -p='{"spec":{"overrides":{"components":[{"name":"cnv-mtv-integrations-preview","enabled":true}]}}}'
+          -p='{"spec":{"overrides":{"components":[{"name":"cnv-mtv-integrations","enabled":true}]}}}'
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -204,6 +204,22 @@
     - name: Label managed clusters with cnv=true
       shell: |
         oc label managedcluster {{ managedcluster_names[item] }} cnv=true --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_clusters }}"
+      changed_when: false
+
+    # Enroll spokes into the ACM CNV/MTV integration. The cnv-mtv-integrations
+    # `openshift-cnv` addon Placement selects clusters labeled
+    # `acm/cnv-operator-install=true`; that triggers the mtv-integrations
+    # controller to register each spoke as an MTV Provider (in the
+    # mtv-integrations namespace on the hub). Without this the ACM console
+    # reports "cross-cluster live migration is not possible" because the spokes
+    # are not MTV providers. (The KubeVirt-native `cclm` path does not need it.)
+    - name: Label managed clusters for ACM CNV/MTV provider registration
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} acm/cnv-operator-install=true --overwrite
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -957,8 +973,15 @@
           pvcSelector:
             matchLabels:
               appname: {{ virt_app_name }}
-          kubeObjectProtection:
-            captureInterval: 5m
+          # NOTE: kubeObjectProtection is intentionally NOT set here.
+          # With it enabled, on failover Ramen tries to restore kube objects
+          # from a prior S3 capture; if the workload is failed over before its
+          # first capture completes, restore loops forever on NoSuchKey /
+          # "capture-to-recover-from identifier nil", ClusterDataProtected never
+          # reaches True, and Relocate/failback hangs at Initiating. The app
+          # DRPCs (deploy-app.yml) use volume-only (VolSync) protection for the
+          # same reason. The VM manifests are GitOps/ArgoCD-managed, so kube
+          # object capture is redundant here.
         EOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"

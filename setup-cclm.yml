@@ -1,0 +1,181 @@
+---
+# =============================================================================
+# Cross-Cluster Live Migration (CCLM) — Setup
+# =============================================================================
+# Enables KubeVirt "decentralized live migration" BETWEEN the spoke clusters
+# (the non-ACM clusters), carried over the Submariner fabric.
+#
+# Play 1: Enable the decentralizedLiveMigration feature gate on HyperConverged
+#         on each spoke and wait for the virt-synchronization-controller.
+# Play 2: Cross-import each spoke's kubevirt-ca into every other spoke's
+#         kubevirt-external-ca (the sync channel on TCP 9185 is mTLS against
+#         the KubeVirt CA, so the clusters must trust each other).
+#
+# Prerequisites:
+# 1. Clusters deployed with NON-OVERLAPPING CIDRs: ./ansible-runner.sh deploy
+# 2. Submariner configured WITHOUT globalnet (globalnet_enabled: false):
+#    ./ansible-runner.sh infra-dr
+# 3. OpenShift Virtualization installed on both spokes: ./ansible-runner.sh virt
+#
+# After this, run a migration with:
+#   ./ansible-runner.sh cclm-migrate -e cclm_vm=<vm> -e cclm_from=cluster2 -e cclm_to=cluster3
+# =============================================================================
+
+# =============================================================================
+# Play 1: Enable decentralizedLiveMigration feature gate on each spoke
+# =============================================================================
+- name: "Play 1: Enable decentralizedLiveMigration on spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Verify OpenShift Virtualization (HyperConverged) is installed
+      shell: |
+        oc get hyperconverged kubevirt-hyperconverged -n {{ cnv_namespace }} \
+          -o jsonpath='{.metadata.name}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hco_check
+      failed_when: hco_check.rc != 0
+      changed_when: false
+
+  tasks:
+    # In CNV 4.22+, DecentralizedLiveMigration is enabled by default (the KubeVirt
+    # CR carries the gate and the virt-synchronization-controller runs), and the
+    # HCO rejects `spec.featureGates.decentralizedLiveMigration` as an unknown
+    # field. Older CNV exposed it as an HCO featureGate. So we attempt the enable
+    # best-effort and treat the running sync controller (below) as the real check.
+    - name: Enable decentralizedLiveMigration feature gate on HyperConverged (best-effort)
+      shell: |
+        oc patch hyperconverged kubevirt-hyperconverged -n {{ cnv_namespace }} \
+          --type=merge \
+          -p '{"spec":{"featureGates":{"decentralizedLiveMigration":true}}}' 2>&1 || true
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: fg_patch
+      changed_when: "'patched' in (fg_patch.stdout | default(''))"
+
+    - name: Wait for virt-synchronization-controller deployment to be Available
+      shell: |
+        oc get deployment virt-synchronization-controller -n {{ cnv_namespace }} \
+          -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "NotFound"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: sync_ctrl
+      until: sync_ctrl.stdout == "True"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Read this spoke's kubevirt-ca bundle
+      shell: |
+        oc get configmap kubevirt-ca -n {{ cnv_namespace }} \
+          -o jsonpath='{.data.ca-bundle}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: kubevirt_ca
+      changed_when: false
+
+    - name: Stash this spoke's CA bundle as a host fact
+      set_fact:
+        kubevirt_ca_bundle: "{{ kubevirt_ca.stdout }}"
+
+    - name: Report feature gate enabled
+      debug:
+        msg: >-
+          decentralizedLiveMigration enabled on {{ cluster_name }};
+          virt-synchronization-controller Available (sync port {{ cclm_sync_port }}).
+
+# =============================================================================
+# Play 2: Cross-import kubevirt-ca -> kubevirt-external-ca between spokes
+# =============================================================================
+- name: "Play 2: Cross-import KubeVirt CAs between spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: End host if CA bundle was not collected (CNV missing / Play 1 skipped)
+      meta: end_host
+      when: kubevirt_ca_bundle is not defined
+
+    - name: Build list of participating spokes (have a CA bundle)
+      set_fact:
+        cclm_spokes: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('kubevirt_ca_bundle', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build the external CA bundle from all OTHER spokes
+      set_fact:
+        external_ca_bundle: >-
+          {{ cclm_spokes
+             | reject('equalto', cluster_name)
+             | map('extract', hostvars)
+             | map(attribute='kubevirt_ca_bundle')
+             | join('\n') }}
+
+  tasks:
+    - name: Apply peer CAs into this spoke's kubevirt-external-ca ConfigMap
+      shell: |
+        oc create configmap kubevirt-external-ca -n {{ cnv_namespace }} \
+          --from-literal=ca-bundle="$(cat <<'CAEOF'
+        {{ external_ca_bundle }}
+        CAEOF
+        )" \
+          --dry-run=client -o yaml | oc apply -f -
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: external_ca_bundle | trim | length > 0
+
+    - name: Report CA trust established
+      debug:
+        msg: >-
+          {{ cluster_name }} now trusts peer KubeVirt CAs from:
+          {{ cclm_spokes | reject('equalto', cluster_name) | join(', ') }}
+      when: external_ca_bundle | trim | length > 0
+
+    - name: CCLM setup summary
+      debug:
+        msg: |
+          ============================================
+          Cross-Cluster Live Migration is ready
+          ============================================
+          Participating spokes: {{ cclm_spokes | join(', ') }}
+          Feature gate: decentralizedLiveMigration = true
+          Sync channel: TCP {{ cclm_sync_port }} (mTLS, KubeVirt CA) over Submariner
+          CA trust: cross-imported into kubevirt-external-ca
+
+          Migrate a running VM with:
+            ./ansible-runner.sh cclm-migrate -e cclm_vm=<vm> \
+                -e cclm_from={{ cclm_spokes[0] }} -e cclm_to={{ cclm_spokes[1] | default('<other-spoke>') }}
+      run_once: true

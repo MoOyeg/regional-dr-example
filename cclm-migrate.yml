@@ -1,0 +1,251 @@
+---
+# =============================================================================
+# Cross-Cluster Live Migration (CCLM) — Perform a migration
+# =============================================================================
+# Live-migrates a RUNNING VM from one spoke to the other over Submariner using
+# KubeVirt decentralized live migration. Run ./ansible-runner.sh cclm first.
+#
+# Required extra vars:
+#   cclm_vm    — VM (and VMI) name to migrate
+#   cclm_from  — source spoke cluster (e.g. cluster2)
+#   cclm_to    — target spoke cluster (e.g. cluster3)
+# Optional:
+#   cclm_vm_namespace   — namespace of the VM (default: virt_namespace)
+#   cclm_migration_id   — unique id shared by both VMIMs (default: derived)
+#   cclm_skip_target_vm — 'true' if you pre-created the target VM + blank disks
+#
+# Example:
+#   ./ansible-runner.sh cclm-migrate -e cclm_vm=vm-dr-example \
+#       -e cclm_from=cluster2 -e cclm_to=cluster3
+# =============================================================================
+- name: "Cross-cluster live migration: {{ cclm_vm | default('?') }} {{ cclm_from | default('?') }} -> {{ cclm_to | default('?') }}"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    from_kubeconfig: "{{ artifacts_dir }}/{{ cclm_from }}/kubeconfig"
+    to_kubeconfig: "{{ artifacts_dir }}/{{ cclm_to }}/kubeconfig"
+    ns: "{{ cclm_vm_namespace | default(virt_namespace) }}"
+    migration_id: "{{ cclm_migration_id | default(cclm_vm ~ '-' ~ cclm_from ~ '-to-' ~ cclm_to) }}"
+
+  tasks:
+    - name: Validate required extra vars
+      assert:
+        that:
+          - cclm_vm is defined and (cclm_vm | length > 0)
+          - cclm_from is defined and (cclm_from | length > 0)
+          - cclm_to is defined and (cclm_to | length > 0)
+          - cclm_from != cclm_to
+        fail_msg: >-
+          Set cclm_vm, cclm_from and cclm_to (distinct), e.g.
+          -e cclm_vm=vm-dr-example -e cclm_from=cluster2 -e cclm_to=cluster3
+
+    - name: Validate both kubeconfigs exist
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ from_kubeconfig }}"
+        - "{{ to_kubeconfig }}"
+      register: kc_stat
+      failed_when: not kc_stat.stat.exists
+
+    - name: Verify source VMI is Running on {{ cclm_from }}
+      shell: |
+        oc --kubeconfig {{ from_kubeconfig }} get vmi {{ cclm_vm }} -n {{ ns }} \
+          -o jsonpath='{.status.phase}'
+      register: src_phase
+      changed_when: false
+      failed_when: src_phase.stdout != "Running"
+
+    - name: Display migration plan
+      debug:
+        msg: |
+          Migrating VM '{{ cclm_vm }}' (namespace {{ ns }})
+          Source: {{ cclm_from }}  ->  Target: {{ cclm_to }}
+          migrationID: {{ migration_id }}
+          Sync channel: TCP {{ cclm_sync_port }} over Submariner
+
+    # =========================================================================
+    # 1. Build the target (receiver) VM + blank receiver disks on {{ cclm_to }}
+    # =========================================================================
+    - name: Ensure the VM namespace exists on the target {{ cclm_to }}
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} create namespace {{ ns }} --dry-run=client -o yaml | \
+          oc --kubeconfig {{ to_kubeconfig }} apply -f -
+      register: target_ns
+      changed_when: "'created' in target_ns.stdout"
+
+    - name: Build and apply target receiver VM + blank disks on {{ cclm_to }}
+      shell: |
+        python3 - "{{ from_kubeconfig }}" "{{ to_kubeconfig }}" "{{ cclm_vm }}" "{{ ns }}" <<'PY'
+        import json, subprocess, sys
+        from_kc, to_kc, vm_name, ns = sys.argv[1:5]
+
+        def oc(kc, *args, check=True):
+            return subprocess.run(["oc", "--kubeconfig", kc, *args],
+                                  capture_output=True, text=True, check=check)
+
+        vm = json.loads(oc(from_kc, "get", "vm", vm_name, "-n", ns, "-o", "json").stdout)
+        pvcs = json.loads(oc(from_kc, "get", "pvc", "-n", ns, "-o", "json").stdout)["items"]
+        pvc_by_name = {p["metadata"]["name"]: p for p in pvcs}
+
+        docs = []
+        # One blank DataVolume per dataVolume/PVC-backed volume, matching name+size+SC.
+        vols = vm.get("spec", {}).get("template", {}).get("spec", {}).get("volumes", [])
+        for v in vols:
+            dv_name = None
+            if "dataVolume" in v:
+                dv_name = v["dataVolume"]["name"]
+            elif "persistentVolumeClaim" in v:
+                dv_name = v["persistentVolumeClaim"]["claimName"]
+            if not dv_name:
+                continue
+            src_pvc = pvc_by_name.get(dv_name, {})
+            size = src_pvc.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "10Gi")
+            sc = src_pvc.get("spec", {}).get("storageClassName")
+            storage = {"resources": {"requests": {"storage": size}}}
+            if sc:
+                storage["storageClassName"] = sc
+            docs.append({
+                "apiVersion": "cdi.kubevirt.io/v1beta1", "kind": "DataVolume",
+                "metadata": {"name": dv_name, "namespace": ns,
+                             "annotations": {"cdi.kubevirt.io/storage.usePopulator": "true"}},
+                "spec": {"source": {"blank": {}}, "storage": storage},
+            })
+
+        # Target VM = copy of source spec.template, runStrategy WaitAsReceiver.
+        tmpl = vm["spec"]["template"]
+        tmpl.get("metadata", {}).pop("creationTimestamp", None)
+        target_vm = {
+            "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachine",
+            "metadata": {"name": vm_name, "namespace": ns,
+                         "labels": vm["metadata"].get("labels", {}),
+                         "annotations": {"kubevirt.io/restore-run-strategy": "Always"}},
+            "spec": {"runStrategy": "WaitAsReceiver", "template": tmpl},
+        }
+        if "instancetype" in vm["spec"]:
+            target_vm["spec"]["instancetype"] = vm["spec"]["instancetype"]
+        if "preference" in vm["spec"]:
+            target_vm["spec"]["preference"] = vm["spec"]["preference"]
+        docs.append(target_vm)
+
+        manifest = "\n---\n".join(json.dumps(d) for d in docs)
+        res = subprocess.run(["oc", "--kubeconfig", to_kc, "apply", "-f", "-"],
+                             input=manifest, capture_output=True, text=True)
+        print(res.stdout)
+        sys.stderr.write(res.stderr)
+        sys.exit(res.returncode)
+      register: target_apply
+      changed_when: "'created' in target_apply.stdout or 'configured' in target_apply.stdout"
+      when: not (cclm_skip_target_vm | default(false) | bool)
+
+    - name: Wait for receiver VMI to be created on {{ cclm_to }}
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} get vmi {{ cclm_vm }} -n {{ ns }} \
+          -o jsonpath='{.metadata.name}' 2>/dev/null || echo ""
+      register: recv_vmi
+      until: recv_vmi.stdout == cclm_vm
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    # =========================================================================
+    # 2. Create the target (receive) VMIM, then read the sync address
+    # =========================================================================
+    - name: Create target (receive) VirtualMachineInstanceMigration on {{ cclm_to }}
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} apply -f - <<'EOF'
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachineInstanceMigration
+        metadata:
+          name: {{ cclm_vm }}-cclm-target
+          namespace: {{ ns }}
+        spec:
+          receive:
+            migrationID: "{{ migration_id }}"
+          vmiName: {{ cclm_vm }}
+        EOF
+      register: target_vmim
+      changed_when: "'created' in target_vmim.stdout or 'configured' in target_vmim.stdout"
+
+    - name: Read target synchronization address (status.synchronizationAddresses[0])
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} get vmim {{ cclm_vm }}-cclm-target -n {{ ns }} \
+          -o jsonpath='{.status.synchronizationAddresses[0]}'
+      register: sync_addr
+      until: sync_addr.stdout | length > 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Normalize connectURL (append :{{ cclm_sync_port }} if no port present)
+      set_fact:
+        cclm_connect_url: "{{ sync_addr.stdout if (':' in sync_addr.stdout) else (sync_addr.stdout ~ ':' ~ cclm_sync_port) }}"
+
+    - name: Display resolved sync address
+      debug:
+        msg: "Target sync address: {{ sync_addr.stdout }}  ->  connectURL: {{ cclm_connect_url }}"
+
+    # =========================================================================
+    # 3. Create the source (sendTo) VMIM to start the migration
+    # =========================================================================
+    - name: Create source (sendTo) VirtualMachineInstanceMigration on {{ cclm_from }}
+      shell: |
+        oc --kubeconfig {{ from_kubeconfig }} apply -f - <<'EOF'
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachineInstanceMigration
+        metadata:
+          name: {{ cclm_vm }}-cclm-source
+          namespace: {{ ns }}
+        spec:
+          sendTo:
+            migrationID: "{{ migration_id }}"
+            connectURL: "{{ cclm_connect_url }}"
+          vmiName: {{ cclm_vm }}
+        EOF
+      register: source_vmim
+      changed_when: "'created' in source_vmim.stdout or 'configured' in source_vmim.stdout"
+
+    # =========================================================================
+    # 4. Watch the migration to completion
+    # =========================================================================
+    # Watch the TARGET (receive) VMIM, not the source: in decentralized live
+    # migration the source VMI — and its -cclm-source VMIM — are removed once the
+    # VM migrates away, so the source VMIM phase never latches 'Succeeded' (the
+    # object vanishes and jsonpath returns empty, spinning until timeout). The
+    # target VMIM reaches 'Succeeded' and persists on {{ cclm_to }}.
+    - name: Wait for migration to reach a terminal phase
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} get vmim {{ cclm_vm }}-cclm-target -n {{ ns }} \
+          -o jsonpath='{.status.phase}'
+      register: mig_phase
+      until: mig_phase.stdout in ['Succeeded', 'Failed']
+      retries: "{{ (cclm_migration_timeout | int / 15) | int }}"
+      delay: 15
+      changed_when: false
+      failed_when: mig_phase.stdout == 'Failed'
+
+    - name: Confirm VM is Running on {{ cclm_to }} after migration
+      shell: |
+        oc --kubeconfig {{ to_kubeconfig }} get vmi {{ cclm_vm }} -n {{ ns }} \
+          -o jsonpath='{.status.phase}'
+      register: final_target
+      changed_when: false
+      when: mig_phase.stdout == 'Succeeded'
+
+    - name: Migration result
+      debug:
+        msg: |
+          ============================================
+          Cross-Cluster Live Migration complete
+          ============================================
+          VM:            {{ cclm_vm }} ({{ ns }})
+          {{ cclm_from }} -> {{ cclm_to }}
+          Migration phase: {{ mig_phase.stdout }}
+          VM on {{ cclm_to }}: {{ final_target.stdout | default('n/a') }}
+
+          Verify, then clean up the finished migration objects if desired:
+            oc --kubeconfig artifacts/{{ cclm_from }}/kubeconfig delete vmim {{ cclm_vm }}-cclm-source -n {{ ns }}
+            oc --kubeconfig artifacts/{{ cclm_to }}/kubeconfig delete vmim {{ cclm_vm }}-cclm-target -n {{ ns }}
+      when: mig_phase.stdout == 'Succeeded'

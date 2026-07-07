@@ -17,26 +17,32 @@ controlPlane:
 metadata:
   name: {{ cluster_name }}
 networking:
+  # CIDRs are parameterized so Submariner-connected clusters can be given
+  # NON-OVERLAPPING pod/service/machine ranges. Non-overlapping ranges let
+  # Submariner run WITHOUT globalnet and route pod-to-pod directly, which is
+  # required for cross-cluster live migration (virt-launcher <-> virt-launcher).
   clusterNetwork:
-  - cidr: 10.128.0.0/14
-    hostPrefix: 23
+  - cidr: {{ cluster_network_cidr | default('10.128.0.0/14') }}
+    hostPrefix: {{ cluster_network_host_prefix | default(23) }}
   machineNetwork:
-  - cidr: 10.0.0.0/16
+  - cidr: {{ machine_network_cidr | default('10.0.0.0/16') }}
   networkType: OVNKubernetes
   serviceNetwork:
-  - 172.30.0.0/16
+  - {{ service_network_cidr | default('172.30.0.0/16') }}
 platform:
   aws:
     region: {{ aws_deploy_region }}
 {% if not use_existing_vpc and aws_availability_zones is defined %}
-    availabilityZones:
+    defaultMachinePlatform:
+      zones:
 {% for zone in aws_availability_zones %}
-    - {{ zone }}
+      - {{ zone }}
 {% endfor %}
 {% elif use_existing_vpc and aws_subnet_id is defined %}
 {% if aws_availability_zone is defined %}
-    availabilityZones:
-    - {{ aws_availability_zone }}
+    defaultMachinePlatform:
+      zones:
+      - {{ aws_availability_zone }}
 {% endif %}
     subnets:
     - {{ aws_subnet_id }}

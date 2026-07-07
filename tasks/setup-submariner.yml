@@ -8,13 +8,13 @@
 - name: Look up AWS credentials for {{ managed_cluster_name }}
   set_fact:
     sub_aws_access_key: >-
-      {{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (hostvars[managed_cluster_name]['aws_credential_set'] | string))
+      {{ lookup('ini', 'aws_access_key_id', section=hostvars[managed_cluster_name]['aws_profile'], file=aws_shared_credentials_file)
          if managed_cluster_name != 'local-cluster'
-         else lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}
+         else lookup('ini', 'aws_access_key_id', section=aws_profile, file=aws_shared_credentials_file) }}
     sub_aws_secret_key: >-
-      {{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (hostvars[managed_cluster_name]['aws_credential_set'] | string))
+      {{ lookup('ini', 'aws_secret_access_key', section=hostvars[managed_cluster_name]['aws_profile'], file=aws_shared_credentials_file)
          if managed_cluster_name != 'local-cluster'
-         else lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}
+         else lookup('ini', 'aws_secret_access_key', section=aws_profile, file=aws_shared_credentials_file) }}
 
 - name: Create AWS credentials secret for {{ managed_cluster_name }}
   shell: |
@@ -33,6 +33,18 @@
     KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
   delegate_to: localhost
 
+# Minimal infra: the cluster is Single-Node OpenShift and its one node doubles as
+# the Submariner gateway, so label it here and omit the dedicated-gateway AWS block
+# below (otherwise the addon would try to provision a separate gateway machine).
+- name: (minimal-infra) Label the single node as the Submariner gateway on {{ managed_cluster_name }}
+  shell: |
+    NODE=$(oc get nodes -o jsonpath='{.items[0].metadata.name}')
+    oc label node "$NODE" submariner.io/gateway=true --overwrite
+  environment:
+    KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name if managed_cluster_name == 'local-cluster' else managed_cluster_name }}/kubeconfig"
+  delegate_to: localhost
+  when: minimal_infra | default(false) | bool
+
 - name: Create SubmarinerConfig for {{ managed_cluster_name }}
   shell: |
     oc apply -f - <<'EOF'
@@ -44,8 +56,10 @@
     spec:
       gatewayConfig:
         gateways: 1
+    {% if not (minimal_infra | default(false) | bool) %}
         aws:
-          instanceType: m5.xlarge
+          instanceType: {{ submariner_gateway_instance_type | default('m5.xlarge') }}
+    {% endif %}
       IPSecNATTPort: 4500
       NATTEnable: true
       cableDriver: {{ submariner_cable_driver | default('vxlan') }}

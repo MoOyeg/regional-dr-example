@@ -115,8 +115,8 @@
 
     - name: Set AWS credentials for hub
       set_fact:
-        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
-        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
+        aws_access_key: "{{ lookup('ini', 'aws_access_key_id', section=aws_profile, file=aws_shared_credentials_file) }}"
+        aws_secret_key: "{{ lookup('ini', 'aws_secret_access_key', section=aws_profile, file=aws_shared_credentials_file) }}"
 
     - name: Build list of spoke clusters
       set_fact:
@@ -237,7 +237,7 @@
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
 
-    - name: Create Submariner Broker with globalnet enabled
+    - name: Create Submariner Broker (globalnet per globalnet_enabled)
       shell: |
         oc apply -f - <<'EOF'
         apiVersion: submariner.io/v1alpha1
@@ -420,13 +420,19 @@
           namespace: openshift-storage
         spec:
           manageNodes: false
+        {% if minimal_infra | default(false) | bool %}
+          # Minimal/SNO: one node can't satisfy replica-3 across separate hosts.
+          # flexibleScaling makes the failure domain "host" and lets Ceph place all
+          # OSDs on the single node (replica 1 device set, 3 OSDs). Not fault-tolerant.
+          flexibleScaling: true
+        {% endif %}
           network:
             multiClusterService:
               clusterID: {{ cluster_name }}
               enabled: true
           storageDeviceSets:
           - name: ocs-deviceset
-            count: {{ odf_device_set_count }}
+            count: {{ (odf_minimal_device_set_count | default(3)) if (minimal_infra | default(false) | bool) else odf_device_set_count }}
             dataPVCTemplate:
               spec:
                 accessModes:
@@ -437,7 +443,7 @@
                   requests:
                     storage: {{ odf_storage_size }}
             portable: true
-            replica: {{ odf_device_set_replica }}
+            replica: {{ 1 if (minimal_infra | default(false) | bool) else odf_device_set_replica }}
         EOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
@@ -464,6 +470,45 @@
           name: ocs-provider-server
           namespace: openshift-storage
         EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Default virtualization StorageClass
+    # Make {{ odf_virt_storage_class }} (RWX / volumeMode Block) the default class
+    # for VM disks. Without this, VMs fall back to the cluster-wide default
+    # (gp3-csi = RWO Filesystem), which is not live-migratable and breaks
+    # cross-cluster live migration (the receiver disk ends up too small / Filesystem).
+    # =========================================================================
+    - name: Wait for the virtualization StorageClass to be created by ODF
+      shell: |
+        oc get storageclass {{ odf_virt_storage_class }} -o name
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: virt_sc_present
+      until: virt_sc_present.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Clear default-virt-class annotation from any other StorageClass
+      shell: |
+        for sc in $(oc get storageclass \
+          -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubevirt\.io/is-default-virt-class=="true")]}{.metadata.name}{"\n"}{end}'); do
+          [ "$sc" = "{{ odf_virt_storage_class }}" ] && continue
+          oc annotate storageclass "$sc" storageclass.kubevirt.io/is-default-virt-class- --overwrite
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Set {{ odf_virt_storage_class }} as the default virtualization StorageClass
+      shell: |
+        oc annotate storageclass {{ odf_virt_storage_class }} \
+          storageclass.kubevirt.io/is-default-virt-class="true" --overwrite
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost

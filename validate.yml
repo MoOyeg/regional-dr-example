@@ -8,48 +8,30 @@
       debug:
         msg: "Validating AWS credentials..."
     
-    - name: Validate credential set 1
+    - name: Determine AWS shared credentials file
+      set_fact:
+        _aws_creds_file: "{{ lookup('env', 'AWS_SHARED_CREDENTIALS_FILE') if (lookup('env', 'AWS_SHARED_CREDENTIALS_FILE') | length > 0) else (lookup('env', 'HOME') + '/.aws/credentials') }}"
+
+    - name: Build list of AWS profiles used by clusters
+      set_fact:
+        cluster_aws_profiles: "{{ groups['openshift_clusters'] | default([]) | map('extract', hostvars, 'aws_profile') | select('defined') | map('string') | reject('equalto', '') | unique | list }}"
+
+    - name: Validate each cluster AWS profile
       shell: |
-        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_1') }}" \
-        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_1') }}" \
-        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_1') | default('us-east-1', true) }}
-      register: cred1_result
+        AWS_SHARED_CREDENTIALS_FILE="{{ _aws_creds_file }}" \
+        AWS_PROFILE="{{ item }}" \
+        aws sts get-caller-identity --region us-east-1
+      register: profile_results
       ignore_errors: true
       changed_when: false
-    
-    - name: Credential set 1 status
+      loop: "{{ cluster_aws_profiles }}"
+
+    - name: AWS profile status
       debug:
-        msg: "Credential Set 1: {{ 'Valid' if cred1_result.rc == 0 else 'Not configured or invalid' }}"
-    
-    - name: Validate credential set 2
-      shell: |
-        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_2') }}" \
-        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_2') }}" \
-        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_2') | default('us-east-1', true) }}
-      register: cred2_result
-      ignore_errors: true
-      changed_when: false
-      when: lookup('env', 'AWS_ACCESS_KEY_ID_2') | length > 0
-    
-    - name: Credential set 2 status
-      debug:
-        msg: "Credential Set 2: {{ 'Valid' if cred2_result.rc == 0 else 'Not configured' }}"
-      when: lookup('env', 'AWS_ACCESS_KEY_ID_2') | length > 0
-    
-    - name: Validate credential set 3
-      shell: |
-        AWS_ACCESS_KEY_ID="{{ lookup('env', 'AWS_ACCESS_KEY_ID_3') }}" \
-        AWS_SECRET_ACCESS_KEY="{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_3') }}" \
-        aws sts get-caller-identity --region {{ lookup('env', 'AWS_REGION_3') | default('us-east-1', true) }}
-      register: cred3_result
-      ignore_errors: true
-      changed_when: false
-      when: lookup('env', 'AWS_ACCESS_KEY_ID_3') | length > 0
-    
-    - name: Credential set 3 status
-      debug:
-        msg: "Credential Set 3: {{ 'Valid' if cred3_result.rc == 0 else 'Not configured' }}"
-      when: lookup('env', 'AWS_ACCESS_KEY_ID_3') | length > 0
+        msg: "AWS profile '{{ item.item }}': {{ 'Valid' if item.rc == 0 else 'Not configured or invalid' }}"
+      loop: "{{ profile_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
     
     - name: Check for pull secret
       stat:

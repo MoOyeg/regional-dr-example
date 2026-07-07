@@ -1,539 +1,430 @@
-# Regional Disaster Recovery - Multi-Credential OpenShift Deployment
+# OpenShift Virtualization DR & Mobility
 
-An Ansible automation tool for deploying OpenShift clusters across multiple AWS regions using different AWS credentials. Inspired by [sno-disaster-recovery](https://github.com/MoOyeg/sno-disaster-recovery), this tool enables true regional disaster recovery by supporting up to 3 different AWS credential sets.
+Ansible automation that stands up a three-cluster OpenShift 4.21 environment on AWS and
+demonstrates **two hands-on ways to move a running Application/VM between regions** — plus a third,
+lighter **VolSync direct-replication** DR pattern with a reference implementation:
 
-## Features
+| # | Use case | Mechanism | Recovery type |
+|---|----------|-----------|---------------|
+| 1 | **[Regional DR Failover](#use-case-1-test-regional-dr-failover)** | ODF Regional-DR (Ramen + VolSync) driven by an ACM `DRPlacementControl` | Disaster recovery — VM is **restarted** on the surviving cluster from replicated storage |
+| 2 | **[Cross-Cluster Live Migration](#use-case-2-test-cross-cluster-live-migration-cclm-with-submariner)** | KubeVirt **decentralized live migration** over a **Submariner** pod network | Live mobility — VM **keeps running** while its memory + disk move to the other cluster |
+| 3 | **[VolSync Direct DR](#use-case-3-lightweight-regional-dr-with-volsync-direct-cluster-to-cluster)** | VolSync `ReplicationSource`/`ReplicationDestination` (`rsync-tls` mover) replicating PVCs **directly cluster-to-cluster** — no ODF Ramen / MirrorPeer / DRPolicy | Lightweight disaster recovery — promote the replicated snapshot on the standby |
 
-- **Multi-Credential Support**: Deploy clusters using 1-3 different AWS credential sets
-- **Regional Deployment**: Deploy OpenShift clusters across different AWS regions
-- **Dual Deployment Modes**:
-  - **IPI Mode**: OpenShift installer creates VPC, subnets, and all infrastructure automatically
-  - **UPI Mode**: Deploy into existing VPC/subnet with manual infrastructure control
-- **Containerized Ansible**: No local Ansible installation required - runs in Podman container
-- **Single Node OpenShift**: Optimized for SNO deployments
-- **Automated DNS**: Optional Route53 integration for automatic DNS configuration
-- **Auto-Detect Base Domain**: Automatically fetches first Route53 hosted zone if not specified
-- **Elastic IP Management**: Automatic allocation and association of Elastic IPs (UPI mode)
-- **Credential Isolation**: Each cluster can use a different AWS credential set
+Everything runs inside a Podman container (no local Ansible needed) via `./ansible-runner.sh`.
 
-## Architecture
+## Topology
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Control Node (Local)                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Ansible in Podman Container             │   │
-│  │  - AWS Credential Set 1 (us-east-1)                 │   │
-│  │  - AWS Credential Set 2 (us-west-2)                 │   │
-│  │  - AWS Credential Set 3 (eu-west-1)                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        ▼                  ▼                  ▼
-  ┌──────────┐      ┌──────────┐      ┌──────────┐
-  │ AWS      │      │ AWS      │      │ AWS      │
-  │ US-East-1│      │ US-West-2│      │ EU-West-1│
-  │ (Cred 1) │      │ (Cred 2) │      │ (Cred 3) │
-  │          │      │          │      │          │
-  │ OpenShift│      │ OpenShift│      │ OpenShift│
-  │ Cluster  │      │ Cluster  │      │ Cluster  │
-  └──────────┘      └──────────┘      └──────────┘
+                 ┌──────────────────────────┐
+                 │  cluster1  (HUB)          │   RHACM 2.17 + ODF Multicluster
+                 │  ACM / GitOps / Ramen-hub │   Orchestrator + Ramen hub
+                 └───────────┬──────────────┘
+              manages / DRPolicy / Submariner broker
+             ┌───────────────┴───────────────┐
+   ┌─────────▼──────────┐          ┌──────────▼─────────┐
+   │ cluster2 (SPOKE)   │◄────────►│ cluster3 (SPOKE)   │
+   │ ODF 4.21 + CNV 4.21│ Submariner│ ODF 4.21 + CNV 4.21│
+   │ pod 10.128.0.0/14  │  (direct  │ pod 10.132.0.0/14  │
+   │ svc 172.30.0.0/16  │  pod mesh)│ svc 172.31.0.0/16  │
+   └────────────────────┘          └────────────────────┘
 ```
+
+- **Hub = cluster1**, **spokes = cluster2 / cluster3** (all AWS IPI, `us-east-2`, OpenShift **4.21**).
+- Each cluster uses a separate AWS account via a named profile in `~/.aws/credentials`
+  (set as `aws_profile` in `inventory/host_vars/<cluster>`).
+- **The two spokes are installed with non-overlapping CIDRs** so Submariner runs **without
+  globalnet** and routes pod-to-pod directly — a hard requirement for use case 2 (see below).
+
+---
 
 ## Prerequisites
 
-### Local Requirements
-
-1. **Podman** (or Docker)
-   ```bash
-   # RHEL/Fedora
-   sudo dnf install -y podman
-   
-   # Ubuntu/Debian
-   sudo apt install -y podman
+1. **Podman** on the host.
+2. **`~/.aws/credentials`** with one named profile per cluster account, each with EC2/VPC/ELB/Route53/IAM permissions:
+   ```ini
+   [cluster1]
+   aws_access_key_id = ...
+   aws_secret_access_key = ...
+   [cluster2]
+   ...
+   [cluster3]
+   ...
    ```
+   The profile each cluster uses is set by `aws_profile` in its `inventory/host_vars/` file.
+3. **`pull-secret.json`** (Red Hat pull secret) and **`ssh-key.pub`** in the repo root.
+4. A **public Route53 hosted zone** in each account (base domain is auto-detected).
 
-2. **Red Hat Pull Secret**
-   - Download from: https://console.redhat.com/openshift/install/pull-secret
-   - Save as `pull-secret.json` in project directory
-
-3. **SSH Key Pair**
-   ```bash
-   ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
-   cp ~/.ssh/id_rsa.pub ./ssh-key.pub
-   ```
-
-### AWS Requirements
-
-For each region you want to deploy to, you'll need:
-
-1. **AWS Credentials** with appropriate permissions
-2. **VPC** with internet connectivity
-3. **Subnet** in the VPC
-4. **Security Group** allowing:
-   - Port 6443 (API)
-   - Port 22 (SSH)
-   - Port 80 (HTTP)
-   - Port 443 (HTTPS)
-   - Port 22623 (Machine Config)
-5. **EC2 Key Pair** created in the region
-6. **RHCOS AMI ID** for your region and OpenShift version
-7. **Route53 Hosted Zone** (optional, for automatic DNS)
-
-### Required IAM Permissions
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:RunInstances",
-        "ec2:TerminateInstances",
-        "ec2:DescribeInstances",
-        "ec2:CreateVolume",
-        "ec2:AttachVolume",
-        "ec2:DescribeVolumes",
-        "ec2:CreateTags",
-        "ec2:AllocateAddress",
-        "ec2:AssociateAddress",
-        "ec2:ReleaseAddress",
-        "ec2:DescribeAddresses",
-        "ec2:DescribeImages",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeVpcs",
-        "route53:ChangeResourceRecordSets",
-        "route53:ListHostedZones",
-        "route53:ListResourceRecordSets"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-## Quick Start
-
-### 1. Clone and Setup
-
-```bash
-git clone <repository-url>
-cd regional-dr-example
-./setup.sh
-```
-
-### 2. Configure AWS Credentials
-
-Set up credentials for 1-3 AWS regions:
-
-```bash
-# Primary region (us-east-1)
-export AWS_ACCESS_KEY_ID_1="AKIAIOSFODNN7EXAMPLE"
-export AWS_SECRET_ACCESS_KEY_1="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-export AWS_REGION_1="us-east-1"
-
-# Secondary region (us-west-2) - Optional
-export AWS_ACCESS_KEY_ID_2="AKIAIOSFODNN7EXAMPLE2"
-export AWS_SECRET_ACCESS_KEY_2="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY2"
-export AWS_REGION_2="us-west-2"
-
-# Tertiary region (eu-west-1) - Optional
-export AWS_ACCESS_KEY_ID_3="AKIAIOSFODNN7EXAMPLE3"
-export AWS_SECRET_ACCESS_KEY_3="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY3"
-export AWS_REGION_3="eu-west-1"
-```
-
-### 3. Configure Clusters
-
-Create configuration files for each cluster. Choose between IPI or UPI deployment mode:
-
-**IPI Mode (Simple - OpenShift creates infrastructure):**
-```yaml
-# inventory/host_vars/cluster1.yml
-cluster_name: cluster1
-aws_region: us-east-1
-aws_credential_set: 1
-# cluster_base_domain: example.com  # Optional - auto-detected from Route53
-
-# That's it! OpenShift installer will create VPC, subnets, etc.
-```
-
-**UPI Mode (Advanced - Use existing infrastructure):**
-```yaml
-# inventory/host_vars/cluster1.yml
-cluster_name: cluster1
-aws_region: us-east-1
-aws_credential_set: 1
-# cluster_base_domain: example.com  # Optional - auto-detected from Route53
-
-# UPI-specific: existing infrastructure
-aws_vpc_id: vpc-0123456789abcdef0
-aws_subnet_id: subnet-0123456789abcdef0
-aws_security_group_id: sg-0123456789abcdef0
-aws_ami_id: ami-0123456789abcdef0
-aws_key_name: my-keypair
-```
-
-See [IPI vs UPI Modes Guide](docs/IPI-VS-UPI-MODES.md) for detailed comparison.
-
-```bash
-# Copy example configurations
-cp inventory/host_vars/cluster-us-east-1.example inventory/host_vars/cluster-us-east-1.yml
-cp inventory/host_vars/cluster-us-west-2.example inventory/host_vars/cluster-us-west-2.yml
-
-# Edit each file with your configuration
-vim inventory/host_vars/cluster-us-east-1.yml
-vim inventory/host_vars/cluster-us-west-2.yml
-```
-
-Add clusters to inventory:
-
-```bash
-cat >> inventory/hosts <<EOF
-cluster-us-east-1
-cluster-us-west-2
-EOF
-```
-
-### 4. Validate Configuration
+Validate everything before deploying:
 
 ```bash
 ./ansible-runner.sh validate
 ```
 
-### 5. Deploy Clusters
+---
+
+## Common setup (both use cases)
+
+Run these once to build the full environment. Total time ~2–3 h (three AWS cluster installs + operators + ODF + metal nodes).
 
 ```bash
-# Deploy all clusters
-./ansible-runner.sh deploy
-
-# Deploy specific cluster
-./ansible-runner.sh deploy --limit cluster-us-east-1
-
-# Deploy with verbose output
-./ansible-runner.sh deploy -v
+./ansible-runner.sh deploy       # 1. Install cluster1/2/3 on OpenShift 4.21 (IPI)
+./ansible-runner.sh operators    # 2. ACM + ODF MCO + Ramen-hub (hub); DR-cluster + OADP (spokes)
+./ansible-runner.sh import       # 3. Import spokes into ACM as ManagedClusters
+./ansible-runner.sh infra-dr     # 4. Submariner (globalnet OFF) + ODF StorageCluster on spokes
+./ansible-runner.sh certs        # 5. cert-manager + Let's Encrypt wildcard certs on every ingress
 ```
 
-### 6. Access Your Clusters
+> **Why `certs` matters for DR:** Ramen validates each `DRCluster` by reaching its ODF/Noobaa
+> S3 endpoint over TLS. The `certs` step gives every `*.apps.<domain>` route (including the S3
+> route) a publicly-trusted Let's Encrypt certificate, so `DRCluster … Validated=True` without
+> any custom-CA trust plumbing. Skip it and Regional-DR replication stalls on TLS.
 
-After deployment (approximately 45-60 minutes per cluster):
+Confirm the DR control plane is healthy:
 
 ```bash
-# View cluster information
-cat artifacts/cluster-us-east-1/cluster-info.txt
-
-# Use kubeconfig
-export KUBECONFIG=$(pwd)/artifacts/cluster-us-east-1/kubeconfig
-oc get nodes
-oc get co
-
-# Get console password
-cat artifacts/cluster-us-east-1/kubeadmin-password
+oc --kubeconfig artifacts/cluster1/kubeconfig get drpolicy,drcluster
+# dr-policy   Validated=True ;  cluster2/cluster3  Validated=True
 ```
 
-## Project Structure
-
-```
-.
-├── ansible-runner.sh                    # Main script with multi-credential support
-├── setup.sh                             # Initial setup script
-├── Containerfile                        # Ansible container definition
-├── ansible.cfg                          # Ansible configuration
-├── deploy-clusters.yml                  # Cluster deployment playbook
-├── destroy-clusters.yml                 # Cluster cleanup playbook
-├── validate.yml                         # Configuration validation playbook
-├── list-clusters.yml                    # List configured clusters
-├── inventory/
-│   ├── hosts                           # Inventory file
-│   ├── group_vars/
-│   │   └── all.yml                     # Global variables
-│   └── host_vars/
-│       ├── cluster-us-east-1.example   # Example: US East 1
-│       ├── cluster-us-west-2.example   # Example: US West 2
-│       └── cluster-eu-west-1.example   # Example: EU West 1
-├── templates/
-│   └── install-config.yaml.j2          # OpenShift install config template
-├── artifacts/                           # Generated cluster credentials (gitignored)
-│   └── <cluster-name>/
-│       ├── kubeconfig
-│       ├── kubeadmin-password
-│       ├── cluster-info.txt
-│       └── instance-id.txt
-└── README.md
-```
-
-## Usage Examples
-
-### Deploy Multiple Clusters
+Then deploy OpenShift Virtualization and a VM on the spokes:
 
 ```bash
-# Deploy all configured clusters
-./ansible-runner.sh deploy
-
-# Watch progress in another terminal
-watch -n 10 'ls -la artifacts/'
+./ansible-runner.sh virt         # CNV 4.21 on both spokes (on m5.metal nodes) + DR-protected VM
 ```
 
-### Deploy to Specific Region
+`virt` provisions an `m5.metal` MachineSet on each spoke (bare metal is required for hardware
+virtualization on AWS), installs CNV via an ACM policy, and deploys a DR-protected VM
+`vm-dr-example` in namespace `vm-example`.
+
+---
+
+## Use case 1: Test Regional DR Failover
+
+A DR-protected VM (`vm-dr-example`) runs on **cluster2**. Its disk is mirrored to **cluster3**
+by ODF/VolSync, and an ACM `DRPlacementControl` (DRPC) governs where it runs. On a "regional
+outage" you **fail it over** and Ramen restarts it on cluster3 from the replicated volume.
+
+### 1. Confirm the VM is protected and running on cluster2
+
+In the ACM console (**Fleet management → Search**, `kind:VirtualMachine`) the VM shows on **cluster2, Running**:
+
+![VM running on cluster2 (ACM)](docs/images/regional-dr/01-acm-vm-on-cluster2.png)
+
+Its DR state should be `Deployed` / `Protected=True` / `PeerReady=True`:
 
 ```bash
-# Deploy only US East cluster
-./ansible-runner.sh deploy --limit cluster-us-east-1
-
-# Deploy only US West cluster
-./ansible-runner.sh deploy --limit cluster-us-west-2
+oc --kubeconfig artifacts/cluster1/kubeconfig \
+   get drpc vm-dr-example-gitops-drpc -n openshift-gitops \
+   -o jsonpath='{.status.phase} Protected={.status.conditions[?(@.type=="Protected")].status} PeerReady={.status.conditions[?(@.type=="PeerReady")].status}{"\n"}'
+# Deployed  Protected=True  PeerReady=True
 ```
 
-### List Configured Clusters
+### 2. Fail over (or relocate) from the ACM console
+
+The default way to move a DR-protected application is the RHACM **Fleet management → Applications**
+view. The DR-protected app (`vm-dr-example-gitops-appset`) exposes **Failover application** and
+**Relocate application** actions directly in its row menu:
+
+![ACM Applications DR action menu — Failover / Relocate](docs/images/regional-dr-acm-ui/01-app-action-menu.png)
+
+- **Failover application** — for an unplanned outage. Pick the target managed cluster (`cluster3`) in
+  the modal; ACM sets the app's `DRPlacementControl` `action: Failover` and Ramen restarts the VM on
+  cluster3 from the last replicated volume.
+- **Relocate application** — for a planned, orderly move. Available once `PeerReady=True`; ACM sets
+  `action: Relocate` to return the app to its preferred cluster (`cluster2`).
+- **Manage disaster recovery** — opens the DR status (current placement, last-sync time, DRPolicy).
+
+Watch it progress `FailingOver → FailedOver`, and the VM come up on cluster3:
 
 ```bash
-./ansible-runner.sh list
+watch 'oc --kubeconfig artifacts/cluster1/kubeconfig get drpc vm-dr-example-gitops-drpc -n openshift-gitops -o jsonpath="{.status.phase}"; \
+       echo; oc --kubeconfig artifacts/cluster3/kubeconfig get vmi -n vm-example'
 ```
 
-### Destroy Clusters
+### 3. Verify the VM restarted on cluster3
+
+ACM Search now shows the **same VM on cluster3, Running** (new instance, later timestamp) — and it is gone from cluster2:
+
+![VM failed over to cluster3 (ACM)](docs/images/regional-dr/03-acm-vm-on-cluster3.png)
+
+The OpenShift console on cluster3 shows the running VM:
+
+![VM on cluster3 (console)](docs/images/regional-dr/04-cluster3-vm-running.png)
+
+### Alternative: driving it from the CLI
+
+The console actions are just a patch to the `DRPlacementControl` `spec.action`, so you can script the
+same failover and fail-back:
 
 ```bash
-# Destroy all clusters (with confirmation skip)
-./ansible-runner.sh destroy --yes
+# Fail over to cluster3 (unplanned outage)
+oc --kubeconfig artifacts/cluster1/kubeconfig \
+   patch drpc vm-dr-example-gitops-drpc -n openshift-gitops --type=merge \
+   -p '{"spec":{"action":"Failover","failoverCluster":"cluster3"}}'
 
-# Destroy specific cluster
-./ansible-runner.sh destroy --limit cluster-us-east-1 --yes
+# Fail back once PeerReady=True (planned relocate to the preferred cluster)
+oc --kubeconfig artifacts/cluster1/kubeconfig \
+   patch drpc vm-dr-example-gitops-drpc -n openshift-gitops --type=merge \
+   -p '{"spec":{"action":"Relocate","preferredCluster":"cluster2"}}'
 ```
 
-### Debug Mode
+> This is a **cold** move: the VM is stopped on the source and restarted on the target from
+> replicated storage. Expect a reboot. That is by design — Regional DR is for site loss, not
+> zero-downtime mobility. For zero-downtime, use case 2.
+
+---
+
+## Use case 2: Test Cross-Cluster Live Migration (CCLM) with Submariner
+
+KubeVirt **decentralized live migration** moves a *running* VM from cluster2 to cluster3 with
+no reboot. The VM's memory and disk stream directly between the two clusters' `virt-launcher`
+pods, and a `virt-synchronization-controller` (TCP 9185, mTLS) coordinates the handoff. **All
+of that traffic rides the Submariner pod network** — which is why the spokes must have
+non-overlapping CIDRs and globalnet must be off (globalnet only routes exported Services, not
+the ephemeral pod IPs the migration targets).
+
+### Prerequisite: enable CCLM on both spokes
 
 ```bash
-# Open shell in Ansible container
-./ansible-runner.sh shell
-
-# Inside container, you can run AWS CLI commands
-aws sts get-caller-identity --region us-east-1
-aws ec2 describe-instances --region us-east-1
+./ansible-runner.sh cclm
 ```
 
-## Configuration Guide
+This enables the `decentralizedLiveMigration` feature gate on each spoke's HyperConverged (on CNV
+4.22 it is on by default; on CNV 4.21 the play sets it as an HCO featureGate), waits for the
+`virt-synchronization-controller`, and cross-imports each spoke's KubeVirt CA into the other's
+`kubevirt-external-ca` for the mTLS sync channel.
 
-### Cluster Configuration File
+Verify Submariner connects the spokes with **no globalnet**:
 
-Each cluster needs a configuration file in `inventory/host_vars/<cluster-name>.yml`:
+```bash
+oc --kubeconfig artifacts/cluster2/kubeconfig get submariner -n submariner-operator \
+   -o jsonpath='globalCIDR="{.items[0].spec.globalCIDR}"{"\n"}'   # empty = globalnet OFF
+oc --kubeconfig artifacts/cluster1/kubeconfig get managedclusteraddon -A | grep submariner
+# cluster2 submariner  Available=True ;  cluster3 submariner  Available=True
+```
+
+### 1. Live-migrate a running VM from the ACM console
+
+The default way to drive a cross-cluster live migration is the RHACM **Fleet management** console. It
+is orchestrated by **MTV (Migration Toolkit for Virtualization)** via the `cnv-mtv-integrations`
+component. The spokes must be registered as MTV **providers** — the `virt` play labels the managed
+clusters `acm/cnv-operator-install=true` for this; without it the console reports "cross-cluster live
+migration is not possible".
+
+In **Fleet management → Search** (`kind:VirtualMachine`), each VM row exposes a **Cross cluster
+migration** action:
+
+![ACM VM action menu with Cross cluster migration](docs/images/cclm-acm-ui/01-action-menu.png)
+
+It opens the **Migrate VirtualMachines** wizard — pick the source/target cluster and project:
+
+![ACM cross-cluster migration wizard](docs/images/cclm-acm-ui/02-wizard-open.png)
+
+The **Migration readiness** step validates network mapping, storage mapping, and compute/version
+compatibility, then creates and runs the MTV migration plan:
+
+![ACM migration readiness — plan created](docs/images/cclm-acm-ui/05-migration-started.png)
+
+Under the hood the console builds an MTV `Plan`/`StorageMap`/`NetworkMap` (`type: live`) that performs
+the same KubeVirt decentralized live migration as the CLI (same `:9185` sync channel): CDI
+**populates** the receiver disk (`PrepareTarget`), then the live state sync runs (`Synchronization`).
+A healthy run reaches `Initialize → PrepareTarget → Synchronization = Completed` with the target VMI
+`Running`. ACM Search then shows the VM **Running on the target cluster**:
+
+![CCLM: VM running on target (ACM)](docs/images/cclm/01-cclm-vm-on-cluster3.png)
+
+#### The receiver disk MUST be `volumeMode: Block`. Migration will fail otherwise.The automation makes `ocs-storagecluster-ceph-rbd-virtualization`
+the **default virtualization StorageClass** on both spokes (`is-default-virt-class`, set by `infra-dr`),
+and that class's `StorageProfile` defaults to **RWX / Block**. So VM disks are Block *and* the wizard's
+`StorageMap` (which leaves `volumeMode` unset) inherits Block for the receiver — source and receiver are
+byte-identical raw devices, and the migration completes.
+
+
+
+> **To clear a hung/failed MTV migration:** delete the `plan`/`migration`/`storagemap`/`networkmap`
+> in `mtv-integrations` and the leftover receiver `DataVolume` on the target spoke, then check the
+> source VMI:
+> ```bash
+> oc --kubeconfig artifacts/cluster1/kubeconfig -n mtv-integrations delete migration,plan,storagemap,networkmap --all
+> oc --kubeconfig artifacts/<target>/kubeconfig -n <ns> delete dv <vm>-disk   # removes the receiver PVC too
+> oc --kubeconfig artifacts/<source>/kubeconfig -n <ns> get vmi <vm>          # expect Running; if Failed, delete it so the VM controller recreates it
+> ```
+> A Filesystem-receiver failure aborts *before* handoff, so the source VM keeps running; a failure
+> mid-handoff can leave the source VMI `Failed` (the `runStrategy: Always` VM restarts it).
+
+### Alternative: driving it from the CLI (`cclm-migrate`)
+
+You can also drive the migration directly with KubeVirt CRs — **no ACM/MTV orchestration**. This is
+lighter, leaves nothing to a wizard's storage mapping (it creates the receiver DataVolume without
+forcing modes, so CDI inherits RWX Block from the `StorageProfile` automatically), and never disturbs
+the source VM. Any running, PVC-backed VM works.
+
+**1. Live-migrate cluster2 → cluster3** (demo VM `cclm-fedora` in `cclm-demo`):
+
+```bash
+./ansible-runner.sh cclm-migrate \
+    -e cclm_vm=cclm-fedora -e cclm_from=cluster2 -e cclm_to=cluster3 -e cclm_vm_namespace=cclm-demo
+```
+
+Under the hood the play (`cclm-migrate.yml`):
+1. Creates a receiver `VirtualMachine` (`runStrategy: WaitAsReceiver`) + blank DataVolumes on the target.
+2. Creates a `receive` `VirtualMachineInstanceMigration` on the target and reads its
+   `status.synchronizationAddresses[0]` — e.g. `10.132.0.32:9185`, a **raw cluster3 pod IP**
+   reachable from cluster2 **only because Submariner routes the pod CIDR directly**.
+3. Creates the matching `sendTo` migration on the source (`connectURL` = that address).
+4. Waits for the target migration to reach `Succeeded`.
+
+**2. Watch the VM move with zero downtime:**
+
+```bash
+watch 'echo cluster2:; oc --kubeconfig artifacts/cluster2/kubeconfig get vmi -n cclm-demo; \
+       echo cluster3:; oc --kubeconfig artifacts/cluster3/kubeconfig get vmi -n cclm-demo'
+# cluster3 VMI goes Scheduled → Running, then the cluster2 VMI disappears — the guest never rebooted.
+```
+
+**3. Migrate it back (bidirectional):**
+
+```bash
+./ansible-runner.sh cclm-migrate \
+    -e cclm_vm=cclm-fedora -e cclm_from=cluster3 -e cclm_to=cluster2 -e cclm_vm_namespace=cclm-demo
+```
+
+ACM Search now shows the VM **Running on cluster2** again (the source side is left `Stopped`, as
+decentralized migration intends):
+
+![CCLM: VM back on cluster2 (ACM)](docs/images/cclm/02-cclm-vm-on-cluster2.png)
+
+The OpenShift console on cluster2 shows the live VM:
+
+![CCLM: VM on cluster2 (console)](docs/images/cclm/03-cclm-cluster2-console.png)
+
+> This is a **live** move: the guest keeps running throughout. It requires L3 pod-to-pod
+> reachability between the clusters (here, Submariner over non-overlapping CIDRs) plus mutual
+> KubeVirt-CA trust — the two `VirtualMachineInstanceMigration` objects drive it directly.
+
+---
+
+## Use case 3: Lightweight Regional DR with VolSync (direct cluster-to-cluster)
+
+Use case 1 leans on the **full ODF Regional-DR stack** — the ODF Multicluster Orchestrator, the Ramen
+hub/cluster operators, a `MirrorPeer`, a `DRPolicy`, and a `DRPlacementControl` per app. That buys you
+one-click, policy-driven failover, but it also requires ODF on both clusters and a fair amount of
+moving parts.
+
+When you want DR **without** that machinery — for example on SNO clusters, on non-ODF storage
+(LVM/local/any CSI with snapshots), or a setup where you'd rather not run Ramen — you can drive
+replication with **VolSync alone, syncing PVCs directly cluster-to-cluster** over `rsync-tls`. There is
+no Ramen, no MirrorPeer, no `DRPlacementControl`: just a `ReplicationDestination` on the standby that
+exposes an rsync endpoint, and a `ReplicationSource` on the primary that pushes to it on a schedule.
+
+> 📎 **Reference implementation:** this project was inspired by
+> **[MoOyeg/sno-disaster-recovery](https://github.com/MoOyeg/sno-disaster-recovery)**, which implements
+> exactly this VolSync-only pattern between two SNO clusters — ACM policies orchestrate the VolSync
+> `ReplicationSource`/`ReplicationDestination`, OpenShift GitOps renders the app onto the *active*
+> cluster, and **failover is a label flip on the hub** (`app-role=active/standby`) rather than a DRPC
+> action. The rsync endpoint is published with **MetalLB** (a `LoadBalancer` Service), and **Submariner**
+> provides cross-cluster reachability when the two clusters aren't on shared subnets.
+
+### How it works
+
+```
+   cluster2 (primary)                                   cluster3 (standby)
+   ┌────────────────────┐        rsync-tls stream       ┌────────────────────┐
+   │ app PVC            │   over LoadBalancer / Submariner │ ReplicationDest    │
+   │ ReplicationSource  │ ───────────────────────────►  │  → VolumeSnapshot   │
+   │  (every 5 min)     │      (direct, no object store) │  (latestImage)      │
+   └────────────────────┘                               └────────────────────┘
+                                                          promote snap → PVC on failover
+```
+
+- The **`ReplicationDestination`** on the standby (rsync-tls mover) creates a Service exposing the
+  rsync endpoint plus a pre-shared TLS key; its `.status.rsyncTLS.address` is where the source connects.
+- The **`ReplicationSource`** on the primary snapshots the app PVC and syncs it to that address on a
+  schedule — the schedule *is* your RPO (e.g. 5 minutes).
+- Each sync lands on the standby as a `VolumeSnapshot` (`.status.latestImage`), ready to be promoted to
+  a PVC on failover.
+- The data path is **cluster → cluster** (no object storage in the middle): the source must reach the
+  destination's rsync Service, published via a **LoadBalancer** (MetalLB on-prem / a cloud ELB) or made
+  routable with **Submariner**. Storage is anything with CSI snapshots — Ceph, LVM, local, etc.
+
+### Sketch of the CRs
 
 ```yaml
-# Cluster identification
-cluster_name: "cluster-us-east-1"
-cluster_base_domain: "example.com"  # Optional: auto-detected from Route53 if not provided
-
-# AWS Credential Set to use (1, 2, or 3)
-aws_credential_set: 1
-
-# AWS Configuration
-aws_region: "us-east-1"
-aws_availability_zone: "us-east-1a"
-aws_instance_type: "m5.2xlarge"
-aws_root_volume_size: 120
-
-# RHCOS AMI
-aws_ami_id: "ami-0abcdef1234567890"
-
-# Network Configuration
-aws_vpc_id: "vpc-xxxxxxxxxxxxxxxxx"
-aws_subnet_id: "subnet-xxxxxxxxxxxxxxxxx"
-aws_security_group_id: "sg-xxxxxxxxxxxxxxxxx"
-
-# SSH Key
-aws_key_name: "my-keypair"
-
-# Elastic IP
-aws_create_eip: true
-
-# Optional: Route53 DNS
-aws_route53_zone: "example.com"
-
-# OpenShift version
-openshift_version: "4.17"
+# On the STANDBY — expose an rsync-tls endpoint and land each sync as a snapshot
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationDestination
+metadata: { name: app-data, namespace: my-app }
+spec:
+  rsyncTLS:
+    serviceType: LoadBalancer      # MetalLB / cloud LB address the source dials
+    copyMethod: Snapshot
+    accessModes: [ReadWriteOnce]
+    capacity: 10Gi
+# -> .status.rsyncTLS.address (endpoint) + a generated pre-shared key Secret to hand to the source
+---
+# On the PRIMARY — sync the app PVC to the standby every 5 minutes
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata: { name: app-data, namespace: my-app }
+spec:
+  sourcePVC: app-data
+  trigger: { schedule: "*/5 * * * *" }        # RPO = 5 min
+  rsyncTLS:
+    address: <ReplicationDestination .status.rsyncTLS.address>
+    keySecret: volsync-rsync-tls-app-data     # the pre-shared key from the destination
+    copyMethod: Snapshot
 ```
 
-### Finding RHCOS AMI IDs
+### Failover / failback
 
-1. Visit: https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/
-2. Navigate to your OpenShift version (e.g., `4.17/`)
-3. Look for `rhcos-aws.json` or check AWS EC2 console under "Public images"
-4. Search for: "Red Hat CoreOS" + your OpenShift version
+1. **Fail over:** stop the `ReplicationSource` on the (lost) primary, promote the standby's
+   `ReplicationDestination.status.latestImage` snapshot into the app PVC, and start the app on the
+   standby. With the linked repo's model this is a single **label flip** on the hub — ACM policies swap
+   the VolSync roles and GitOps re-renders the app onto the new active cluster.
+2. **Fail back:** reverse the roles (old standby becomes the source), and flip the label back once the
+   volumes are caught up.
 
-Example AMI IDs for OpenShift 4.17:
-- us-east-1: `ami-0abcdef1234567890`
-- us-west-2: `ami-0fedcba9876543210`
-- eu-west-1: `ami-0123456789abcdef0`
+> Compared to use case 1 this trades one-click, sub-second-RPO storage mirroring for a **simpler,
+> storage-agnostic** replicate-and-restore DR: no ODF Regional-DR operators, coarser RTO
+> (promote-from-snapshot), and RPO bounded by the sync schedule. It still needs a network path for the
+> rsync stream (a LoadBalancer or Submariner), but no Ceph/ODF and no Ramen.
 
-## Advanced Features
+---
 
-### Auto-Detecting Base Domain from Route53
+## Command reference
 
-If you don't specify `cluster_base_domain`, the script will automatically query Route53 using the appropriate AWS credentials and use the first hosted zone it finds:
+| Command | Purpose |
+|---------|---------|
+| `./ansible-runner.sh deploy` | Install cluster(s) on AWS (IPI, OpenShift 4.21) |
+| `./ansible-runner.sh destroy --yes` | Tear down cluster(s) |
+| `./ansible-runner.sh operators` | ACM + ODF MCO + Ramen (hub); DR-cluster + OADP (spokes) |
+| `./ansible-runner.sh import` | Import spokes into ACM |
+| `./ansible-runner.sh infra-dr` | Submariner (globalnet off) + ODF StorageCluster |
+| `./ansible-runner.sh certs` | cert-manager + Let's Encrypt wildcard certs |
+| `./ansible-runner.sh app` | MirrorPeer + DRPolicy + sample DR app |
+| `./ansible-runner.sh virt` | OpenShift Virtualization + DR-protected VM |
+| `./ansible-runner.sh cclm` | Enable cross-cluster live migration on the spokes |
+| `./ansible-runner.sh cclm-migrate -e cclm_vm=… -e cclm_from=… -e cclm_to=…` | Live-migrate a VM between spokes |
+| `./ansible-runner.sh validate` / `list` / `shell` | Validate config / list clusters / debug shell |
 
-```yaml
-# Minimal configuration - base domain auto-detected
-cluster_name: "cluster-us-east-1"
-# cluster_base_domain will be auto-detected from Route53
-aws_credential_set: 1
-aws_region: "us-east-1"
-# ... other required fields
-```
+Add `--destroy` to `operators`, `infra-dr`, `certs`, `app`, `virt`, `cclm` to remove what they created.
 
-The script will:
-1. Use the AWS credentials for the specified credential set
-2. Query Route53 for hosted zones
-3. Use the first hosted zone as the base domain
-4. Fail with a clear message if no hosted zones are found
+## Key configuration
 
-### Using Different Instance Types
+- `inventory/group_vars/all.yml` — OpenShift version (`4.21`), operator channels
+  (ACM `release-2.17`, ODF `stable-4.21`), `globalnet_enabled: false`.
+- `inventory/host_vars/cluster{1,2,3}` — per-cluster `aws_profile`, region, and the
+  **non-overlapping** `cluster_network_cidr` / `service_network_cidr` / `machine_network_cidr`
+  that make Submariner-without-globalnet (and therefore CCLM) possible.
 
-Modify `aws_instance_type` in your cluster configuration:
+## Notes / gotchas
 
-```yaml
-# For production workloads
-aws_instance_type: "m5.4xlarge"
-
-# For development/testing
-aws_instance_type: "m5.2xlarge"
-
-# For high-performance workloads
-aws_instance_type: "m5.8xlarge"
-```
-
-### Custom Root Volume Size
-
-```yaml
-# Default is 120GB
-aws_root_volume_size: 120
-
-# For larger workloads
-aws_root_volume_size: 250
-```
-
-### Without Route53
-
-If you don't have a Route53 hosted zone, you can use the Elastic IP directly:
-
-```yaml
-# Remove or comment out this line
-# aws_route53_zone: "example.com"
-
-# Access cluster via IP
-# API: https://<elastic-ip>:6443
-# Console: https://<elastic-ip>:8443
-```
-
-## Troubleshooting
-
-### Check AWS Credentials
-
-```bash
-# Validate credentials
-./ansible-runner.sh validate
-
-# Or manually check
-./ansible-runner.sh shell
-aws sts get-caller-identity --region us-east-1
-```
-
-### Monitor EC2 Instance
-
-```bash
-# Get instance ID
-cat artifacts/cluster-us-east-1/instance-id.txt
-
-# Check instance status
-aws ec2 describe-instances \
-  --instance-ids <instance-id> \
-  --region us-east-1 \
-  --query 'Reservations[0].Instances[0].State.Name'
-
-# Get console output
-aws ec2 get-console-output \
-  --instance-id <instance-id> \
-  --region us-east-1
-```
-
-### Installation Logs
-
-```bash
-# Installation logs are in temporary directory
-tail -f /tmp/ocp-install-<cluster-name>/.openshift_install.log
-```
-
-### Common Issues
-
-1. **AMI not found**: Verify AMI ID is correct for your region
-2. **VPC/Subnet errors**: Ensure VPC has internet gateway and subnet has route to it
-3. **Security group issues**: Verify security group allows required ports
-4. **Key pair not found**: Ensure EC2 key pair exists in the target region
-5. **Insufficient permissions**: Review IAM permissions above
-6. **Route53 errors**: Verify hosted zone exists and matches base domain
-
-## Cost Estimation
-
-Running 24/7 (per cluster):
-- **m5.2xlarge instance**: ~$280/month
-- **EBS volumes (120GB gp3)**: ~$12/month
-- **Elastic IP**: $0 (when associated)
-- **Route53**: ~$0.50/month (per hosted zone)
-- **Total per cluster**: ~$295/month
-
-**Cost Saving Tips**:
-- Stop instances when not in use
-- Use smaller instance types for dev/test
-- Delete clusters when not needed
-
-## Security Considerations
-
-1. **Never commit credentials**: All credential files are in `.gitignore`
-2. **Use separate AWS accounts**: Consider different accounts for different regions
-3. **Rotate credentials regularly**: Change AWS access keys periodically
-4. **Use IAM roles when possible**: For production, use IAM roles instead of access keys
-5. **Restrict security groups**: Only allow necessary ports and IPs
-6. **Enable CloudTrail**: Monitor API activity for security
-7. **Use VPC Flow Logs**: Monitor network traffic
-
-## Comparison with sno-disaster-recovery
-
-This project is inspired by [sno-disaster-recovery](https://github.com/MoOyeg/sno-disaster-recovery) but focuses on:
-
-| Feature | sno-disaster-recovery | regional-dr-example |
-|---------|----------------------|---------------------|
-| Platform | OpenShift Virtualization + AWS | AWS only |
-| Credentials | Single AWS credential | 1-3 AWS credentials |
-| Primary Use Case | DR within datacenter | Regional DR across AWS |
-| ACM Integration | Yes | Not yet |
-| Application DR | VolSync | Not yet |
-| Submariner | Yes | Not yet |
-
-## Roadmap
-
-Future enhancements:
-- [ ] ACM (Advanced Cluster Management) integration
-- [ ] VolSync for application-level DR
-- [ ] Submariner for cluster networking
-- [ ] Automated failover testing
-- [ ] Cost tracking and reporting
-- [ ] Support for additional cloud providers
-- [ ] Application deployment templates
-- [ ] Backup and restore procedures
-
-## Support and Contributions
-
-For issues, questions, or contributions:
-- Review the OpenShift documentation: https://docs.openshift.com
-- Check AWS OpenShift documentation
-- Review example configurations in `inventory/host_vars/`
-
-## License
-
-This automation is provided as-is for educational and operational purposes.
-
-## Acknowledgments
-
-Inspired by [sno-disaster-recovery](https://github.com/MoOyeg/sno-disaster-recovery) by Moyo Oyegunle.
+- **Non-overlapping CIDRs are load-bearing for use case 2.** If the spokes share CIDRs you must
+  run Submariner with globalnet, and CCLM's pod-to-pod data path will not route. Changing CIDRs
+  means reinstalling the spoke.
+- **`certs` before Regional-DR replication.** Let's Encrypt certs on the S3 routes are what let
+  Ramen validate the `DRCluster`s over TLS.
+- **ODF Multicluster Orchestrator needs GitOps.** On the hub, the ArgoCD (`argoproj.io`) CRDs
+  must exist before the ODF MCO subscription, or `odfmo-controller-manager` crash-loops; the
+  `operators` play installs OpenShift GitOps first for this reason.
+- Inspired by [sno-disaster-recovery](https://github.com/MoOyeg/sno-disaster-recovery).

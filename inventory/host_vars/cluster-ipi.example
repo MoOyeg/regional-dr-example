@@ -12,16 +12,25 @@ cluster_name: cluster-us-east-1-ipi
 # AWS Region
 aws_region: us-east-1
 
-# AWS Credential Set (1, 2, or 3)
-# Refers to AWS_ACCESS_KEY_ID_1, AWS_SECRET_ACCESS_KEY_1, AWS_REGION_1
-aws_credential_set: 1
+# AWS account: named profile in ~/.aws/credentials ([section] per account)
+# Create the profile with `aws configure --profile <name>` or edit the file.
+aws_profile: "cluster1"
 
 # Base Domain (Optional - auto-detected from Route53 if not specified)
 # If you have a Route53 hosted zone, this will be automatically detected
 # cluster_base_domain: example.com
 
-# OpenShift Version (Optional - defaults to 4.17)
-# openshift_version: "4.17"
+# OpenShift Version (Optional - defaults to group_vars openshift_version)
+# openshift_version: "4.21"
+
+# Cluster network CIDRs (Optional - override the OCP defaults in install-config).
+# Give Submariner-connected clusters NON-OVERLAPPING pod/service/machine ranges
+# to enable cross-cluster live migration without globalnet. Each cluster in the
+# Submariner set must use a DISTINCT set.
+# cluster_network_cidr: "10.128.0.0/14"
+# cluster_network_host_prefix: 23
+# service_network_cidr: "172.30.0.0/16"
+# machine_network_cidr: "10.0.0.0/16"
 
 # Node topology (defaults: SNO with 1 master, 0 workers)
 # control_plane_replicas: 1

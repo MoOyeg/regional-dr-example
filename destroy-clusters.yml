@@ -12,7 +12,7 @@
         msg: |
           Destroying cluster: {{ cluster_name }}
           Region: {{ aws_region }}
-          Credential Set: {{ aws_credential_set }}
+          AWS Profile: {{ aws_profile }}
 
     - name: Determine deployment mode
       set_fact:
@@ -20,16 +20,16 @@
 
     - name: Set AWS credentials based on credential set
       set_fact:
-        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID_' + (aws_credential_set | string)) }}"
-        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY_' + (aws_credential_set | string)) }}"
-        aws_deploy_region: "{{ lookup('env', 'AWS_REGION_' + (aws_credential_set | string)) | default(aws_region, true) }}"
+        aws_access_key: "{{ lookup('ini', 'aws_access_key_id', section=aws_profile, file=aws_shared_credentials_file) }}"
+        aws_secret_key: "{{ lookup('ini', 'aws_secret_access_key', section=aws_profile, file=aws_shared_credentials_file) }}"
+        aws_deploy_region: "{{ aws_region | default(aws_region, true) }}"
 
     - name: Validate AWS credentials are set
       assert:
         that:
           - aws_access_key | length > 0
           - aws_secret_key | length > 0
-        fail_msg: "AWS credentials not found for credential set {{ aws_credential_set }}. Ensure AWS_ACCESS_KEY_ID_{{ aws_credential_set }} and AWS_SECRET_ACCESS_KEY_{{ aws_credential_set }} are set."
+        fail_msg: "AWS credentials not found for profile {{ aws_profile }}. Ensure AWS_ACCESS_KEY_ID_{{ aws_profile }} and AWS_SECRET_ACCESS_KEY_{{ aws_profile }} are set."
 
     - name: Get first Route53 hosted zone if cluster_base_domain not provided
       shell: |

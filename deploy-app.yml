@@ -1090,8 +1090,13 @@
           pvcSelector:
             matchLabels:
               appname: {{ app_name }}
-          kubeObjectProtection:
-            captureInterval: 5m
+          # NOTE: kubeObjectProtection intentionally omitted (matches the GitOps
+          # instance above, which stays Protected=True). Enabling it makes Ramen
+          # run a Velero kube-object capture, but this environment has no OADP
+          # DataProtectionApplication -> Velero is never deployed -> capture fails
+          # with KubeObjectsCaptureError ("recipe reconcile failed"), the DRPC
+          # stays Protected=False, and the ODF DR dashboard shows the app/VolSync
+          # replication as degraded. Volume (VolSync) protection is sufficient.
         EOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"

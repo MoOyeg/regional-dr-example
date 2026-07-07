@@ -9,6 +9,6 @@
         msg: |
           Cluster: {{ cluster_name }}
           Region: {{ aws_region }}
-          Credential Set: {{ aws_credential_set }}
+          AWS Profile: {{ aws_profile }}
           Base Domain: {{ cluster_base_domain }}
           Instance Type: {{ aws_instance_type }}
