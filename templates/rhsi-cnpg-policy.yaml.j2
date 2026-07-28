@@ -140,10 +140,19 @@ spec:
             {{hub- if $usePromoToken hub}}
                     promotionToken: {{hub $token hub}}
             {{hub- end hub}}
+                  # Replication dials the PEER's site-scoped Listener (pg-<site>), never
+                  # the shared write key. Using $writeKey here deadlocks the switchover:
+                  # during handover BOTH pods still carry cnpg.io/instanceRole=primary, so
+                  # the new active site's own pg-write Connector matches its own (still
+                  # replica) pod, Skupper's local-preference serves that, and the promoting
+                  # replica streams FROM ITSELF - its receive LSN freezes short of the
+                  # promotion token's LSN, the token is never verified, and BOTH sites stay
+                  # replicas with no writable database. pg_stat_wal_receiver reports
+                  # "streaming" throughout, which hides it. (Found live 2026-07-28.)
                   externalClusters:
                     - name: {{hub $siteA hub}}
                       connectionParameters:
-                        host: {{hub $writeKey hub}}
+                        host: pg-{{hub $siteA hub}}
                         port: "{{hub $port hub}}"
                         user: streaming_replica
                         dbname: postgres
@@ -159,7 +168,7 @@ spec:
                         key: tls.key
                     - name: {{hub $siteB hub}}
                       connectionParameters:
-                        host: {{hub $writeKey hub}}
+                        host: pg-{{hub $siteB hub}}
                         port: "{{hub $port hub}}"
                         user: streaming_replica
                         dbname: postgres
@@ -184,9 +193,10 @@ spec:
           severity: high
           pruneObjectBehavior: DeleteIfCreated
           object-templates:
-            # A pg-write Skupper Listener on BOTH spokes: app writes and replica
-            # streaming dial pg-write:{{ cnpg_pg_port }} locally; Skupper's local-preference
-            # serves the active site's own primary, else crosses the Link.
+            # A pg-write Skupper Listener on BOTH spokes: the APP's write path dials
+            # pg-write:{{ cnpg_pg_port }} locally; Skupper's local-preference serves the active
+            # site's own primary, else crosses the Link. NOTE: replication must NOT use
+            # this key - see cnpg-replication-path below.
             - complianceType: musthave
               objectDefinition:
                 apiVersion: skupper.io/v2alpha1
@@ -199,6 +209,66 @@ spec:
                 spec:
                   routingKey: {{ cnpg_write_key }}
                   host: {{ cnpg_write_key }}
+                  port: {{ cnpg_pg_port }}
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-replication-path
+        spec:
+          remediationAction: enforce
+          severity: high
+          pruneObjectBehavior: DeleteIfCreated
+          # SITE-SCOPED replication path, one routing key per site (pg-site-<name>),
+          # so a replica always reaches the PEER instead of looping back to itself.
+          # Each spoke publishes only its OWN instance, role-agnostic (selector is the
+          # cluster, not cnpg.io/instanceRole=primary) - during a switchover neither
+          # side is primary, and that is exactly when the WAL still has to flow.
+          # Both site Listeners exist on both spokes so every externalClusters host
+          # resolves; a site's own listener simply loops back and is never dialled,
+          # because replica.source always names the peer.
+          object-templates-raw: |
+            {% raw %}{{hub- $ns := "{% endraw %}{{ cnpg_namespace }}{% raw %}" hub}}
+            {{hub- $cluster := "{% endraw %}{{ cnpg_cluster_name }}{% raw %}" hub}}
+            {{hub- $self := .ManagedClusterName hub}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: skupper.io/v2alpha1
+                kind: Connector
+                metadata:
+                  name: pg-site-{{hub $self hub}}
+                  namespace: {{hub $ns hub}}
+                  labels:
+                    app: pg-cnpg
+                spec:
+                  routingKey: pg-site-{{hub $self hub}}
+                  selector: cnpg.io/cluster={{hub $cluster hub}}
+                  port: {% endraw %}{{ cnpg_pg_port }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: skupper.io/v2alpha1
+                kind: Listener
+                metadata:
+                  name: pg-{{ cnpg_site_a }}
+                  namespace: {{ cnpg_namespace }}
+                  labels:
+                    app: pg-cnpg
+                spec:
+                  routingKey: pg-site-{{ cnpg_site_a }}
+                  host: pg-{{ cnpg_site_a }}
+                  port: {{ cnpg_pg_port }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: skupper.io/v2alpha1
+                kind: Listener
+                metadata:
+                  name: pg-{{ cnpg_site_b }}
+                  namespace: {{ cnpg_namespace }}
+                  labels:
+                    app: pg-cnpg
+                spec:
+                  routingKey: pg-site-{{ cnpg_site_b }}
+                  host: pg-{{ cnpg_site_b }}
                   port: {{ cnpg_pg_port }}
 ---
 apiVersion: policy.open-cluster-management.io/v1

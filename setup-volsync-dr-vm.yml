@@ -121,11 +121,40 @@
       delay: 20
       changed_when: false
 
-    - name: Generate the rsync-tls pre-shared key
+    # The PSK must be REUSED across re-runs. stunnel inside the VolSync mover reads
+    # psk.txt once at startup and never reloads it, so rotating the key on a live
+    # deployment breaks replication until the long-lived DESTINATION mover pod is
+    # cycled - and it fails silently: the ReplicationSource keeps publishing
+    # lastSyncTime while the ReplicationDestination records none, so only the mover
+    # logs show it ("decrypt error" on the source, "binder does not verify" on the
+    # destination). Found live 2026-07-28.
+    - name: Look for an existing rsync-tls pre-shared key on the spokes
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ volsync_vm_namespace }} \
+          get secret {{ psk_secret_name }} -o jsonpath='{.data.psk\.txt}' 2>/dev/null | base64 -d 2>/dev/null || true
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      register: volsync_psk_existing
+      changed_when: false
+
+    - name: Generate an rsync-tls pre-shared key (only if none exists yet)
       shell: 'echo "volsync:$(openssl rand -hex 32)"'
-      register: volsync_psk
+      register: volsync_psk_new
       changed_when: false
       delegate_to: localhost
+
+    - name: Settle on the pre-shared key to distribute
+      set_fact:
+        volsync_psk_value: >-
+          {{ (volsync_psk_existing.results | map(attribute='stdout') | select('search', '^volsync:') | list | first)
+             | default(volsync_psk_new.stdout, true) }}
+
+    - name: Report which key is in use
+      debug:
+        msg: >-
+          rsync-tls PSK: {{ 'REUSED from the spokes (movers keep working)'
+                            if (volsync_psk_existing.results | map(attribute='stdout') | select('search', '^volsync:') | list | length) > 0
+                            else 'newly generated (first deployment)' }}
 
     - name: Create namespace + data PVC on each spoke
       shell: |
@@ -139,10 +168,21 @@
       shell: |
         oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ volsync_vm_namespace }} \
           create secret generic {{ psk_secret_name }} \
-          --from-literal=psk.txt='{{ volsync_psk.stdout }}' \
+          --from-literal=psk.txt='{{ volsync_psk_value }}' \
           --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f -
       delegate_to: localhost
       loop: "{{ spoke_clusters }}"
+      register: volsync_psk_apply
+
+    # Belt and braces: if the key did change (partial/legacy state), any mover pod
+    # still holds the old one in stunnel's memory - cycle them so the new key takes.
+    - name: Restart VolSync mover pods whose key changed
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ volsync_vm_namespace }} \
+          delete pod -l app.kubernetes.io/created-by=volsync --ignore-not-found
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      when: volsync_psk_apply.results | selectattr('stdout', 'search', 'configured') | list | length > 0
 
     - name: Export the destination rsync Service across the clusterset
       shell: |
