@@ -1,0 +1,10 @@
+---
+# CNPG cross-site Postgres over RHSI - use case 5
+# The Skupper Site, the CloudNativePG Cluster (pg), and the sample app all live here.
+# Created on BOTH spokes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres-dr
+  labels:
+    app: pg-cnpg

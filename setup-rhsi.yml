@@ -1,0 +1,861 @@
+---
+# =============================================================================
+# Red Hat Service Interconnect (RHSI) + CloudNativePG cross-site Postgres - use case 5
+# =============================================================================
+# A CloudNativePG (CNPG) primary/replica Postgres spread across the two spokes, with
+# RHSI (Skupper v2) carrying the streaming replication and the app write path, wired
+# by ACM policies, and an ACM `pg-role` label-flip performing a zero-data-loss CNPG
+# controlled switchover. See the header in inventory/group_vars/all.yml and the README.
+#
+# Play 1: Install skupper-operator + Network Observer on each spoke (cluster-wide)
+# Play 2: Install the CloudNativePG operator on each spoke
+# Play 3: Create the postgres-dr namespace + a Skupper Site on each spoke
+# Play 4: Create an AccessGrant on the primary spoke (link acceptor)
+# Play 5: Redeem the token + form the mTLS Link on the secondary spoke
+# Play 6: Hub - side-load shared certs, deploy the app, label pg-role, apply the
+#         ACM policy engine (CNPG Cluster + RHSI Connector/Listener + token relay)
+#
+# Prerequisites:
+# 1. Clusters deployed / operators installed / spokes imported into ACM
+# 2. ODF (for cnpg_storage_class) and the dr-clusters ManagedClusterSet (infra-dr)
+# =============================================================================
+
+# =============================================================================
+# Play 1: Install Red Hat Service Interconnect operator on spokes
+# =============================================================================
+- name: "Play 1: Install Red Hat Service Interconnect operator on spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # Both operators go into openshift-operators, whose default `global-operators`
+    # OperatorGroup has an empty targetNamespaces -> AllNamespaces (cluster-wide).
+    # Verify that first so we fail loudly rather than silently installing
+    # single-namespace scoped.
+    # =========================================================================
+    - name: Count AllNamespaces OperatorGroups in the operator namespace
+      shell: |
+        # An AllNamespaces OperatorGroup has no spec.targetNamespaces (or an empty list)
+        oc get operatorgroup -n {{ rhsi_operator_namespace }} -o json 2>/dev/null \
+          | jq -r '[.items[] | select(((.spec.targetNamespaces // []) | length) == 0)] | length'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_allns_og
+      changed_when: false
+
+    - name: Fail if the operator namespace is not cluster-scoped
+      fail:
+        msg: >-
+          {{ rhsi_operator_namespace }} has no AllNamespaces OperatorGroup, so the RHSI operators
+          would install scoped to a single namespace. They must be installed for ALL namespaces so
+          Sites/Connectors/Listeners can be created in any namespace (e.g. {{ cnpg_namespace }}).
+      when: (rhsi_allns_og.stdout | default('0') | trim | int) < 1
+
+    - name: Create skupper-operator Subscription (all namespaces)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: skupper-operator
+          namespace: {{ rhsi_operator_namespace }}
+        spec:
+          channel: {{ rhsi_channel }}
+          installPlanApproval: Automatic
+          name: skupper-operator
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # =========================================================================
+    # Network Observer ("Observe") operator - RHSI 2.1+. Package name varies by
+    # catalog version, so discover it unless pinned via rhsi_observer_package.
+    # =========================================================================
+    - name: Resolve the Network Observer operator package
+      shell: |
+        # Prefer the configured package (Red Hat ships it as skupper-netobs-operator) when the
+        # catalog actually has it; otherwise fall back to discovery. The pattern matches only the
+        # skupper netobs/observer packages, never netobserv-operator, which is the unrelated
+        # OpenShift Network Observability product.
+        pkg="{{ rhsi_observer_package }}"
+        if [ -n "$pkg" ] && oc get packagemanifest "$pkg" -n openshift-marketplace >/dev/null 2>&1; then
+          echo "$pkg"
+        else
+          oc get packagemanifest -n openshift-marketplace --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
+            | grep -iE 'skupper-netobs|skupper.*(netobs|observ)|interconnect.*(netobs|observ)' | head -1
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_observer_pkg
+      changed_when: false
+      when: rhsi_install_observer | default(true)
+
+    - name: Warn if the Network Observer operator is not in the catalog
+      debug:
+        msg: >-
+          No Network Observer package found in the catalog on {{ cluster_name }} (needs RHSI 2.1+).
+          Skipping it; pin one with -e rhsi_observer_package=<name> if your catalog names it differently.
+      when:
+        - rhsi_install_observer | default(true)
+        - rhsi_observer_pkg.stdout | default('') | trim | length == 0
+
+    - name: Resolve the Network Observer channel
+      shell: |
+        if [ -n "{{ rhsi_observer_channel }}" ]; then
+          echo "{{ rhsi_observer_channel }}"
+        else
+          oc get packagemanifest {{ rhsi_observer_pkg.stdout | trim }} -n openshift-marketplace \
+            -o jsonpath='{.status.defaultChannel}'
+        fi
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_observer_ch
+      changed_when: false
+      when:
+        - rhsi_install_observer | default(true)
+        - rhsi_observer_pkg.stdout | default('') | trim | length > 0
+
+    - name: Create Network Observer Subscription (all namespaces)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: {{ rhsi_observer_pkg.stdout | trim }}
+          namespace: {{ rhsi_operator_namespace }}
+        spec:
+          channel: {{ rhsi_observer_ch.stdout | trim }}
+          installPlanApproval: Automatic
+          name: {{ rhsi_observer_pkg.stdout | trim }}
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when:
+        - rhsi_install_observer | default(true)
+        - rhsi_observer_pkg.stdout | default('') | trim | length > 0
+
+    - name: Wait for the Network Observer CSV to succeed (best-effort)
+      shell: |
+        oc get csv -n {{ rhsi_operator_namespace }} --no-headers 2>/dev/null \
+          | grep -iE 'skupper-netobs|netobs|network-observer' | grep -c Succeeded
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_observer_csv
+      until: rhsi_observer_csv.stdout | int > 0
+      retries: 30
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+      when:
+        - rhsi_install_observer | default(true)
+        - rhsi_observer_pkg.stdout | default('') | trim | length > 0
+
+    - name: Wait for Skupper Site CRD to be available
+      shell: oc get crd sites.skupper.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_crd_check
+      until: rhsi_crd_check.rc == 0
+      retries: 30
+      delay: 20
+
+    - name: Wait for skupper-operator CSV to succeed (best-effort)
+      shell: |
+        oc get csv -n {{ rhsi_operator_namespace }} \
+          -o jsonpath='{.items[?(@.spec.displayName=="Red Hat Service Interconnect")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: rhsi_csv_status
+      until: "'Succeeded' in rhsi_csv_status.stdout"
+      retries: 30
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 1 result
+      debug:
+        msg: |
+          RHSI operators installed on {{ cluster_name }} into {{ rhsi_operator_namespace }}
+          (AllNamespaces / cluster-wide - Sites can be created in any namespace):
+            - skupper-operator (channel {{ rhsi_channel }})
+            - Network Observer: {{ (rhsi_observer_pkg.stdout | default('') | trim) if (rhsi_observer_pkg.stdout | default('') | trim | length > 0) else 'not found in catalog (needs RHSI 2.1+) - skipped' }}{{ ' (channel ' + (rhsi_observer_ch.stdout | default('') | trim) + ')' if (rhsi_observer_ch.stdout | default('') | trim | length > 0) else '' }}
+
+# =============================================================================
+# Play 2: Install the CloudNativePG operator on each spoke
+# =============================================================================
+- name: "Play 2: Install the CloudNativePG operator on spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Create the CloudNativePG operator Subscription
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: {{ cnpg_package }}
+          namespace: {{ cnpg_operator_namespace }}
+        spec:
+          channel: {{ cnpg_channel }}
+          installPlanApproval: Automatic
+          name: {{ cnpg_package }}
+          source: {{ cnpg_catalog_source }}
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for the CNPG Cluster CRD to be available
+      shell: oc get crd clusters.postgresql.cnpg.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: cnpg_crd_check
+      until: cnpg_crd_check.rc == 0
+      retries: 30
+      delay: 20
+
+    - name: Wait for the CNPG operator CSV to succeed (best-effort)
+      shell: |
+        oc get csv -n {{ cnpg_operator_namespace }} \
+          -o jsonpath='{.items[?(@.spec.displayName=="{{ cnpg_csv_display_name }}")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: cnpg_csv_status
+      until: "'Succeeded' in cnpg_csv_status.stdout"
+      retries: 30
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 2 result
+      debug:
+        msg: "CloudNativePG operator installed on {{ cluster_name }} ({{ cnpg_package }}, channel {{ cnpg_channel }})"
+
+# =============================================================================
+# Play 3: Create the namespace + a Skupper Site on each spoke
+# =============================================================================
+- name: "Play 3: Create the postgres-dr namespace + RHSI Site on each spoke"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Ensure the CNPG/RHSI namespace exists
+      shell: |
+        oc apply -f {{ playbook_dir }}/app-cnpg/namespace.yaml
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create Skupper Site (linkAccess enabled)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: skupper.io/v2alpha1
+        kind: Site
+        metadata:
+          name: {{ rhsi_site_prefix }}-{{ cluster_name }}
+          namespace: {{ cnpg_namespace }}
+        spec:
+          linkAccess: default
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for Site to be Ready (best-effort)
+      shell: |
+        oc get site {{ rhsi_site_prefix }}-{{ cluster_name }} -n {{ cnpg_namespace }} \
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: site_ready
+      until: site_ready.stdout == "True"
+      retries: 30
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 3 result
+      debug:
+        msg: "RHSI Site {{ rhsi_site_prefix }}-{{ cluster_name }} created in {{ cnpg_namespace }} (Ready={{ site_ready.stdout | default('unknown') }})"
+
+# =============================================================================
+# Play 4: Create an AccessGrant on the primary spoke (link acceptor)
+# =============================================================================
+- name: "Play 4: Create AccessGrant on the primary spoke (link acceptor)"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: End host unless this is the primary spoke (link acceptor)
+      meta: end_host
+      when: cluster_name != spoke_clusters[0]
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Create AccessGrant on the primary spoke
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: skupper.io/v2alpha1
+        kind: AccessGrant
+        metadata:
+          name: {{ rhsi_grant_name }}
+          namespace: {{ cnpg_namespace }}
+        spec:
+          redemptionsAllowed: 1
+          expirationWindow: 60m
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for AccessGrant URL to be populated
+      shell: |
+        oc get accessgrant {{ rhsi_grant_name }} -n {{ cnpg_namespace }} \
+          -o jsonpath='{.status.url}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: grant_url
+      until: grant_url.stdout | trim | length > 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Read AccessGrant redemption code
+      shell: |
+        oc get accessgrant {{ rhsi_grant_name }} -n {{ cnpg_namespace }} \
+          -o jsonpath='{.status.code}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: grant_code
+      changed_when: false
+
+    - name: Read AccessGrant CA
+      shell: |
+        oc get accessgrant {{ rhsi_grant_name }} -n {{ cnpg_namespace }} \
+          -o jsonpath='{.status.ca}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: grant_ca
+      changed_when: false
+
+    - name: Stash grant values for the secondary spoke
+      set_fact:
+        rhsi_grant_url: "{{ grant_url.stdout }}"
+        rhsi_grant_code: "{{ grant_code.stdout }}"
+        rhsi_grant_ca: "{{ grant_ca.stdout }}"
+
+    - name: Display Play 4 result
+      debug:
+        msg: "AccessGrant {{ rhsi_grant_name }} ready on {{ cluster_name }} (url={{ rhsi_grant_url }})"
+
+# =============================================================================
+# Play 5: Redeem the token and form the Link on the secondary spoke
+# =============================================================================
+- name: "Play 5: Redeem token and form Link on the secondary spoke"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name')
+             | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name')
+             | list }}
+
+    - name: End host unless this is the secondary spoke (link connector)
+      meta: end_host
+      when: cluster_name != spoke_clusters[1]
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Fail if the primary spoke did not produce an AccessGrant
+      fail:
+        msg: >-
+          No AccessGrant values found on primary spoke {{ spoke_clusters[0] }}.
+          Ensure Play 4 completed (Site linkAccess + AccessGrant).
+      when: hostvars[spoke_clusters[0]].rhsi_grant_url is not defined
+
+  tasks:
+    - name: Write AccessToken manifest from the primary spoke's grant
+      copy:
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/rhsi-token.yaml"
+        content: |
+          apiVersion: skupper.io/v2alpha1
+          kind: AccessToken
+          metadata:
+            name: {{ rhsi_token_name }}
+            namespace: {{ cnpg_namespace }}
+          spec:
+            url: "{{ hostvars[spoke_clusters[0]].rhsi_grant_url }}"
+            code: "{{ hostvars[spoke_clusters[0]].rhsi_grant_code }}"
+            ca: |
+              {{ hostvars[spoke_clusters[0]].rhsi_grant_ca | trim | indent(4) }}
+      delegate_to: localhost
+
+    - name: Apply the AccessToken (redeem -> creates a Link)
+      shell: |
+        oc apply -f "{{ artifacts_dir }}/{{ cluster_name }}/rhsi-token.yaml"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for a Link to become active (best-effort)
+      shell: |
+        oc get link -n {{ cnpg_namespace }} \
+          -o jsonpath='{.items[0].status.conditions[?(@.type=="Operational")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: link_status
+      until: link_status.stdout == "True"
+      retries: 30
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 5 result
+      debug:
+        msg: >-
+          Link from {{ cluster_name }} to {{ spoke_clusters[0] }} formed
+          (Operational={{ link_status.stdout | default('unknown') }})
+
+# =============================================================================
+# Play 6: Hub - shared certs, sample app, pg-role labels, ACM policy engine
+# =============================================================================
+- name: "Play 6: Hub - side-load certs, deploy app, apply the CNPG/RHSI ACM policies"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    hub_kubeconfig: "{{ playbook_dir }}/artifacts/{{ cluster_name }}/kubeconfig"
+    cnpg_cert_dir: "{{ playbook_dir }}/artifacts/cnpg-certs"
+
+  pre_tasks:
+    - name: Run only on the hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate hub kubeconfig exists
+      stat:
+        path: "{{ hub_kubeconfig }}"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Require at least two spokes
+      fail:
+        msg: "CNPG cross-site DR needs 2 spokes; found: {{ spoke_clusters | join(', ') }}"
+      when: spoke_clusters | length < 2
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+    - name: Resolve active / standby spokes and site names
+      set_fact:
+        cnpg_active_cluster: "{{ cnpg_active | default(spoke_clusters[0], true) }}"
+        cnpg_standby_clusters: "{{ spoke_clusters | difference([cnpg_active | default(spoke_clusters[0], true)]) }}"
+        cnpg_site_a: "{{ managedcluster_names[spoke_clusters[0]] }}"
+        cnpg_site_b: "{{ managedcluster_names[spoke_clusters[1]] }}"
+
+    - name: Validate the chosen active spoke is a real spoke
+      fail:
+        msg: "cnpg_active='{{ cnpg_active_cluster }}' is not one of the spokes ({{ spoke_clusters | join(', ') }})."
+      when: cnpg_active_cluster not in spoke_clusters
+
+    - name: Show plan
+      debug:
+        msg: "CNPG-over-RHSI - active(primary)={{ cnpg_active_cluster }}, standby(replica)={{ cnpg_standby_clusters | join(', ') }}, ns={{ cnpg_namespace }}"
+
+  tasks:
+    # =========================================================================
+    # 1. Shared CA + streaming_replica client cert (generated once, reused across
+    #    re-runs). Both spokes get the SAME CA + cert so replication TLS works in
+    #    BOTH directions across switchovers. sslmode=verify-ca (not verify-full):
+    #    the replica dials the Skupper Listener DNS name pg-write, which is not in
+    #    the server cert SAN, so hostname verification must be off.
+    # =========================================================================
+    - name: Ensure the CNPG cert directory exists
+      file:
+        path: "{{ cnpg_cert_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+
+    # NOTE: the keys MUST be ECDSA in SEC1 PEM form ("BEGIN EC PRIVATE KEY").
+    # CNPG parses a bring-your-own CA with ParseECPrivateKey, which accepts only
+    # that block type - hand it a perfectly valid RSA/PKCS#8 key ("BEGIN PRIVATE
+    # KEY", which is what plain `openssl req -x509 -keyout` produces) and the
+    # Cluster never starts: it sits in "Unable to create required cluster objects"
+    # with `generating server TLS certificate: invalid private key PEM block type`.
+    # `openssl ecparam -genkey -noout` emits SEC1; `openssl genpkey -algorithm EC`
+    # would emit PKCS#8 and fail the same way.
+    - name: Generate the shared CA (EC key + cert)
+      shell: |
+        openssl ecparam -name prime256v1 -genkey -noout -out {{ cnpg_cert_dir }}/ca.key
+        openssl req -new -x509 -nodes -days 3650 -subj "/CN=cnpg-ca" \
+          -key {{ cnpg_cert_dir }}/ca.key -out {{ cnpg_cert_dir }}/ca.crt
+      args:
+        creates: "{{ cnpg_cert_dir }}/ca.crt"
+      delegate_to: localhost
+
+    - name: Generate the streaming_replica client cert signed by the shared CA
+      shell: |
+        openssl ecparam -name prime256v1 -genkey -noout -out {{ cnpg_cert_dir }}/tls.key
+        openssl req -new -nodes -subj "/CN=streaming_replica" \
+          -key {{ cnpg_cert_dir }}/tls.key -out {{ cnpg_cert_dir }}/tls.csr
+        openssl x509 -req -in {{ cnpg_cert_dir }}/tls.csr \
+          -CA {{ cnpg_cert_dir }}/ca.crt -CAkey {{ cnpg_cert_dir }}/ca.key -CAcreateserial \
+          -days 3650 -out {{ cnpg_cert_dir }}/tls.crt
+      args:
+        creates: "{{ cnpg_cert_dir }}/tls.crt"
+      delegate_to: localhost
+
+    - name: Generate a stable app DB password
+      shell: "openssl rand -hex 16 > {{ cnpg_cert_dir }}/app_password"
+      args:
+        creates: "{{ cnpg_cert_dir }}/app_password"
+      delegate_to: localhost
+
+    - name: Read the app DB password
+      slurp:
+        src: "{{ cnpg_cert_dir }}/app_password"
+      register: cnpg_app_pw_raw
+      delegate_to: localhost
+
+    - name: Set the app DB password fact
+      set_fact:
+        cnpg_app_pw: "{{ cnpg_app_pw_raw.content | b64decode | trim }}"
+
+    # =========================================================================
+    # 2. Side-load the shared secrets onto BOTH spokes (namespace was created in Play 3)
+    # =========================================================================
+    - name: Create the shared CA secret on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ cnpg_namespace }} \
+          create secret generic {{ cnpg_ca_secret }} \
+          --from-file=ca.crt={{ cnpg_cert_dir }}/ca.crt \
+          --from-file=ca.key={{ cnpg_cert_dir }}/ca.key \
+          --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f -
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Create the shared streaming_replica cert secret on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ cnpg_namespace }} \
+          create secret tls {{ cnpg_replication_secret }} \
+          --cert={{ cnpg_cert_dir }}/tls.crt --key={{ cnpg_cert_dir }}/tls.key \
+          --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f -
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Create the app basic-auth secret on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ cnpg_namespace }} \
+          create secret generic {{ cnpg_app_secret }} \
+          --type=kubernetes.io/basic-auth \
+          --from-literal=username={{ cnpg_db_owner }} \
+          --from-literal=password='{{ cnpg_app_pw }}' \
+          --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f -
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    # =========================================================================
+    # 3. Sample app on both spokes (SITE_NAME injected per spoke)
+    # =========================================================================
+    - name: Deploy the sample app on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f {{ playbook_dir }}/app-cnpg/pg-app.yaml
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Set the app SITE_NAME per spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ cnpg_namespace }} \
+          set env deployment/pg-app SITE_NAME={{ item }}
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    # =========================================================================
+    # 4. Failover control surface: pg-role labels + dr-clusters clusterset
+    # =========================================================================
+    # The roles are SEEDED once and then owned by whoever flips them. Re-labelling
+    # on every run would drag the Postgres primary back to cnpg_active_cluster the
+    # next time this playbook is run after a switchover - observed live: a re-run
+    # silently reverted an in-progress switchover back to the original site.
+    - name: Check whether the spokes already carry a {{ cnpg_role_label }} label
+      shell: |
+        oc get managedcluster -l {{ cnpg_role_label }} -o name 2>/dev/null | wc -l
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: cnpg_roles_present
+      changed_when: false
+
+    - name: Label the active spoke {{ cnpg_role_label }}=active (first run only)
+      shell: |
+        oc label managedcluster {{ managedcluster_names[cnpg_active_cluster] }} {{ cnpg_role_label }}=active --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      when: (cnpg_roles_present.stdout | trim | int) == 0
+
+    - name: Label standby spokes {{ cnpg_role_label }}=standby (first run only)
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} {{ cnpg_role_label }}=standby --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ cnpg_standby_clusters }}"
+      when: (cnpg_roles_present.stdout | trim | int) == 0
+
+    - name: Show the current {{ cnpg_role_label }} assignment
+      shell: |
+        oc get managedcluster -l {{ cnpg_role_label }} \
+          -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.{{ cnpg_role_label }}} {end}'
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: cnpg_role_state
+      changed_when: false
+
+    - name: Ensure spokes are in the dr-clusters ManagedClusterSet
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} \
+          cluster.open-cluster-management.io/clusterset={{ managed_cluster_set_name }} --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Bind the dr-clusters ManagedClusterSet to the policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ cnpg_policy_namespace }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    # =========================================================================
+    # 5. Seed the hub cnpg-dr-config ConfigMap (the cnpg-cluster policy reads
+    #    currentPrimary/promotionToken from here; the hub relay keeps it updated).
+    # =========================================================================
+    - name: Seed the cnpg-dr-config ConfigMap on the hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: cnpg-dr-config
+          namespace: {{ cnpg_policy_namespace }}
+        data:
+          activeSite: "{{ managedcluster_names[cnpg_active_cluster] }}"
+          currentPrimary: ""
+          promotionToken: ""
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    # =========================================================================
+    # 6. Render + apply the ACM policy engine
+    # =========================================================================
+    - name: Render the CNPG/RHSI ACM policy engine
+      template:
+        src: "{{ playbook_dir }}/templates/rhsi-cnpg-policy.yaml.j2"
+        dest: "{{ artifacts_dir }}/{{ cluster_name }}/rhsi-cnpg-policy.yaml"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Apply the CNPG/RHSI ACM policy engine
+      shell: |
+        oc apply -f {{ artifacts_dir }}/{{ cluster_name }}/rhsi-cnpg-policy.yaml
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Wait for the cnpg-fabric policy to be Compliant (best-effort)
+      shell: |
+        oc get policy cnpg-fabric -n {{ cnpg_policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: cnpg_policy_compliance
+      until: cnpg_policy_compliance.stdout == "Compliant"
+      retries: 60
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 6 result
+      debug:
+        msg: |
+          ============================================
+          CNPG cross-site Postgres over RHSI is up
+          ============================================
+          Namespace: {{ cnpg_namespace }} on {{ spoke_clusters | join(', ') }}
+          Primary (read-write): {{ cnpg_active_cluster }}   Replica (read-only): {{ cnpg_standby_clusters | join(', ') }}
+          Policy cnpg-fabric compliance: {{ cnpg_policy_compliance.stdout | default('unknown') }}
+
+          Watch the app (writes via the pg-write VAN key, reads the local endpoint):
+            oc --kubeconfig {{ artifacts_dir }}/{{ cnpg_active_cluster }}/kubeconfig logs -f deploy/pg-app -n {{ cnpg_namespace }}
+            oc --kubeconfig {{ artifacts_dir }}/{{ cnpg_standby_clusters[0] }}/kubeconfig logs -f deploy/pg-app -n {{ cnpg_namespace }}
+
+          Controlled switchover (flip read/write to the other site):
+            oc --kubeconfig {{ hub_kubeconfig }} label managedcluster {{ managedcluster_names[cnpg_standby_clusters[0]] }} {{ cnpg_role_label }}=active --overwrite
+            oc --kubeconfig {{ hub_kubeconfig }} label managedcluster {{ managedcluster_names[cnpg_active_cluster] }} {{ cnpg_role_label }}=standby --overwrite
+          The hub relay carries CNPG's demotionToken to the new primary (zero data loss);
+          the pg-write Connector follows. If the token relay stalls, promote manually with:
+            oc --kubeconfig {{ artifacts_dir }}/<new-primary>/kubeconfig cnpg promote {{ cnpg_cluster_name }} -n {{ cnpg_namespace }}

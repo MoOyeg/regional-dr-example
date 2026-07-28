@@ -1,0 +1,12 @@
+---
+# Dedicated namespace for the OADP auto-failover demo (use case 4).
+# Kept separate from vm-example (use case 1, Ramen-protected + GitOps-synced) so
+# the two DR engines never fight over the same VM: OADP's auto-failover deletes
+# and restores this VM, which would be undone by ArgoCD and would confuse Ramen.
+# Same split as use case 3's vm-example-volsync namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vm-example-oadp
+  labels:
+    app: vm-dr-example

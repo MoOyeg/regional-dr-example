@@ -21,7 +21,7 @@ aws_profile: "cluster1"
 # cluster_base_domain: example.com
 
 # OpenShift Version (Optional - defaults to group_vars openshift_version)
-# openshift_version: "4.21"
+# openshift_version: "4.22.5"
 
 # Cluster network CIDRs (Optional - override the OCP defaults in install-config).
 # Give Submariner-connected clusters NON-OVERLAPPING pod/service/machine ranges

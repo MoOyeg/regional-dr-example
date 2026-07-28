@@ -365,7 +365,7 @@
                 {Key=Name,Value={{ cluster_name }}},
                 {Key=cluster,Value={{ cluster_name }}},
                 {Key=region,Value={{ aws_deploy_region }}},
-                {Key=openshift-version,Value={{ openshift_version | default("4.21") }}},
+                {Key=openshift-version,Value={{ openshift_version | default("4.22.5") }}},
                 {Key=managed-by,Value=ansible}
               ]' \
               --region {{ aws_deploy_region }} \

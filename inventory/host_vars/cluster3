@@ -11,7 +11,9 @@ aws_profile: "cluster2"
 
 # AWS Configuration
 aws_region: "us-east-2"
-aws_availability_zone: "us-east-2a"
+# Metro DR: cluster3 sits in a second zone (us-east-2b) so cluster2 (2a) + cluster3 (2b)
+# are the two data zones of the stretched Ceph; the arbiter mon goes in us-east-2c.
+aws_availability_zone: "us-east-2b"
 aws_instance_type: "m5.2xlarge"
 aws_root_volume_size: 120
 control_plane_replicas: 3
@@ -49,4 +51,4 @@ machine_network_cidr: "10.1.0.0/16"
 # aws_route53_zone: "example.com"
 
 # OpenShift version
-openshift_version: "4.21"
+openshift_version: "4.22.5"

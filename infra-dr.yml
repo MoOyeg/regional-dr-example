@@ -366,8 +366,15 @@
       delay: 20
 
     - name: Wait for OCS Operator CSV to succeed (installed as ODF dependency)
+      # Anchored to ocs-operator. of a bare `grep -i ocs`: several CSVs match
+      # that (ocs-client-operator, ocs-metrics-exporter...), and since the test is
+      # only "is Succeeded anywhere in the output", the first of them to land let
+      # the play continue while ocs-operator - the one that owns the
+      # StorageCluster CRD - was still Installing.
       shell: |
-        oc get csv -n openshift-storage -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' | grep -i ocs
+        oc get csv -n openshift-storage \
+          -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' \
+          | grep -E '^ocs-operator\.'
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -375,6 +382,20 @@
       until: "'Succeeded' in ocs_csv_status.stdout"
       retries: 30
       delay: 20
+
+    - name: Wait for the StorageCluster CRD to be registered
+      # The real precondition for the apply below. A Succeeded CSV does not yet
+      # guarantee its CRDs are served, so assert the kind directly.
+      shell: |
+        oc get crd storageclusters.ocs.openshift.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: odf_storagecluster_crd
+      until: odf_storagecluster_crd.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
 
     # =========================================================================
     # Enable ODF Console plugin on spoke
@@ -400,9 +421,19 @@
     # Label Storage Nodes
     # =========================================================================
     - name: Label worker nodes for ODF storage
+      # Excludes infra nodes. The Submariner addon's dedicated gateway node is an
+      # infra node that also carries the worker role, so a bare `-l worker=`
+      # selector labelled it as a storage node too. On a single-AZ cluster ODF
+      # picks failureDomain=rack and hands every storage node a rack - including
+      # that one - and then a mon that must land in its rack can never schedule,
+      # because the node is tainted node-role.submariner.io/gateway and nothing
+      # in ODF tolerates it. The StorageCluster then sits in Progressing forever.
       shell: |
-        oc label nodes -l node-role.kubernetes.io/worker= \
+        oc label nodes -l 'node-role.kubernetes.io/worker=,!node-role.kubernetes.io/infra' \
           cluster.ocs.openshift.io/openshift-storage="" --overwrite
+        # Drop the label from any infra node that a previous run labelled
+        oc label nodes -l 'node-role.kubernetes.io/infra' \
+          cluster.ocs.openshift.io/openshift-storage- 2>/dev/null || true
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
@@ -420,12 +451,10 @@
           namespace: openshift-storage
         spec:
           manageNodes: false
-        {% if minimal_infra | default(false) | bool %}
-          # Minimal/SNO: one node can't satisfy replica-3 across separate hosts.
-          # flexibleScaling makes the failure domain "host" and lets Ceph place all
-          # OSDs on the single node (replica 1 device set, 3 OSDs). Not fault-tolerant.
-          flexibleScaling: true
-        {% endif %}
+          # Minimal/SNO only: flexibleScaling makes the failure domain the host so
+          # Ceph can place all OSDs on one node (replica-1 device set). Rendered as an
+          # inline expression, not a block tag, so the shell free-form parser accepts it.
+          {{ 'flexibleScaling: true' if (minimal_infra | default(false) | bool) else '' }}
           network:
             multiClusterService:
               clusterID: {{ cluster_name }}
@@ -481,7 +510,12 @@
     # (gp3-csi = RWO Filesystem), which is not live-migratable and breaks
     # cross-cluster live migration (the receiver disk ends up too small / Filesystem).
     # =========================================================================
-    - name: Wait for the virtualization StorageClass to be created by ODF
+    - name: Wait for the virtualization StorageClass to be created by ODF (best-effort)
+      # ODF only creates this class once OpenShift Virtualization is installed, and
+      # CNV is installed later, by `virt`. On a first build it therefore cannot
+      # exist yet - waiting hard for it here deadlocks infra-dr behind a step that
+      # runs after it. Best-effort here; setup-virt.yml makes it the default virt
+      # class once CNV is up.
       shell: |
         oc get storageclass {{ odf_virt_storage_class }} -o name
       environment:
@@ -489,11 +523,21 @@
       delegate_to: localhost
       register: virt_sc_present
       until: virt_sc_present.rc == 0
-      retries: 30
+      retries: 6
       delay: 10
+      failed_when: false
       changed_when: false
 
+    - name: Note that the virtualization StorageClass comes with CNV
+      debug:
+        msg: >-
+          {{ odf_virt_storage_class }} does not exist yet on {{ cluster_name }} -
+          ODF creates it once OpenShift Virtualization is installed. `virt` will
+          set it as the default virtualization StorageClass.
+      when: virt_sc_present.rc != 0
+
     - name: Clear default-virt-class annotation from any other StorageClass
+      when: virt_sc_present.rc == 0
       shell: |
         for sc in $(oc get storageclass \
           -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubevirt\.io/is-default-virt-class=="true")]}{.metadata.name}{"\n"}{end}'); do
@@ -506,6 +550,7 @@
       changed_when: false
 
     - name: Set {{ odf_virt_storage_class }} as the default virtualization StorageClass
+      when: virt_sc_present.rc == 0
       shell: |
         oc annotate storageclass {{ odf_virt_storage_class }} \
           storageclass.kubevirt.io/is-default-virt-class="true" --overwrite

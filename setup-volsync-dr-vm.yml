@@ -1,0 +1,255 @@
+---
+# =============================================================================
+# VolSync Direct DR - VM (Fedora) - Use case 3 (VM variant)
+# =============================================================================
+# Same label-flip (app-role) VolSync engine as setup-volsync-dr.yml, but for a
+# VirtualMachine: the vm-data-pvc data disk is synced spoke-to-spoke over rsync-tls
+# and the VM follows the app-role=active label via GitOps. Runs in the dedicated
+# `vm-example-volsync` namespace so it coexists with the Ramen-based use case 1.
+#
+# Extra prerequisite over the app variant: OpenShift Virtualization on the spokes
+# (`./ansible-runner.sh virt`). NOTE: written + syntax-checked, NOT yet run live.
+# =============================================================================
+- name: "VolSync Direct DR (VM): deploy + wire label-flip failover"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    hub_kubeconfig: "{{ playbook_dir }}/artifacts/{{ cluster_name }}/kubeconfig"
+    psk_secret_name: "volsync-rsync-tls-vm-data-pvc"
+    rd_service: "volsync-rsync-tls-dst-vm-data-volsync-destination-standby"
+
+  pre_tasks:
+    - name: Run only on the hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate hub kubeconfig exists
+      stat:
+        path: "{{ hub_kubeconfig }}"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+    - name: Resolve active / standby spokes
+      set_fact:
+        volsync_active_cluster: "{{ volsync_active | default(spoke_clusters[0]) }}"
+        volsync_standby_clusters: "{{ spoke_clusters | difference([volsync_active | default(spoke_clusters[0])]) }}"
+
+    - name: Validate the chosen active spoke is a real spoke
+      fail:
+        msg: "volsync_active='{{ volsync_active_cluster }}' is not one of the spokes ({{ spoke_clusters | join(', ') }})."
+      when: volsync_active_cluster not in spoke_clusters
+
+    - name: Show plan
+      debug:
+        msg: "VolSync VM DR — active={{ volsync_active_cluster }}, standby={{ volsync_standby_clusters | join(', ') }}, ns={{ volsync_vm_namespace }}"
+
+  tasks:
+    - name: Label the active spoke app-role=active
+      shell: |
+        oc label managedcluster {{ managedcluster_names[volsync_active_cluster] }} app-role=active --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Label standby spokes app-role=standby
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} app-role=standby --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ volsync_standby_clusters }}"
+
+    - name: Ensure spokes are in the dr-clusters ManagedClusterSet
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} \
+          cluster.open-cluster-management.io/clusterset={{ managed_cluster_set_name }} --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Install the VolSync addon on each spoke
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: addon.open-cluster-management.io/v1alpha1
+        kind: ManagedClusterAddOn
+        metadata:
+          name: volsync
+          namespace: {{ managedcluster_names[item] }}
+        spec:
+          installNamespace: volsync-system
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Wait for VolSync CRDs to appear on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get crd replicationsources.volsync.backube
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      register: volsync_crd_wait
+      until: volsync_crd_wait.rc == 0
+      retries: 30
+      delay: 20
+      changed_when: false
+
+    - name: Generate the rsync-tls pre-shared key
+      shell: 'echo "volsync:$(openssl rand -hex 32)"'
+      register: volsync_psk
+      changed_when: false
+      delegate_to: localhost
+
+    - name: Create namespace + data PVC on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply \
+          -f {{ playbook_dir }}/vm-app-volsync/namespace.yaml \
+          -f {{ playbook_dir }}/vm-app-volsync/vm-pvc.yaml
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Create the rsync-tls PSK secret on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig -n {{ volsync_vm_namespace }} \
+          create secret generic {{ psk_secret_name }} \
+          --from-literal=psk.txt='{{ volsync_psk.stdout }}' \
+          --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f -
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Export the destination rsync Service across the clusterset
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig apply -f - <<'EOF'
+        apiVersion: multicluster.x-k8s.io/v1alpha1
+        kind: ServiceExport
+        metadata:
+          name: {{ rd_service }}
+          namespace: {{ volsync_vm_namespace }}
+        EOF
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      when: volsync_use_submariner | default(true)
+
+    - name: Create the volsync-dr-config-vm ConfigMap on the hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: volsync-dr-config-vm
+          namespace: {{ volsync_policy_namespace }}
+        data:
+          submarinerEnabled: "{{ volsync_use_submariner | default(true) | string | lower }}"
+          serviceType: "{{ 'ClusterIP' if (volsync_use_submariner | default(true)) else 'LoadBalancer' }}"
+          storageClassName: "{{ volsync_storage_class }}"
+          volumeSnapshotClassName: "{{ volsync_snapshot_class }}"
+          address: "{{ rd_service }}.{{ volsync_vm_namespace }}.svc.clusterset.local"
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Bind the dr-clusters ManagedClusterSet to the policy + GitOps namespaces
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ item }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop:
+        - "{{ volsync_policy_namespace }}"
+        - "{{ gitops_namespace }}"
+
+    - name: Apply the VolSync VM automation policies
+      shell: |
+        oc apply -f {{ playbook_dir }}/acm-policy-volsync-vm.yaml
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Create the VM ApplicationSet (active spoke only)
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: argoproj.io/v1alpha1
+        kind: ApplicationSet
+        metadata:
+          name: fedora-volsync-appset
+          namespace: {{ gitops_namespace }}
+        spec:
+          generators:
+            - clusterDecisionResource:
+                configMapRef: acm-placement
+                labelSelector:
+                  matchLabels:
+                    cluster.open-cluster-management.io/placement: vm-placement-active
+                requeueAfterSeconds: 60
+          template:
+            metadata:
+              name: 'fedora-volsync-{% raw %}{{name}}{% endraw %}'
+            spec:
+              project: default
+              source:
+                repoURL: {{ app_git_url }}
+                targetRevision: {{ app_git_branch }}
+                path: vm-app-volsync/workload
+              destination:
+                server: '{% raw %}{{server}}{% endraw %}'
+                namespace: {{ volsync_vm_namespace }}
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                syncOptions:
+                  - CreateNamespace=true
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Show result + failover instructions
+      debug:
+        msg: |
+          ============================================
+          VolSync Direct DR (VM) deployed
+          ============================================
+          Active spoke:  {{ volsync_active_cluster }}  (VM + ReplicationSource)
+          Standby spoke: {{ volsync_standby_clusters | join(', ') }}  (ReplicationDestination)
+          Namespace:     {{ volsync_vm_namespace }}   RPO: {{ volsync_source_schedule }}
+
+          Verify:
+            oc --kubeconfig artifacts/{{ volsync_active_cluster }}/kubeconfig get vmi,replicationsource -n {{ volsync_vm_namespace }}
+            oc --kubeconfig artifacts/{{ volsync_standby_clusters[0] }}/kubeconfig get replicationdestination -n {{ volsync_vm_namespace }}
+
+          Fail over (label flip on the hub):
+            oc --kubeconfig artifacts/{{ cluster_name }}/kubeconfig label managedcluster {{ managedcluster_names[volsync_standby_clusters[0]] }} app-role=active --overwrite
+            oc --kubeconfig artifacts/{{ cluster_name }}/kubeconfig label managedcluster {{ managedcluster_names[volsync_active_cluster] }} app-role=standby --overwrite

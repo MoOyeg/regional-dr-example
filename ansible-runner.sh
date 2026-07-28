@@ -59,7 +59,7 @@ build_image() {
     if [ -f "Containerfile" ]; then
         # Extract openshift_version from group_vars for the container build
         local ocp_version
-        ocp_version=$(grep -E '^\s*openshift_version:' "$SCRIPT_DIR/inventory/group_vars/all.yml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "4.21")
+        ocp_version=$(grep -E '^\s*openshift_version:' "$SCRIPT_DIR/inventory/group_vars/all.yml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "4.22.5")
         print_info "Building with OpenShift version: $ocp_version"
         podman build --build-arg OPENSHIFT_VERSION="$ocp_version" -t "$IMAGE_NAME" -f Containerfile .
         print_info "Image built successfully"
@@ -153,6 +153,11 @@ Commands:
     virt            Deploy VM DR example (OpenShift Virtualization + Regional DR)
     cclm            Enable cross-cluster live migration between spokes (over Submariner)
     cclm-migrate    Live-migrate a running VM between spokes (KubeVirt decentralized LM)
+    rhsi            CNPG cross-site Postgres over Red Hat Service Interconnect (use case 5)
+    volsync-dr      VolSync Direct DR: label-flip (app-role) failover, no Ramen (use case 3)
+    oadp            OADP backup/restore: S3 bucket, DPA, backup + failover policies (use case 4)
+    oadp-backup     Back up a VM namespace to the OADP S3 bucket
+    oadp-restore    Restore a VM namespace from the OADP S3 bucket on another cluster
     test-failover   Test DR failover and failback for app instances
     validate        Validate configuration and credentials
     list            List configured clusters
@@ -164,7 +169,8 @@ Options:
     -v, --verbose       Verbose output
     --check             Run in check mode
     --yes               Skip confirmation prompts (for destroy command)
-    --destroy           Remove resources (for operators, import, infra-dr, certs commands)
+    --destroy           Remove resources (operators, import, infra-dr, certs, app, virt,
+                        cclm, rhsi, volsync-dr, oadp, netobserv, acs commands)
     --minimal           Minimal infra: SNO everywhere - large VM hub, bare-metal spokes
                         that double as their own Submariner gateways (deploy, infra-dr)
     -h, --help          Show this help message
@@ -194,6 +200,19 @@ Examples:
     $0 cclm                           # Enable cross-cluster live migration on both spokes
     $0 cclm --destroy                 # Disable CCLM (feature gate + external CA)
     $0 cclm-migrate -e cclm_vm=vm-dr-example -e cclm_from=cluster2 -e cclm_to=cluster3
+    $0 rhsi                           # CNPG primary/replica across spokes over RHSI - use case 5
+    $0 rhsi --destroy                 # Remove CNPG, RHSI Link/Sites, policies, and operators
+    $0 volsync-dr                     # VolSync Direct DR for the app (active=cluster2) - use case 3
+    $0 volsync-dr -e volsync_active=cluster3   # Deploy with cluster3 as the active spoke
+    $0 volsync-dr --vm                # VolSync Direct DR for the Fedora VM (run `$0 virt` first)
+    $0 volsync-dr --destroy           # Tear down the app VolSync DR (add --vm for the VM)
+    $0 oadp                           # OADP: S3 bucket + DPA on spokes, backup/auto-failover policies - use case 4
+    $0 oadp -e oadp_active=cluster3   # Seed cluster3 as the initially active spoke
+    $0 oadp -e oadp_autorestore_enabled=false   # Scheduled backups only, no auto-failover
+    $0 oadp-backup -e oadp_from=cluster2 -e oadp_backup_vm_namespace=vm-example
+    $0 oadp-restore -e oadp_to=cluster3 -e oadp_backup_name=vm-backup
+    $0 oadp --destroy                 # Remove OADP policies, DPA, demo VM (keeps the S3 bucket)
+    $0 oadp --destroy -e oadp_remove_bucket=true      # ...and delete the backup bucket too
     $0 test-failover                    # Test failover+failback for both app instances
     $0 test-failover -e instance=gitops # Test GitOps instance only
     $0 test-failover -e instance=direct # Test Direct instance only
@@ -411,6 +430,8 @@ VM DR Example Command (./ansible-runner.sh virt):
 
     What it does:
     1. Installs OpenShift Virtualization operator on spokes via ACM Policy
+       (and on the hub directly, unless virt_deploy_hub=false; the hub gets
+       no .metal MachineSet, so its CNV control plane runs but cannot host VMs)
     2. Waits for HyperConverged CR readiness on each spoke
     3. Deploys Fedora VM with persistent data disk via ArgoCD ApplicationSet
     4. Creates DRPlacementControl for VM failover/relocate
@@ -687,6 +708,76 @@ case "${1:-}" in
         build_image
         shift
         run_ansible "cclm-migrate.yml" "$@"
+        ;;
+
+    rhsi)
+        build_image
+        shift
+        # Check for --destroy flag and switch playbook
+        filtered_args=()
+        playbook="setup-rhsi.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-rhsi.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    volsync-dr)
+        build_image
+        shift
+        # VolSync Direct DR (use case 3): --vm selects the VM variant, --destroy tears down.
+        # Optionally pick the active spoke: -e volsync_active=cluster3
+        filtered_args=()
+        variant="app"
+        action="setup"
+        for arg in "$@"; do
+            if [ "$arg" = "--vm" ]; then
+                variant="vm"
+            elif [ "$arg" = "--destroy" ]; then
+                action="destroy"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        if [ "$variant" = "vm" ]; then
+            playbook="${action}-volsync-dr-vm.yml"
+        else
+            playbook="${action}-volsync-dr.yml"
+        fi
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    oadp)
+        build_image
+        shift
+        # OADP (use case 4): --destroy removes the policies, DPA and demo VM.
+        # The S3 bucket is kept unless -e oadp_remove_bucket=true is passed.
+        filtered_args=()
+        playbook="setup-oadp.yml"
+        for arg in "$@"; do
+            if [ "$arg" = "--destroy" ]; then
+                playbook="destroy-oadp.yml"
+            else
+                filtered_args+=("$arg")
+            fi
+        done
+        run_ansible "$playbook" "${filtered_args[@]}"
+        ;;
+
+    oadp-backup)
+        build_image
+        shift
+        run_ansible "oadp-backup.yml" "$@"
+        ;;
+
+    oadp-restore)
+        build_image
+        shift
+        run_ansible "oadp-restore.yml" "$@"
         ;;
 
     test-failover)

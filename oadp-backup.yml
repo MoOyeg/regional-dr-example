@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# oadp-backup.yml - Velero Backup of a VM namespace on the SOURCE spoke
+# =============================================================================
+# Backs up a VM's namespace (default vm-example) to the shared S3 bucket using
+# CSI snapshots + the data mover (snapshotMoveData), which is required because
+# CNV VM disks are volumeMode Block (the kopia file-system mover can't walk a
+# raw block device). The moved snapshot data lands in the bucket, so it can be
+# restored on the peer cluster with `oadp-restore`.
+#
+# Run against the source cluster, e.g.:
+#   ./ansible-runner.sh oadp-backup -e oadp_from=cluster2 \
+#       -e oadp_backup_vm_namespace=vm-example -e oadp_backup_name=vm-backup
+# =============================================================================
+
+- name: Back up a VM namespace with OADP
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    oadp_from: "cluster2"
+
+  pre_tasks:
+    - name: Run only on the source cluster ({{ oadp_from }})
+      meta: end_host
+      when: cluster_name != oadp_from
+
+  tasks:
+    - name: Create a Velero Backup of namespace {{ oadp_backup_vm_namespace }}
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: velero.io/v1
+        kind: Backup
+        metadata:
+          name: {{ oadp_backup_name }}
+          namespace: {{ oadp_namespace }}
+        spec:
+          includedNamespaces:
+            - {{ oadp_backup_vm_namespace }}
+          storageLocation: {{ oadp_bsl_name }}
+          snapshotMoveData: true          # CSI snapshot -> data mover -> S3 (Block disks)
+          ttl: 720h0m0s
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    # NOTE: backups.velero.io in full, never the `backup` short name - it is
+    # ambiguous and resolves to whichever CRD wins discovery. With use case 5
+    # installed that is backups.postgresql.cnpg.io (CNPG), and with ODF/Noobaa it
+    # can be backups.postgresql.cnpg.noobaa.io; either way this silently queries
+    # the wrong kind and reports "not found" for a backup that exists.
+    - name: Wait for the backup to reach a terminal phase
+      shell: |
+        oc get backups.velero.io {{ oadp_backup_name }} -n {{ oadp_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_backup_phase
+      # WaitingForPluginOperations[PartiallyFailed] is NOT terminal - the data mover
+      # is still uploading - so match phases exactly rather than by substring.
+      until: oadp_backup_phase.stdout in ['Completed', 'PartiallyFailed', 'Failed', 'FailedValidation']
+      retries: 80
+      delay: 15
+      failed_when: oadp_backup_phase.stdout in ['Failed', 'FailedValidation']
+
+    # failed_when above replaces the default rc/retry failure, so an exhausted
+    # `until` (or an `oc` that errors every time) would otherwise be reported as
+    # ok and the play would carry on with no backup at all. Assert explicitly.
+    - name: Fail if the backup never reached a terminal phase
+      fail:
+        msg: >-
+          Backup {{ oadp_backup_name }} did not reach a terminal phase
+          (last observed: '{{ oadp_backup_phase.stdout | default('') }}').
+      when: oadp_backup_phase.stdout not in ['Completed', 'PartiallyFailed']
+
+    - name: Read backup progress
+      shell: >
+        oc get backups.velero.io {{ oadp_backup_name }} -n {{ oadp_namespace }}
+        -o jsonpath='phase={.status.phase} items={.status.progress.itemsBackedUp}/{.status.progress.totalItems} warnings={.status.warnings} errors={.status.errors}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_backup_result
+      changed_when: false
+
+    - name: Backup summary
+      debug:
+        msg: |
+          ============================================
+          OADP Backup complete
+          ============================================
+          Backup:     {{ oadp_backup_name }}  ({{ oadp_backup_phase.stdout }})
+          Source:     {{ oadp_from }}   Namespace: {{ oadp_backup_vm_namespace }}
+          Progress:   {{ oadp_backup_result.stdout }}
+
+          Restore on the peer cluster with:
+            ./ansible-runner.sh oadp-restore -e oadp_to=<cluster> -e oadp_backup_name={{ oadp_backup_name }}

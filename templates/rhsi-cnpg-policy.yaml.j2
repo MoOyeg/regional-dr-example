@@ -1,0 +1,429 @@
+---
+# =============================================================================
+# CNPG cross-site Postgres over RHSI - ACM policy engine (use case 5)
+# =============================================================================
+# Rendered by setup-rhsi.yml (Play "hub") and applied on the hub. Structure mirrors
+# acm-policy-volsync-automate.yaml. Failover control surface = the `{{ cnpg_role_label }}`
+# ManagedCluster label (active|standby); flipping it is a CONTROLLED CNPG switchover.
+#
+# IMPORTANT (same reason as the old rhsi-vm template): this MUST stay a template
+# FILE, not an inline heredoc. Ansible renders Jinja with trim_blocks=True, so every
+# Go/ACM template expression (the hub templates and the lookup calls) is wrapped in
+# Jinja raw/endraw blocks; only Ansible vars are injected, in the endraw..raw gaps
+# (mostly as Go `$var := "..."` declarations at the top of each object-templates block).
+#
+# Policies:
+#   cnpg-fabric   (-> cnpg-placement-all, both spokes)
+#       * cnpg-cluster  : the CNPG Cluster `{{ cnpg_cluster_name }}` (NEVER pruned - it owns the data).
+#                         Role driven by a hub template: reads which spoke is
+#                         {{ cnpg_role_label }}=active, and gates promotion on the demotionToken
+#                         relayed via the hub cnpg-dr-config ConfigMap (controlled switchover).
+#       * cnpg-listener : a `{{ cnpg_write_key }}` Skupper Listener on BOTH spokes.
+#   cnpg-connector (-> cnpg-placement-active): a `{{ cnpg_write_key }}` Connector -> the local
+#                         primary. Pruned (DeleteIfCreated) when the spoke stops being active,
+#                         so the write path follows the primary on failover.
+#   cnpg-hub-relay (-> cnpg-placement-hub, local-cluster): ManagedClusterView per spoke over the
+#                         CNPG Cluster + aggregates activeSite / currentPrimary / promotionToken
+#                         into the hub cnpg-dr-config ConfigMap.
+#
+# GOTCHA (found live): a hub template (the hub-delimited kind) may NOT list cluster-scoped
+# resources - looking up ManagedCluster with an empty name fails with "lookup of
+# cluster-scoped resource 'ManagedCluster/' is not allowed", which makes the WHOLE template
+# fail to render, so its ConfigurationPolicy is never created on the spoke and the policy
+# just sits NonCompliant with the error buried in the REPLICATED policy's status in the
+# cluster namespace (not on the root policy, and no event). cnpg-fabric therefore reads
+# activeSite from the cnpg-dr-config ConfigMap - a NAMESPACED lookup in the policy's own
+# namespace, which is allowed. The same lookup IS fine in cnpg-hub-relay, because that runs
+# as an ordinary managed-cluster template on local-cluster, not as a hub template.
+#
+# Nothing in this header may contain Jinja delimiters: the header is outside the raw block,
+# so Ansible evaluates it, and a stray brace pair here fails the whole render.
+# =============================================================================
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: cnpg-fabric
+  namespace: {{ cnpg_policy_namespace }}
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-cluster
+        spec:
+          remediationAction: enforce
+          severity: high
+          # No pruneObjectBehavior: the CNPG Cluster owns the PVCs/data and must
+          # survive placement/label changes. Only spec.replica is ever patched.
+          object-templates-raw: |
+            {% raw %}{{hub- $ns := "{% endraw %}{{ cnpg_namespace }}{% raw %}" hub}}
+            {{hub- $cluster := "{% endraw %}{{ cnpg_cluster_name }}{% raw %}" hub}}
+            {{hub- $polns := "{% endraw %}{{ cnpg_policy_namespace }}{% raw %}" hub}}
+            {{hub- $writeKey := "{% endraw %}{{ cnpg_write_key }}{% raw %}" hub}}
+            {{hub- $port := "{% endraw %}{{ cnpg_pg_port }}{% raw %}" hub}}
+            {{hub- $instances := "{% endraw %}{{ cnpg_instances }}{% raw %}" hub}}
+            {{hub- $storageClass := "{% endraw %}{{ cnpg_storage_class }}{% raw %}" hub}}
+            {{hub- $storageSize := "{% endraw %}{{ cnpg_storage_size }}{% raw %}" hub}}
+            {{hub- $dbName := "{% endraw %}{{ cnpg_db_name }}{% raw %}" hub}}
+            {{hub- $dbOwner := "{% endraw %}{{ cnpg_db_owner }}{% raw %}" hub}}
+            {{hub- $caSecret := "{% endraw %}{{ cnpg_ca_secret }}{% raw %}" hub}}
+            {{hub- $replSecret := "{% endraw %}{{ cnpg_replication_secret }}{% raw %}" hub}}
+            {{hub- $appSecret := "{% endraw %}{{ cnpg_app_secret }}{% raw %}" hub}}
+            {{hub- $roleLabel := "{% endraw %}{{ cnpg_role_label }}{% raw %}" hub}}
+            {{hub- $siteA := "{% endraw %}{{ cnpg_site_a }}{% raw %}" hub}}
+            {{hub- $siteB := "{% endraw %}{{ cnpg_site_b }}{% raw %}" hub}}
+            {{hub- $self := .ManagedClusterName hub}}
+            {{hub- $peer := $siteB hub}}{{hub- if eq $self $siteB hub}}{{hub- $peer = $siteA hub}}{{hub- end hub}}
+            {{hub- $cfg := (lookup "v1" "ConfigMap" $polns "cnpg-dr-config").data hub}}
+            {{hub- $active := $siteA hub}}
+            {{hub- if $cfg hub}}{{hub- if ne ($cfg.activeSite | default "") "" hub}}{{hub- $active = $cfg.activeSite hub}}{{hub- end hub}}{{hub- end hub}}
+            {{hub- $cur := "" hub}}{{hub- $token := "" hub}}
+            {{hub- if $cfg hub}}{{hub- $cur = ($cfg.currentPrimary | default "") hub}}{{hub- $token = ($cfg.promotionToken | default "") hub}}{{hub- end hub}}
+            {{hub- $primary := $active hub}}{{hub- $usePromoToken := false hub}}
+            {{hub- if eq $self $active hub}}
+            {{hub-   if eq $cur $self hub}}{{hub- $primary = $self hub}}
+            {{hub-   else if ne $token "" hub}}{{hub- $primary = $self hub}}{{hub- $usePromoToken = true hub}}
+            {{hub-   else if eq $cur "" hub}}{{hub- $primary = $self hub}}
+            {{hub-   else hub}}{{hub- $primary = $cur hub}}
+            {{hub-   end hub}}
+            {{hub- end hub}}
+            {{hub- $isPrimary := eq $primary $self hub}}
+            {{hub- $source := $primary hub}}{{hub- if $isPrimary hub}}{{hub- $source = $peer hub}}{{hub- end hub}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: postgresql.cnpg.io/v1
+                kind: Cluster
+                metadata:
+                  name: {{hub $cluster hub}}
+                  namespace: {{hub $ns hub}}
+                spec:
+                  instances: {{hub $instances hub}}
+                  storage:
+                    size: {{hub $storageSize hub}}
+                    storageClass: {{hub $storageClass hub}}
+                  certificates:
+                    serverCASecret: {{hub $caSecret hub}}
+                    clientCASecret: {{hub $caSecret hub}}
+                    replicationTLSSecret: {{hub $replSecret hub}}
+                  # bootstrap is keyed on the SITE, never on the current role.
+                  # spec.bootstrap is immutable in CNPG (it only applies at creation),
+                  # so rendering it from the role means every switchover rewrites it
+                  # and the API rejects the WHOLE update - taking the replica.primary
+                  # change with it. The Cluster then never demotes, no demotionToken is
+                  # produced, and the switchover deadlocks with the ConfigurationPolicy
+                  # reporting "cannot be updated, likely due to immutable fields not
+                  # matching". Keyed by site the rendered spec is identical before and
+                  # after a flip, so the only things that change are replica.primary
+                  # and promotionToken - both mutable.
+                  bootstrap:
+            {{hub- if eq $self $siteA hub}}
+                    initdb:
+                      database: {{hub $dbName hub}}
+                      owner: {{hub $dbOwner hub}}
+                      secret:
+                        name: {{hub $appSecret hub}}
+            {{hub- else hub}}
+                    pg_basebackup:
+                      source: {{hub $siteA hub}}
+            {{hub- end hub}}
+                  replica:
+                    self: {{hub $self hub}}
+                    primary: {{hub $primary hub}}
+                    source: {{hub $source hub}}
+            {{hub- if $usePromoToken hub}}
+                    promotionToken: {{hub $token hub}}
+            {{hub- end hub}}
+                  externalClusters:
+                    - name: {{hub $siteA hub}}
+                      connectionParameters:
+                        host: {{hub $writeKey hub}}
+                        port: "{{hub $port hub}}"
+                        user: streaming_replica
+                        dbname: postgres
+                        sslmode: verify-ca
+                      sslRootCert:
+                        name: {{hub $caSecret hub}}
+                        key: ca.crt
+                      sslCert:
+                        name: {{hub $replSecret hub}}
+                        key: tls.crt
+                      sslKey:
+                        name: {{hub $replSecret hub}}
+                        key: tls.key
+                    - name: {{hub $siteB hub}}
+                      connectionParameters:
+                        host: {{hub $writeKey hub}}
+                        port: "{{hub $port hub}}"
+                        user: streaming_replica
+                        dbname: postgres
+                        sslmode: verify-ca
+                      sslRootCert:
+                        name: {{hub $caSecret hub}}
+                        key: ca.crt
+                      sslCert:
+                        name: {{hub $replSecret hub}}
+                        key: tls.crt
+                      sslKey:
+                        name: {{hub $replSecret hub}}
+                        key: tls.key
+{% endraw %}
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-listener
+        spec:
+          remediationAction: enforce
+          severity: high
+          pruneObjectBehavior: DeleteIfCreated
+          object-templates:
+            # A pg-write Skupper Listener on BOTH spokes: app writes and replica
+            # streaming dial pg-write:{{ cnpg_pg_port }} locally; Skupper's local-preference
+            # serves the active site's own primary, else crosses the Link.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: skupper.io/v2alpha1
+                kind: Listener
+                metadata:
+                  name: {{ cnpg_write_key }}
+                  namespace: {{ cnpg_namespace }}
+                  labels:
+                    app: pg-cnpg
+                spec:
+                  routingKey: {{ cnpg_write_key }}
+                  host: {{ cnpg_write_key }}
+                  port: {{ cnpg_pg_port }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: cnpg-connector
+  namespace: {{ cnpg_policy_namespace }}
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-connector
+        spec:
+          remediationAction: enforce
+          severity: high
+          pruneObjectBehavior: DeleteIfCreated
+          object-templates:
+            # Only on the ACTIVE spoke: publish the local CNPG primary under the
+            # pg-write routing key. When {{ cnpg_role_label }} flips, this spoke leaves
+            # cnpg-placement-active and the Connector is pruned, so the write path moves.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: skupper.io/v2alpha1
+                kind: Connector
+                metadata:
+                  name: {{ cnpg_write_key }}
+                  namespace: {{ cnpg_namespace }}
+                  labels:
+                    app: pg-cnpg
+                spec:
+                  routingKey: {{ cnpg_write_key }}
+                  selector: cnpg.io/cluster={{ cnpg_cluster_name }},cnpg.io/instanceRole=primary
+                  port: {{ cnpg_pg_port }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: cnpg-hub-relay
+  namespace: {{ cnpg_policy_namespace }}
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-token-views
+        spec:
+          remediationAction: enforce
+          severity: low
+          # Runs on local-cluster: one ManagedClusterView per participating spoke,
+          # scoped to the CNPG Cluster, so the hub can read its .status.
+          object-templates-raw: |
+            {% raw %}{{- $roleLabel := "{% endraw %}{{ cnpg_role_label }}{% raw %}" }}
+            {{- $cluster := "{% endraw %}{{ cnpg_cluster_name }}{% raw %}" }}
+            {{- $ns := "{% endraw %}{{ cnpg_namespace }}{% raw %}" }}
+            {{- range $mc := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if and (ne (index $mc.metadata.labels "name") "local-cluster") (index $mc.metadata.labels $roleLabel) }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: view.open-cluster-management.io/v1beta1
+                kind: ManagedClusterView
+                metadata:
+                  name: cnpg-cluster-view
+                  namespace: {{ $mc.metadata.name }}
+                  labels:
+                    app: pg-cnpg
+                    cnpg-role: cluster-view
+                spec:
+                  scope:
+                    name: {{ $cluster }}
+                    namespace: {{ $ns }}
+                    kind: Cluster
+                    apiGroup: postgresql.cnpg.io
+                    version: v1
+            {{- end }}
+            {{- end }}
+{% endraw %}
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: cnpg-token-aggregate
+        spec:
+          remediationAction: enforce
+          severity: low
+          # Aggregate the MCV results into the hub cnpg-dr-config ConfigMap:
+          #   activeSite      = the spoke labelled {{ cnpg_role_label }}=active
+          #   currentPrimary  = the spoke whose CNPG Cluster is (desired) primary; while a
+          #                     switchover is in flight the DEMOTED old primary (the one
+          #                     holding a demotionToken) is kept as currentPrimary so the
+          #                     new side waits for the token instead of force-failing over.
+          #   promotionToken  = the old primary's .status.demotionToken (empty when none)
+          object-templates-raw: |
+            {% raw %}{{- $roleLabel := "{% endraw %}{{ cnpg_role_label }}{% raw %}" }}
+            {{- $polns := "{% endraw %}{{ cnpg_policy_namespace }}{% raw %}" }}
+            {{- $active := "" }}
+            {{- range $mc := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if eq (index $mc.metadata.labels $roleLabel) "active" }}{{- $active = $mc.metadata.name }}{{- end }}
+            {{- end }}
+            {{- $cur := "" }}{{- $token := "" }}{{- $demoted := "" }}
+            {{- range $mcv := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" "" "").items }}
+            {{- if eq (index $mcv.metadata.labels "cnpg-role") "cluster-view" }}
+            {{- if $mcv.status.result }}
+            {{- $c := $mcv.status.result }}
+            {{- if and $c.status $c.status.demotionToken }}{{- $token = $c.status.demotionToken }}{{- $demoted = $mcv.metadata.namespace }}{{- end }}
+            {{- if $c.spec.replica }}
+            {{- $selfName := ($c.spec.replica.self | default $c.metadata.name) }}
+            {{- if eq $c.spec.replica.primary $selfName }}{{- $cur = $mcv.metadata.namespace }}{{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if ne $demoted "" }}{{- $cur = $demoted }}{{- end }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: cnpg-dr-config
+                  namespace: {{ $polns }}
+                data:
+                  activeSite: {{ $active | quote }}
+                  currentPrimary: {{ $cur | quote }}
+                  promotionToken: {{ $token | quote }}
+{% endraw %}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: cnpg-fabric-binding
+  namespace: {{ cnpg_policy_namespace }}
+placementRef:
+  name: cnpg-placement-all
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: cnpg-fabric
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: cnpg-connector-binding
+  namespace: {{ cnpg_policy_namespace }}
+placementRef:
+  name: cnpg-placement-active
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: cnpg-connector
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: cnpg-hub-relay-binding
+  namespace: {{ cnpg_policy_namespace }}
+placementRef:
+  name: cnpg-placement-hub
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: cnpg-hub-relay
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: cnpg-placement-all
+  namespace: {{ cnpg_policy_namespace }}
+spec:
+  clusterSets:
+    - {{ managed_cluster_set_name }}
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: {{ cnpg_role_label }}
+              operator: Exists
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: cnpg-placement-active
+  namespace: {{ cnpg_policy_namespace }}
+spec:
+  clusterSets:
+    - {{ managed_cluster_set_name }}
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: {{ cnpg_role_label }}
+              operator: In
+              values:
+                - active
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: cnpg-placement-hub
+  namespace: {{ cnpg_policy_namespace }}
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values:
+                - local-cluster

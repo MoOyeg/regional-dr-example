@@ -374,6 +374,40 @@
       changed_when: false
       ignore_errors: true
 
+    # =========================================================================
+    # Remove the directly-installed CNV operator from the hub (Play 4b in setup)
+    # =========================================================================
+    - name: Delete HyperConverged CR from hub
+      shell: |
+        oc delete hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+          --ignore-not-found --timeout=180s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: virt_deploy_hub | default(true)
+      ignore_errors: true
+
+    - name: Delete CNV Subscription and CSV from hub
+      shell: |
+        oc delete subscription kubevirt-hyperconverged -n openshift-cnv --ignore-not-found
+        for csv in $(oc get csv -n openshift-cnv -o name 2>/dev/null | grep -i kubevirt); do
+          oc delete "$csv" -n openshift-cnv --ignore-not-found
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: virt_deploy_hub | default(true)
+      ignore_errors: true
+
+    - name: Delete openshift-cnv namespace from hub
+      shell: |
+        oc delete namespace openshift-cnv --ignore-not-found --timeout=180s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: virt_deploy_hub | default(true)
+      ignore_errors: true
+
     - name: Display hub policy cleanup result
       debug:
         msg: |
@@ -381,6 +415,7 @@
           - Removed cnv=true labels from: {{ virt_clusters | join(', ') }}
           - Deleted metal MachineSet policy and ConfigMaps
           - Deleted policy namespace: {{ policy_namespace }}
+          {% if virt_deploy_hub | default(true) %}- Removed hub CNV operator (HyperConverged, Subscription/CSV, openshift-cnv namespace){% endif %}
           Note: CNV operator remains installed on spoke clusters.
           To fully remove the operator, delete the HyperConverged CR and
           Subscription/CSV on each spoke cluster manually.

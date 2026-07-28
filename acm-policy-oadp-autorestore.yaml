@@ -1,0 +1,830 @@
+---
+# =============================================================================
+# OADP automatic failover / auto-restore - use case 4 (ACM policies)
+# =============================================================================
+# Turns the label-driven OADP backups (acm-policy-oadp-schedule.yaml) into an
+# automatic recovery loop: if the protected VM stops being available on the
+# ACTIVE spoke, and it stays gone for the grace period (default 30s), the hub
+# hands the active role to the peer spoke, which restores the VM from the newest
+# backup in the shared S3 bucket - and then starts taking the scheduled backups
+# itself, so a failback is possible in the other direction.
+#
+# Control plane = ONE label on the ManagedCluster (independent of use case 3's
+# `app-role` and use case 5's `pg-role`):
+#
+#     oadp-role: active     the spoke that should be running the VM
+#     oadp-role: standby    the peer (holds no copy; the copy of record is S3)
+#
+#   Failover (automatic): the hub flips the label for you after the grace period.
+#   Failback (manual):    flip the label back, the policies do the rest -
+#       oc label managedcluster <back-to> oadp-role=active  --overwrite
+#       oc label managedcluster <other>   oadp-role=standby --overwrite
+#
+# Objects, and who owns them:
+#
+#   oadp-vm-autofailover-hub   (local-cluster) watches both spokes through a
+#       ManagedClusterView of the VM, runs the grace-period timer, publishes the
+#       oadp-dr-status ConfigMap, and flips the oadp-role labels.
+#   oadp-vm-restore-active     (oadp-role=active) restores the newest Completed
+#       backup when the VM is missing here and the hub says it is our turn,
+#       powers a freshly restored VM on, and un-pauses its Velero Schedule.
+#   oadp-vm-standby-cleanup    (oadp-role=standby) pauses the local Schedule and
+#       drops a stale local copy of the VM (+ the PVCs that VM uses) once the
+#       active site is confirmed up, so the next restore is not blocked by
+#       pre-existing PVCs holding stale data.
+#
+# Inputs come from the oadp-dr-config ConfigMap (written by setup-oadp.yml from
+# the group_vars defaults): vmName, vmNamespace, oadpNamespace, graceSeconds,
+# timerImage, standbyCleanup. oadp-dr-status is written by the hub policy.
+#
+# The 30s dwell is a Job that runs `sleep <graceSeconds>` on the hub: the timer
+# is created when the VM goes missing, deleted the moment it comes back, and
+# "elapsed" == the Job reaching completionTime. That keeps the timing in the
+# cluster (no date arithmetic in policy templates) and makes the countdown
+# visible: `oc -n open-cluster-management-global-set get job oadp-failover-timer`.
+#
+# Timing: grace period + up to ~25s of detection/evaluation latency (the
+# ManagedClusterView refreshes every 10s, the hub policy evaluates every 10-15s).
+# A whole-cluster outage (as opposed to the VM going away) is only detected when
+# ACM marks the ManagedCluster unavailable, which takes ~5 minutes of missed
+# leases - the VM-level signal is the fast path.
+# =============================================================================
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: oadp-vm-autofailover-hub
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/categories: CP Contingency Planning
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/controls: CP-10 System Recovery and Reconstitution
+spec:
+  disabled: false
+  remediationAction: enforce
+  policy-templates:
+    # ------------------------------------------------------------------------
+    # 1. A ManagedClusterView of the protected VM in every spoke that carries an
+    #    oadp-role label. This is how the hub sees whether the VM is up, without
+    #    needing credentials for the spokes. Views for clusters that lost the
+    #    label are pruned.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-hub-views
+        spec:
+          remediationAction: enforce
+          severity: low
+          pruneObjectBehavior: DeleteIfCreated
+          evaluationInterval:
+            compliant: 30s
+            noncompliant: 15s
+          object-templates-raw: |
+            {{- $cfg := (lookup "v1" "ConfigMap" "open-cluster-management-global-set" "oadp-dr-config").data }}
+            {{- if $cfg }}
+            {{- range $mc := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if $mc.metadata.labels }}
+            {{- if (index $mc.metadata.labels "oadp-role") }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: view.open-cluster-management.io/v1beta1
+                kind: ManagedClusterView
+                metadata:
+                  name: oadp-vm-view
+                  namespace: {{ $mc.metadata.name }}
+                  labels:
+                    oadp-dr: vm-view
+                spec:
+                  scope:
+                    apiGroup: kubevirt.io
+                    version: v1
+                    kind: VirtualMachine
+                    name: {{ $cfg.vmName }}
+                    namespace: {{ $cfg.vmNamespace }}
+                    updateIntervalSeconds: 10
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* Prune views left behind by a cluster that no longer takes part. */}}
+            {{- range $v := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" "" "").items }}
+            {{- if $v.metadata.labels }}
+            {{- if eq ((index $v.metadata.labels "oadp-dr") | default "") "vm-view" }}
+            {{- $keep := false }}
+            {{- range $mc := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if $mc.metadata.labels }}
+            {{- if (index $mc.metadata.labels "oadp-role") }}
+            {{- if eq $v.metadata.namespace $mc.metadata.name }}
+            {{- $keep = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if not $keep }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: view.open-cluster-management.io/v1beta1
+                kind: ManagedClusterView
+                metadata:
+                  name: {{ $v.metadata.name }}
+                  namespace: {{ $v.metadata.namespace }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+    # ------------------------------------------------------------------------
+    # 2. The decision loop: grace-period timer, status ConfigMap, role flip.
+    #
+    #    NOTE: no pruneObjectBehavior here on purpose. This template patches
+    #    ManagedCluster labels; DeleteIfCreated must never be attached to a
+    #    policy that touches ManagedClusters.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-failover-decision
+        spec:
+          remediationAction: enforce
+          severity: high
+          evaluationInterval:
+            compliant: 15s
+            noncompliant: 10s
+          object-templates-raw: |
+            {{- $ns := "open-cluster-management-global-set" }}
+            {{- $cfg := (lookup "v1" "ConfigMap" $ns "oadp-dr-config").data }}
+            {{- $st := (lookup "v1" "ConfigMap" $ns "oadp-dr-status").data }}
+            {{- if $cfg }}
+            {{- $grace := ($cfg.graceSeconds | default "30") }}
+            {{- $image := ($cfg.timerImage | default "registry.access.redhat.com/ubi9/ubi-minimal:latest") }}
+
+            {{- /* --- who is active / standby, and is that cluster reachable? --- */}}
+            {{- $active := "" }}
+            {{- $peer := "" }}
+            {{- $activeUp := false }}
+            {{- $peerUp := false }}
+            {{- range $mc := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if $mc.metadata.labels }}
+            {{- $role := ((index $mc.metadata.labels "oadp-role") | default "") }}
+            {{- $up := false }}
+            {{- if $mc.status }}
+            {{- range $c := ($mc.status.conditions | default list) }}
+            {{- if and (eq $c.type "ManagedClusterConditionAvailable") (eq $c.status "True") }}
+            {{- $up = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if eq $role "active" }}
+            {{- $active = $mc.metadata.name }}
+            {{- $activeUp = $up }}
+            {{- end }}
+            {{- if eq $role "standby" }}
+            {{- $peer = $mc.metadata.name }}
+            {{- $peerUp = $up }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- /* --- is the VM available on the active site? (view of the VM) ---
+                   A ManagedClusterView keeps its last successful result when a
+                   later fetch fails, so status.result on its own cannot tell
+                   "still there" from "gone". Any False condition on the view
+                   means the last fetch failed (the VM is not there any more) -
+                   testing the status rather than the condition type keeps this
+                   independent of the foundation's condition naming.
+            */}}
+            {{- $vmAvailable := false }}
+            {{- if ne $active "" }}
+            {{- $view := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" $active "oadp-vm-view") }}
+            {{- $viewFailed := false }}
+            {{- if $view.status }}
+            {{- range $c := ($view.status.conditions | default list) }}
+            {{- if eq $c.status "False" }}
+            {{- $viewFailed = true }}
+            {{- end }}
+            {{- end }}
+            {{- if not $viewFailed }}
+            {{- if $view.status.result }}
+            {{- if $view.status.result.status }}
+            {{- $ps := ($view.status.result.status.printableStatus | default "") }}
+            {{- if ($view.status.result.status.ready | default false) }}
+            {{- $vmAvailable = true }}
+            {{- end }}
+            {{- /* transient states are NOT an outage - never fail over mid-migration */}}
+            {{- if or (eq $ps "Starting") (eq $ps "Migrating") (eq $ps "Provisioning") (eq $ps "WaitingForVolumeBinding") }}
+            {{- $vmAvailable = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* a view of an unreachable cluster keeps its last result - treat it as an outage */}}
+            {{- if not $activeUp }}
+            {{- $vmAvailable = false }}
+            {{- end }}
+
+            {{- /* --- does the standby still hold a copy of the VM? --- */}}
+            {{- $peerHasVM := false }}
+            {{- if ne $peer "" }}
+            {{- $pview := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" $peer "oadp-vm-view") }}
+            {{- $pviewFailed := false }}
+            {{- if $pview.status }}
+            {{- range $c := ($pview.status.conditions | default list) }}
+            {{- if eq $c.status "False" }}
+            {{- $pviewFailed = true }}
+            {{- end }}
+            {{- end }}
+            {{- if not $pviewFailed }}
+            {{- if $pview.status.result }}
+            {{- if $pview.status.result.metadata }}
+            {{- $peerHasVM = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- /* --- carried state (this policy is the only writer of oadp-dr-status) --- */}}
+            {{- $everSeen := false }}
+            {{- $done := false }}
+            {{- $lastTo := "" }}
+            {{- if $st }}
+            {{- if eq (($st.vmEverSeen) | default "false") "true" }}
+            {{- $everSeen = true }}
+            {{- end }}
+            {{- if eq (($st.autoFailoverDone) | default "false") "true" }}
+            {{- $done = true }}
+            {{- end }}
+            {{- $lastTo = (($st.lastFailoverTo) | default "") }}
+            {{- end }}
+            {{- if $vmAvailable }}
+            {{- $everSeen = true }}
+            {{- /* the VM is up on the active site again: re-arm for the next outage */}}
+            {{- $done = false }}
+            {{- end }}
+
+            {{- /* --- should the grace-period timer be running? ---
+                   Every guard here exists to stop a failover loop:
+                     everSeen      - never fail over a VM that was never created
+                     not done      - one automatic flip per outage, no ping-pong
+                                     while the new active site is restoring
+                     not peerHasVM - the peer still holding the VM means a manual
+                                     failback is in flight, not an outage
+                     peerUp        - never hand the role to an unreachable cluster
+            */}}
+            {{- $wantTimer := false }}
+            {{- if and (ne $active "") (ne $peer "") }}
+            {{- if and $everSeen (not $vmAvailable) }}
+            {{- if and (not $done) (and $peerUp (not $peerHasVM)) }}
+            {{- $wantTimer = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- $timer := (lookup "v1" "Pod" $ns "oadp-failover-timer") }}
+            {{- $timerState := "none" }}
+            {{- if $timer.metadata }}
+            {{- $timerState = "running" }}
+            {{- if $timer.status }}
+            {{- if eq ($timer.status.phase | default "") "Succeeded" }}
+            {{- $timerState = "complete" }}
+            {{- end }}
+            {{- if eq ($timer.status.phase | default "") "Failed" }}
+            {{- $timerState = "failed" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- $flip := false }}
+            {{- if and $wantTimer (eq $timerState "complete") }}
+            {{- $flip = true }}
+            {{- $lastTo = $peer }}
+            {{- end }}
+
+            {{- /* --- may the active site restore the VM into itself? ---
+                   Only after it has been handed the role (autoFailoverDone) or
+                   while the peer still holds the previous copy (manual failback).
+                   Otherwise deleting the VM on the active site would just be
+                   healed in place and would never fail over to the peer.
+                   Computed from pre-flip state so the OUTGOING active can never
+                   act on it in the same cycle as the label flip.
+            */}}
+            {{- $restoreOnActive := false }}
+            {{- if and (ne $active "") (not $vmAvailable) }}
+            {{- if or $done $peerHasVM }}
+            {{- $restoreOnActive = true }}
+            {{- end }}
+            {{- end }}
+
+            {{- /* ------------------------- act ------------------------- */}}
+            {{- /* The dwell is a bare Pod, not a Job, and deliberately so. A Job's
+                   pods are orphaned when the Job is deleted (batch/v1 defaults to
+                   OrphanDependents), and a ConfigurationPolicy can only delete what
+                   it can name - a nameless mustnothave matched on labels is DETECTED
+                   but never deleted, so those orphans pin the policy NonCompliant
+                   forever. A named Pod is created and deleted cleanly by name. */}}
+            {{- if $wantTimer }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  name: oadp-failover-timer
+                  namespace: {{ $ns }}
+                  labels:
+                    oadp-dr: failover-timer
+                spec:
+                  restartPolicy: Never
+                  containers:
+                    - name: timer
+                      image: {{ $image }}
+                      command: ["sleep", "{{ $grace }}"]
+                      resources:
+                        requests:
+                          cpu: 10m
+                          memory: 32Mi
+                      securityContext:
+                        allowPrivilegeEscalation: false
+                        runAsNonRoot: true
+                        capabilities:
+                          drop: ["ALL"]
+                        seccompProfile:
+                          type: RuntimeDefault
+            {{- else }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  name: oadp-failover-timer
+                  namespace: {{ $ns }}
+            {{- end }}
+
+            {{- if $flip }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: cluster.open-cluster-management.io/v1
+                kind: ManagedCluster
+                metadata:
+                  name: {{ $peer }}
+                  labels:
+                    oadp-role: active
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: cluster.open-cluster-management.io/v1
+                kind: ManagedCluster
+                metadata:
+                  name: {{ $active }}
+                  labels:
+                    oadp-role: standby
+            {{- end }}
+
+            {{- /* Written last: if the flip above fails, autoFailoverDone is not
+                   recorded and the next evaluation retries it. */}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: oadp-dr-status
+                  namespace: {{ $ns }}
+                data:
+                  activeSite: "{{ $active }}"
+                  standbySite: "{{ $peer }}"
+                  activeClusterAvailable: "{{ $activeUp }}"
+                  standbyClusterAvailable: "{{ $peerUp }}"
+                  vmAvailable: "{{ $vmAvailable }}"
+                  standbyHasVM: "{{ $peerHasVM }}"
+                  vmEverSeen: "{{ $everSeen }}"
+                  timerState: "{{ $timerState }}"
+                  failoverArmed: "{{ eq $timerState "complete" }}"
+                  autoFailoverDone: "{{ or $done $flip }}"
+                  restoreOnActive: "{{ $restoreOnActive }}"
+                  lastFailoverTo: "{{ $lastTo }}"
+            {{- end }}
+---
+# =============================================================================
+# On the ACTIVE spoke: restore the VM when it is missing here and the hub says
+# it is our turn, power a freshly restored VM on, and resume its backups.
+# =============================================================================
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: oadp-vm-restore-active
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/categories: CP Contingency Planning
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/controls: CP-10 System Recovery and Reconstitution
+spec:
+  disabled: false
+  remediationAction: enforce
+  policy-templates:
+    # ------------------------------------------------------------------------
+    # 1. Restore the newest Completed backup of the protected VM.
+    #    Velero on this spoke has already synced the backup metadata from the
+    #    shared BackupStorageLocation, so the backups taken on the peer are
+    #    visible here; the data mover rehydrates the Block PVCs from S3.
+    #    The Restore is named after the backup, so re-evaluating the policy
+    #    never starts a second restore of the same backup.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-autorestore
+        spec:
+          remediationAction: enforce
+          severity: high
+          evaluationInterval:
+            compliant: 30s
+            noncompliant: 10s
+          object-templates-raw: |
+            {{- $vmName := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmName" hub}}" }}
+            {{- $vmNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmNamespace" hub}}" }}
+            {{- $adpNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "oadpNamespace" hub}}" }}
+            {{- $ourTurn := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-status" "restoreOnActive" hub}}" }}
+            {{- if eq $ourTurn "true" }}
+            {{- $vm := (lookup "kubevirt.io/v1" "VirtualMachine" $vmNs $vmName) }}
+            {{- if not $vm.metadata }}
+            {{- $sched := printf "%s-scheduled-backup" $vmName }}
+            {{- $best := "" }}
+            {{- $bestTS := "" }}
+            {{- range $b := (lookup "velero.io/v1" "Backup" $adpNs "").items }}
+            {{- $match := false }}
+            {{- if $b.metadata.labels }}
+            {{- if eq ((index $b.metadata.labels "velero.io/schedule-name") | default "") $sched }}
+            {{- $match = true }}
+            {{- end }}
+            {{- if eq ((index $b.metadata.labels "oadp-backup-vm") | default "") $vmName }}
+            {{- $match = true }}
+            {{- end }}
+            {{- end }}
+            {{- if $match }}
+            {{- if $b.status }}
+            {{- $ph := ($b.status.phase | default "") }}
+            {{- if or (eq $ph "Completed") (eq $ph "PartiallyFailed") }}
+            {{- $ts := ($b.status.completionTimestamp | default "") }}
+            {{- /* RFC3339 UTC sorts correctly as a string */}}
+            {{- if gt $ts $bestTS }}
+            {{- $best = $b.metadata.name }}
+            {{- $bestTS = $ts }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if ne $best "" }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: velero.io/v1
+                kind: Restore
+                metadata:
+                  name: {{ $best }}-restore
+                  namespace: {{ $adpNs }}
+                  labels:
+                    oadp-autorestore-vm: {{ $vmName }}
+                spec:
+                  backupName: {{ $best }}
+                  restorePVs: true
+                  existingResourcePolicy: update
+            {{- end }}
+            {{- end }}
+            {{- end }}
+    # ------------------------------------------------------------------------
+    # 2. Power on a VM that OADP just restored (Velero stamps restored objects
+    #    with velero.io/restore-name). Only a restored VM is started, so a VM
+    #    that an admin stopped on the active site is left alone - and stays a
+    #    valid failover trigger.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-start-restored
+        spec:
+          remediationAction: enforce
+          severity: medium
+          evaluationInterval:
+            compliant: 30s
+            noncompliant: 15s
+          object-templates-raw: |
+            {{- $vmName := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmName" hub}}" }}
+            {{- $vmNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmNamespace" hub}}" }}
+            {{- $vm := (lookup "kubevirt.io/v1" "VirtualMachine" $vmNs $vmName) }}
+            {{- if $vm.metadata }}
+            {{- if $vm.metadata.labels }}
+            {{- if (index $vm.metadata.labels "velero.io/restore-name") }}
+            {{- $ps := "" }}
+            {{- if $vm.status }}
+            {{- $ps = ($vm.status.printableStatus | default "") }}
+            {{- end }}
+            {{- if eq $ps "Stopped" }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: kubevirt.io/v1
+                kind: VirtualMachine
+                metadata:
+                  name: {{ $vmName }}
+                  namespace: {{ $vmNs }}
+                spec:
+            {{- /* running and runStrategy are mutually exclusive - patch whichever the VM uses */}}
+            {{- if $vm.spec.runStrategy }}
+                  runStrategy: Always
+            {{- else }}
+                  running: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+    # ------------------------------------------------------------------------
+    # 3. Run the VM's Velero Schedule here, but ONLY while the VM is actually up.
+    #
+    #    The schedule itself is created by acm-policy-oadp-schedule.yaml off the
+    #    oadp-backup label, which the restored VM carries with it - and it is
+    #    created as soon as the VM OBJECT lands, which during a failover is well
+    #    before the data mover has finished rehydrating its PVC. Left unpaused it
+    #    fires mid-restore and produces a backup of a half-written disk that is
+    #    NEWER than the good one, which the restore side would then prefer on the
+    #    next failover. So the schedule stays paused until the VM reports ready.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-schedule-resume
+        spec:
+          remediationAction: enforce
+          severity: low
+          evaluationInterval:
+            compliant: 30s
+            noncompliant: 15s
+          object-templates-raw: |
+            {{- $vmName := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmName" hub}}" }}
+            {{- $vmNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmNamespace" hub}}" }}
+            {{- $adpNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "oadpNamespace" hub}}" }}
+            {{- $vm := (lookup "kubevirt.io/v1" "VirtualMachine" $vmNs $vmName) }}
+            {{- $ready := false }}
+            {{- if $vm.metadata }}
+            {{- if $vm.status }}
+            {{- if ($vm.status.ready | default false) }}
+            {{- $ready = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range $s := (lookup "velero.io/v1" "Schedule" $adpNs "").items }}
+            {{- if $s.metadata.labels }}
+            {{- if eq ((index $s.metadata.labels "oadp-backup-vm") | default "") $vmName }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: velero.io/v1
+                kind: Schedule
+                metadata:
+                  name: {{ $s.metadata.name }}
+                  namespace: {{ $adpNs }}
+                spec:
+                  paused: {{ if $ready }}false{{ else }}true{{ end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+---
+# =============================================================================
+# On the STANDBY spoke: stop backing up from here, and drop a stale local copy
+# of the VM once the active site is confirmed running it.
+#
+# Why the copy has to go: Velero will not re-hydrate a PVC that already exists
+# (existingResourcePolicy only updates metadata), so a leftover vm-data-pvc from
+# an earlier role would silently be reused - with stale data - the next time
+# this cluster takes over. Deletion is scoped to the configured VM and the PVCs
+# that VM actually references, is gated on a Completed backup existing locally,
+# and can be switched off entirely with standbyCleanup=false in oadp-dr-config.
+# =============================================================================
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: oadp-vm-standby-cleanup
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/categories: CP Contingency Planning
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/controls: CP-9 System Backup
+spec:
+  disabled: false
+  remediationAction: enforce
+  policy-templates:
+    # ------------------------------------------------------------------------
+    # 1. Pause the local Schedule: only the active site should be producing
+    #    backups, otherwise a stale copy here keeps writing newer backups than
+    #    the live VM and would poison the next restore.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-schedule-pause
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- $vmName := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmName" hub}}" }}
+            {{- $adpNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "oadpNamespace" hub}}" }}
+            {{- range $s := (lookup "velero.io/v1" "Schedule" $adpNs "").items }}
+            {{- if $s.metadata.labels }}
+            {{- if eq ((index $s.metadata.labels "oadp-backup-vm") | default "") $vmName }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: velero.io/v1
+                kind: Schedule
+                metadata:
+                  name: {{ $s.metadata.name }}
+                  namespace: {{ $adpNs }}
+                spec:
+                  paused: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
+    # ------------------------------------------------------------------------
+    # 2. Drop the stale copy (VM + the PVCs it uses) once the hub reports the
+    #    VM available on the active site.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-standby-drop-stale-copy
+        spec:
+          remediationAction: enforce
+          severity: medium
+          evaluationInterval:
+            compliant: 30s
+            noncompliant: 15s
+          object-templates-raw: |
+            {{- $vmName := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmName" hub}}" }}
+            {{- $vmNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "vmNamespace" hub}}" }}
+            {{- $adpNs := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "oadpNamespace" hub}}" }}
+            {{- $cleanup := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-config" "standbyCleanup" hub}}" }}
+            {{- $activeVMUp := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-status" "vmAvailable" hub}}" }}
+            {{- $activeSite := "{{hub fromConfigMap "open-cluster-management-global-set" "oadp-dr-status" "activeSite" hub}}" }}
+            {{- $me := "{{hub .ManagedClusterName hub}}" }}
+            {{- /* activeSite must be someone ELSE before any of this is believable.
+                   Right after a role flip the placement moves this policy to the new
+                   standby a cycle before the hub rewrites oadp-dr-status, so for one
+                   evaluation the status still describes THIS cluster as the active
+                   one - and vmAvailable=true is then a statement about our own VM.
+                   Acting on it deletes the running copy before the new active site
+                   has restored anything, which drops the standbyHasVM guard and lets
+                   the hub arm a failover straight back: a real ping-pong, observed
+                   live. Comparing activeSite to our own name closes that window. */}}
+            {{- if and (eq $cleanup "true") (and (eq $activeVMUp "true") (ne $activeSite $me)) }}
+            {{- /* interlock: never drop a copy unless a restorable backup is here */}}
+            {{- $sched := printf "%s-scheduled-backup" $vmName }}
+            {{- $haveBackup := false }}
+            {{- range $b := (lookup "velero.io/v1" "Backup" $adpNs "").items }}
+            {{- $match := false }}
+            {{- if $b.metadata.labels }}
+            {{- if eq ((index $b.metadata.labels "velero.io/schedule-name") | default "") $sched }}
+            {{- $match = true }}
+            {{- end }}
+            {{- if eq ((index $b.metadata.labels "oadp-backup-vm") | default "") $vmName }}
+            {{- $match = true }}
+            {{- end }}
+            {{- end }}
+            {{- if $match }}
+            {{- if $b.status }}
+            {{- $ph := ($b.status.phase | default "") }}
+            {{- if or (eq $ph "Completed") (eq $ph "PartiallyFailed") }}
+            {{- $haveBackup = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if $haveBackup }}
+            {{- /* A stale VM object only exists if this site lost the role while
+                   still running the VM (a manual failback). It is absent when the
+                   failover was triggered by the VM being deleted. */}}
+            {{- $vm := (lookup "kubevirt.io/v1" "VirtualMachine" $vmNs $vmName) }}
+            {{- if $vm.metadata }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: kubevirt.io/v1
+                kind: VirtualMachine
+                metadata:
+                  name: {{ $vmName }}
+                  namespace: {{ $vmNs }}
+            {{- end }}
+            {{- /* Every PVC in the VM's namespace, whether or not the VM object is
+                   still around: deleting the VM leaves its disks behind, and Velero
+                   will NOT re-hydrate a PVC that already exists - it only updates
+                   metadata - so a leftover disk would silently be reused with stale
+                   data the next time this cluster took over. This namespace belongs
+                   to the OADP demo VM alone (vm-app-oadp/), which is why deleting
+                   its PVCs wholesale is safe. Deletes issued alongside the VM delete
+                   block on the protection finalizer until the virt-launcher pod
+                   goes away, then complete on their own. */}}
+            {{- range $p := (lookup "v1" "PersistentVolumeClaim" $vmNs "").items }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: PersistentVolumeClaim
+                metadata:
+                  name: {{ $p.metadata.name }}
+                  namespace: {{ $vmNs }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+---
+# =============================================================================
+# Placements + bindings
+# =============================================================================
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: oadp-placement-hub
+  namespace: open-cluster-management-global-set
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values:
+                - local-cluster
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: oadp-placement-active
+  namespace: open-cluster-management-global-set
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: oadp-role
+              operator: In
+              values:
+                - active
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: oadp-placement-standby
+  namespace: open-cluster-management-global-set
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: oadp-role
+              operator: In
+              values:
+                - standby
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-oadp-vm-autofailover-hub
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: oadp-placement-hub
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: oadp-vm-autofailover-hub
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-oadp-vm-restore-active
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: oadp-placement-active
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: oadp-vm-restore-active
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-oadp-vm-standby-cleanup
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: oadp-placement-standby
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: oadp-vm-standby-cleanup
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

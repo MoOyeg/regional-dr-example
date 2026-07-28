@@ -51,4 +51,4 @@ aws_create_eip: true
 #aws_route53_zone: "example.com"
 
 # OpenShift version
-openshift_version: "4.21"
+openshift_version: "4.22.5"

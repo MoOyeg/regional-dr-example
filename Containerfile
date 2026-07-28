@@ -1,4 +1,4 @@
-ARG OPENSHIFT_VERSION=4.21
+ARG OPENSHIFT_VERSION=4.22.5
 
 FROM registry.access.redhat.com/ubi9/ubi:latest
 
@@ -27,13 +27,13 @@ RUN ansible-galaxy collection install \
 
 # Install OpenShift CLI (oc)
 ARG OPENSHIFT_VERSION
-RUN wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${OPENSHIFT_VERSION}/openshift-client-linux.tar.gz && \
+RUN wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OPENSHIFT_VERSION}/openshift-client-linux.tar.gz && \
     tar -xzf openshift-client-linux.tar.gz -C /usr/local/bin/ && \
     rm openshift-client-linux.tar.gz && \
     chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
 
 # Install OpenShift Installer
-RUN wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${OPENSHIFT_VERSION}/openshift-install-linux.tar.gz && \
+RUN wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OPENSHIFT_VERSION}/openshift-install-linux.tar.gz && \
     tar -xzf openshift-install-linux.tar.gz -C /usr/local/bin/ && \
     rm openshift-install-linux.tar.gz && \
     chmod +x /usr/local/bin/openshift-install

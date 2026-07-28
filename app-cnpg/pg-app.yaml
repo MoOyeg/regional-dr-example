@@ -1,0 +1,90 @@
+---
+# Sample app for the CNPG-over-RHSI demo (use case 5). Deployed on BOTH spokes.
+#
+# It is a psql read/write loop (observe it with `oc logs deploy/pg-app -n postgres-dr`):
+#   * WRITE a heartbeat row to WRITE_HOST (pg-write) — the ONLY cross-VAN routing key.
+#     Skupper routes it to whichever spoke currently holds the CNPG primary (local on
+#     the active site, across the Link on the standby site), so ALL writes land on the
+#     one primary and replicate back.
+#   * READ from READ_HOST (pg-r) — the LOCAL any-instance Service (no VAN). The line
+#     `local_is_replica=<t|f>` shows this site's role: f = read-write (primary),
+#     t = read-only (streaming replica). After an ACM `pg-role` failover the two flip.
+#
+# SITE_NAME (which spoke this pod runs on) is injected per-spoke by setup-rhsi.yml via
+# `oc set env`, so the heartbeat rows show which site issued each write.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-app
+  namespace: postgres-dr
+  labels:
+    app: pg-cnpg
+    component: pg-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg-cnpg
+      component: pg-app
+  template:
+    metadata:
+      labels:
+        app: pg-cnpg
+        component: pg-app
+    spec:
+      containers:
+        - name: pg-app
+          image: quay.io/sclorg/postgresql-16-c9s:latest
+          env:
+            - name: WRITE_HOST
+              value: pg-write
+            - name: READ_HOST
+              value: pg-r
+            - name: PGPORT
+              value: "5432"
+            - name: DB_NAME
+              value: appdb
+            - name: HOME
+              value: /tmp
+            - name: PGCONNECT_TIMEOUT
+              value: "5"
+            - name: SITE_NAME
+              value: unknown
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: cnpg-app-secret
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cnpg-app-secret
+                  key: password
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -u
+              echo "pg-app site=${SITE_NAME}: write->${WRITE_HOST}:${PGPORT} read->${READ_HOST}:${PGPORT} db=${DB_NAME}"
+              # Ensure the heartbeat table exists on the primary (idempotent; via the pg-write VAN key).
+              until psql -h "$WRITE_HOST" -p "$PGPORT" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
+                    -c "CREATE TABLE IF NOT EXISTS heartbeat (id bigserial PRIMARY KEY, site text NOT NULL, ts timestamptz NOT NULL DEFAULT now());" ; do
+                echo "[init] primary not reachable yet via ${WRITE_HOST}; retrying in 10s"; sleep 10
+              done
+              while true; do
+                echo "----- $(date -u +%FT%TZ) site=${SITE_NAME} -----"
+                psql -h "$WRITE_HOST" -p "$PGPORT" -d "$DB_NAME" \
+                  -c "INSERT INTO heartbeat(site) VALUES ('${SITE_NAME}');" 2>&1 | sed 's/^/[write] /'
+                psql -h "$READ_HOST" -p "$PGPORT" -d "$DB_NAME" -At \
+                  -c "SELECT 'local_is_replica=' || pg_is_in_recovery();" 2>&1 | sed 's/^/[read]  /'
+                psql -h "$READ_HOST" -p "$PGPORT" -d "$DB_NAME" \
+                  -c "SELECT id, site, ts FROM heartbeat ORDER BY id DESC LIMIT 5;" 2>&1 | sed 's/^/[read]  /'
+                sleep 10
+              done
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

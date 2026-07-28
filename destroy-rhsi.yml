@@ -1,0 +1,223 @@
+---
+# =============================================================================
+# RHSI + CloudNativePG cross-site Postgres teardown - use case 5
+# =============================================================================
+# Play 1: Remove the ACM policy engine, MCVs, pg-role labels + hub ConfigMap (hub)
+# Play 2: Remove the CNPG Cluster, RHSI (Site/Link/tokens/Connectors/Listeners),
+#         the app, the side-loaded secrets, the namespace, and the operators (spokes)
+#
+# The shared policy namespace (open-cluster-management-global-set) and the dr-clusters
+# clusterset labels are LEFT INTACT (shared with use case 3 / ACM).
+# Set rhsi_remove_operator=false / cnpg_remove_operator=false to keep the operators.
+# =============================================================================
+
+# =============================================================================
+# Play 1: Remove the ACM policy engine + labels from the hub
+# =============================================================================
+- name: "Play 1: Remove CNPG/RHSI ACM policies and labels from hub"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+  tasks:
+    - name: Delete the CNPG/RHSI Policies, PlacementBindings and Placements
+      shell: |
+        ns={{ cnpg_policy_namespace }}
+        for p in cnpg-fabric cnpg-connector cnpg-hub-relay; do
+          oc delete policy "$p" -n "$ns" --ignore-not-found
+        done
+        for b in cnpg-fabric-binding cnpg-connector-binding cnpg-hub-relay-binding; do
+          oc delete placementbinding "$b" -n "$ns" --ignore-not-found
+        done
+        for pl in cnpg-placement-all cnpg-placement-active cnpg-placement-hub; do
+          oc delete placement "$pl" -n "$ns" --ignore-not-found
+        done
+        oc delete configmap cnpg-dr-config -n "$ns" --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the CNPG ManagedClusterViews on each spoke namespace
+      shell: |
+        oc delete managedclusterview cnpg-cluster-view -n {{ managedcluster_names[item] }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Remove pg-role label from spoke managed clusters
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} {{ cnpg_role_label }}- --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 1 result
+      debug:
+        msg: >-
+          Removed CNPG/RHSI policies, MCVs and {{ cnpg_role_label }} labels from
+          {{ spoke_clusters | join(', ') }} (policy namespace {{ cnpg_policy_namespace }} kept).
+
+# =============================================================================
+# Play 2: Remove CNPG + RHSI resources and the operators from each spoke
+# =============================================================================
+- name: "Play 2: Remove CNPG/RHSI resources from spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    - name: Delete the CNPG Cluster (removes the database and its PVCs)
+      shell: |
+        oc delete cluster.postgresql.cnpg.io {{ cnpg_cluster_name }} -n {{ cnpg_namespace }} \
+          --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete Skupper Connectors and Listeners
+      shell: |
+        oc delete connector --all -n {{ cnpg_namespace }} --ignore-not-found
+        oc delete listener --all -n {{ cnpg_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete Link, AccessToken and AccessGrant
+      shell: |
+        oc delete link --all -n {{ cnpg_namespace }} --ignore-not-found
+        oc delete accesstoken {{ rhsi_token_name }} -n {{ cnpg_namespace }} --ignore-not-found
+        oc delete accessgrant {{ rhsi_grant_name }} -n {{ cnpg_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the Skupper Site
+      shell: |
+        oc delete site {{ rhsi_site_prefix }}-{{ cluster_name }} -n {{ cnpg_namespace }} \
+          --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the postgres-dr namespace (cascades app + secrets)
+      shell: |
+        oc delete namespace {{ cnpg_namespace }} --ignore-not-found --timeout=180s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove the generated AccessToken manifest
+      file:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/rhsi-token.yaml"
+        state: absent
+      delegate_to: localhost
+
+    - name: Uninstall the CloudNativePG operator (Subscription + CSV)
+      shell: |
+        oc delete subscription {{ cnpg_package }} -n {{ cnpg_operator_namespace }} --ignore-not-found
+        for csv in $(oc get csv -n {{ cnpg_operator_namespace }} -o name 2>/dev/null \
+                     | grep -iE 'cloudnative-pg|cloudnativepg|cnpg'); do
+          oc delete "$csv" -n {{ cnpg_operator_namespace }} --ignore-not-found
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: cnpg_remove_operator | default(true)
+      ignore_errors: true
+
+    - name: Uninstall the RHSI operators (skupper + Network Observer) Subscriptions + CSVs
+      shell: |
+        # main Service Interconnect operator
+        oc delete subscription skupper-operator -n {{ rhsi_operator_namespace }} --ignore-not-found
+        # Network Observer operator (name varies by catalog) - match its subscription(s)
+        for sub in $(oc get subscription -n {{ rhsi_operator_namespace }} -o name 2>/dev/null \
+                     | grep -iE 'network-observer|observ'); do
+          oc delete "$sub" -n {{ rhsi_operator_namespace }} --ignore-not-found
+        done
+        # CSVs for both
+        for csv in $(oc get csv -n {{ rhsi_operator_namespace }} -o name 2>/dev/null \
+                     | grep -iE 'skupper|network-observer|interconnect'); do
+          oc delete "$csv" -n {{ rhsi_operator_namespace }} --ignore-not-found
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: rhsi_remove_operator | default(true)
+      ignore_errors: true
+
+    - name: Display Play 2 result
+      debug:
+        msg: |
+          CNPG/RHSI removed from {{ cluster_name }}:
+          - Deleted CNPG Cluster {{ cnpg_cluster_name }}, RHSI Site/Link/tokens/Connectors/Listeners
+          - Deleted the {{ cnpg_namespace }} namespace (app + secrets)
+          {% if cnpg_remove_operator | default(true) %}- Uninstalled the CloudNativePG operator{% endif %}
+          {% if rhsi_remove_operator | default(true) %}- Uninstalled skupper-operator{% endif %}

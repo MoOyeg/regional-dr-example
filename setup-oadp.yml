@@ -1,0 +1,478 @@
+---
+# =============================================================================
+# setup-oadp.yml - OADP DataProtectionApplication + shared S3 bucket
+# =============================================================================
+# Prepares OADP (OpenShift API for Data Protection = Velero) on BOTH spokes for
+# cross-cluster VM backup/restore (use case 4). It:
+#   1. Provisions ONE S3 bucket in the oadp_aws_profile account (reused if it
+#      already exists), owned by a single account so both spokes can reach it.
+#   2. On each spoke, creates the `cloud-credentials` secret (the bucket-owner
+#      AWS keys) and a DataProtectionApplication whose BackupStorageLocation
+#      points at that bucket, with the openshift/aws/csi/kubevirt plugins and the
+#      kopia node agent (file-system backup of VM disks).
+#
+# The OADP operator itself is installed by the `operators` command. After this,
+# use `oadp-backup` (on the source) and `oadp-restore` (on the target).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Play 1: provision the shared S3 backup bucket (once)
+# -----------------------------------------------------------------------------
+- name: Provision the OADP S3 backup bucket
+  hosts: openshift_clusters
+  gather_facts: false
+  run_once: true
+
+  tasks:
+    - name: Look up bucket-owner AWS credentials ({{ oadp_aws_profile }})
+      set_fact:
+        oadp_aws_key: "{{ lookup('ini', 'aws_access_key_id', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+        oadp_aws_secret: "{{ lookup('ini', 'aws_secret_access_key', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+
+    - name: Resolve bucket-owner account id
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ oadp_aws_key }}" AWS_SECRET_ACCESS_KEY="{{ oadp_aws_secret }}" \
+          aws sts get-caller-identity --query Account --output text
+      delegate_to: localhost
+      register: oadp_acct
+      changed_when: false
+
+    - name: Compute backup bucket name
+      set_fact:
+        oadp_bucket_name: "{{ oadp_s3_bucket if (oadp_s3_bucket | length > 0) else ('oadp-dr-' ~ (oadp_acct.stdout | trim)) }}"
+
+    - name: Create the S3 bucket if it does not exist
+      shell: |
+        export AWS_ACCESS_KEY_ID="{{ oadp_aws_key }}" AWS_SECRET_ACCESS_KEY="{{ oadp_aws_secret }}"
+        if aws s3api head-bucket --bucket "{{ oadp_bucket_name }}" 2>/dev/null; then
+          echo "exists"
+        elif [ "{{ oadp_s3_region }}" = "us-east-1" ]; then
+          aws s3api create-bucket --bucket "{{ oadp_bucket_name }}" --region us-east-1 >/dev/null && echo "created"
+        else
+          aws s3api create-bucket --bucket "{{ oadp_bucket_name }}" --region "{{ oadp_s3_region }}" \
+            --create-bucket-configuration LocationConstraint="{{ oadp_s3_region }}" >/dev/null && echo "created"
+        fi
+      delegate_to: localhost
+      register: oadp_bucket_create
+      changed_when: "'created' in oadp_bucket_create.stdout"
+
+    - name: Display backup bucket
+      debug:
+        msg: "OADP backup bucket: {{ oadp_bucket_name }} ({{ oadp_s3_region }}) - {{ oadp_bucket_create.stdout | trim }}"
+
+# -----------------------------------------------------------------------------
+# Play 2: DataProtectionApplication on each spoke
+# -----------------------------------------------------------------------------
+- name: Configure OADP DataProtectionApplication on spokes
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip the hub (OADP DR runs on the spokes)
+      meta: end_host
+      when: (cluster_role | default('spoke')) == 'hub'
+
+    - name: Look up bucket-owner AWS credentials ({{ oadp_aws_profile }})
+      set_fact:
+        oadp_aws_key: "{{ lookup('ini', 'aws_access_key_id', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+        oadp_aws_secret: "{{ lookup('ini', 'aws_secret_access_key', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+
+    - name: Resolve bucket-owner account id
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ oadp_aws_key }}" AWS_SECRET_ACCESS_KEY="{{ oadp_aws_secret }}" \
+          aws sts get-caller-identity --query Account --output text
+      delegate_to: localhost
+      register: oadp_acct2
+      changed_when: false
+
+    - name: Compute backup bucket name
+      set_fact:
+        oadp_bucket_name: "{{ oadp_s3_bucket if (oadp_s3_bucket | length > 0) else ('oadp-dr-' ~ (oadp_acct2.stdout | trim)) }}"
+
+  tasks:
+    - name: Wait for the OADP operator (DataProtectionApplication CRD)
+      shell: oc get crd dataprotectionapplications.oadp.openshift.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_crd
+      until: oadp_crd.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Create cloud-credentials secret (bucket-owner AWS keys)
+      shell: |
+        cat > /tmp/oadp-creds-{{ cluster_name }} <<CREDS
+        [default]
+        aws_access_key_id={{ oadp_aws_key }}
+        aws_secret_access_key={{ oadp_aws_secret }}
+        CREDS
+        oc create secret generic cloud-credentials -n {{ oadp_namespace }} \
+          --from-file=cloud=/tmp/oadp-creds-{{ cluster_name }} \
+          --dry-run=client -o yaml | oc apply -f -
+        rm -f /tmp/oadp-creds-{{ cluster_name }}
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Label ODF RBD VolumeSnapshotClass for Velero CSI backups (best-effort)
+      # VM disks are volumeMode Block, which the kopia file-system mover can't walk;
+      # Velero must use CSI snapshots + the data mover instead, and it only picks a
+      # VolumeSnapshotClass carrying this label.
+      shell: |
+        for vsc in $(oc get volumesnapshotclass \
+          -o jsonpath='{range .items[?(@.driver=="openshift-storage.rbd.csi.ceph.com")]}{.metadata.name}{"\n"}{end}'); do
+          oc label volumesnapshotclass "$vsc" velero.io/csi-volumesnapshot-class="true" --overwrite
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Create DataProtectionApplication ({{ oadp_dpa_name }})
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: oadp.openshift.io/v1alpha1
+        kind: DataProtectionApplication
+        metadata:
+          name: {{ oadp_dpa_name }}
+          namespace: {{ oadp_namespace }}
+        spec:
+          configuration:
+            velero:
+              defaultPlugins:
+                - openshift
+                - aws
+                - csi
+                - kubevirt
+            nodeAgent:
+              enable: true
+              uploaderType: kopia
+          backupLocations:
+            - name: {{ oadp_bsl_name }}
+              velero:
+                provider: aws
+                default: true
+                objectStorage:
+                  bucket: {{ oadp_bucket_name }}
+                  prefix: velero
+                config:
+                  region: {{ oadp_s3_region }}
+                credential:
+                  name: cloud-credentials
+                  key: cloud
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for BackupStorageLocation to be Available
+      shell: |
+        oc get backupstoragelocation {{ oadp_bsl_name }} -n {{ oadp_namespace }} \
+          -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_bsl_phase
+      until: "'Available' in oadp_bsl_phase.stdout"
+      retries: 30
+      delay: 10
+
+    - name: Display OADP readiness
+      debug:
+        msg: |
+          OADP ready on {{ cluster_name }}
+          Bucket: {{ oadp_bucket_name }}   BSL: {{ oadp_bsl_name }} (Available)
+
+# =============================================================================
+# Play 3: Create the label-driven scheduled-backup ACM Policy on the hub
+# =============================================================================
+# Enforced on the spokes: any VM labelled `oadp-backup` gets a Velero Schedule
+# (every 5 min, 1h TTL). See acm-policy-oadp-schedule.yaml and README use case 4.
+- name: Create the OADP scheduled-backup ACM Policy on the hub
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    hub_kubeconfig: "{{ playbook_dir }}/artifacts/{{ cluster_name }}/kubeconfig"
+
+  pre_tasks:
+    - name: Run only on the hub cluster
+      meta: end_host
+      when: (cluster_role | default('spoke')) != 'hub'
+
+    - name: Validate hub kubeconfig exists
+      stat:
+        path: "{{ hub_kubeconfig }}"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build the spoke cluster list
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+    - name: Resolve the initial active / standby spokes
+      set_fact:
+        oadp_active_cluster: "{{ oadp_active | default(spoke_clusters[0]) }}"
+        oadp_standby_clusters: "{{ spoke_clusters | difference([oadp_active | default(spoke_clusters[0])]) }}"
+
+    - name: Validate the chosen active spoke is a real spoke
+      fail:
+        msg: "oadp_active='{{ oadp_active_cluster }}' is not one of the spokes ({{ spoke_clusters | join(', ') }})."
+      when: oadp_active_cluster not in spoke_clusters
+
+  tasks:
+    - name: Ensure spokes are in the dr-clusters ManagedClusterSet
+      # The OADP policy Placements select this clusterset. infra-dr also does
+      # this (in its Submariner play), but use case 4 must not depend on it.
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} \
+          cluster.open-cluster-management.io/clusterset={{ managed_cluster_set_name }} --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+
+    - name: Bind the dr-clusters ManagedClusterSet to the policy namespace
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSetBinding
+        metadata:
+          name: {{ managed_cluster_set_name }}
+          namespace: {{ oadp_policy_namespace }}
+        spec:
+          clusterSet: {{ managed_cluster_set_name }}
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Apply the OADP scheduled-backup Policy
+      shell: |
+        oc apply -f {{ playbook_dir }}/acm-policy-oadp-schedule.yaml
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+
+    - name: Wait for the OADP schedule Policy to reconcile (best-effort)
+      shell: |
+        oc get policy oadp-vm-backup-schedule -n {{ oadp_policy_namespace }} \
+          -o jsonpath='{.status.compliant}'
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: oadp_policy_compliant
+      until: oadp_policy_compliant.stdout | length > 0
+      retries: 20
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Auto-failover / auto-restore policy (acm-policy-oadp-autorestore.yaml)
+    # -------------------------------------------------------------------------
+    - name: Check whether the spokes already carry an oadp-role label
+      shell: |
+        oc get managedcluster -l oadp-role -o name 2>/dev/null | wc -l
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: oadp_roles_present
+      changed_when: false
+      when: oadp_autorestore_enabled | bool
+
+    - name: Assign the initial oadp-role labels (only when none are set yet)
+      # Re-running `oadp` after a failover must not drag the active role back to
+      # the original spoke, so the labels are seeded once and owned by the
+      # policy (failover) or by you (failback) from then on.
+      shell: |
+        oc label managedcluster {{ managedcluster_names[oadp_active_cluster] }} oadp-role=active --overwrite
+        {% for c in oadp_standby_clusters %}
+        oc label managedcluster {{ managedcluster_names[c] }} oadp-role=standby --overwrite
+        {% endfor %}
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      when:
+        - oadp_autorestore_enabled | bool
+        - (oadp_roles_present.stdout | trim | int) == 0
+
+    - name: Read the current oadp-role assignment
+      shell: |
+        oc get managedcluster -l oadp-role \
+          -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.oadp-role} {end}'
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: oadp_role_state
+      changed_when: false
+      when: oadp_autorestore_enabled | bool
+
+    - name: Create the oadp-dr-config ConfigMap on the hub
+      # Inputs for acm-policy-oadp-autorestore.yaml. Editing a value here (or with
+      # `oc edit cm`) re-renders the policies - no need to re-apply them.
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: oadp-dr-config
+          namespace: {{ oadp_policy_namespace }}
+        data:
+          vmName: "{{ oadp_dr_vm_name }}"
+          vmNamespace: "{{ oadp_dr_vm_namespace }}"
+          oadpNamespace: "{{ oadp_namespace }}"
+          graceSeconds: "{{ oadp_failover_grace_seconds }}"
+          standbyCleanup: "{{ oadp_standby_cleanup | string | lower }}"
+          timerImage: "{{ oadp_failover_timer_image }}"
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      when: oadp_autorestore_enabled | bool
+
+    - name: Seed the oadp-dr-status ConfigMap (created once, then owned by the policy)
+      # The hub policy reads this back to carry state between evaluations, so it
+      # must exist before the spoke policies resolve their hub templates - but it
+      # must never be reset on a re-run.
+      shell: |
+        oc get configmap oadp-dr-status -n {{ oadp_policy_namespace }} >/dev/null 2>&1 && exit 0
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: oadp-dr-status
+          namespace: {{ oadp_policy_namespace }}
+        data:
+          activeSite: ""
+          standbySite: ""
+          activeClusterAvailable: "false"
+          standbyClusterAvailable: "false"
+          vmAvailable: "false"
+          standbyHasVM: "false"
+          vmEverSeen: "false"
+          timerState: "none"
+          failoverArmed: "false"
+          autoFailoverDone: "false"
+          restoreOnActive: "false"
+          lastFailoverTo: ""
+        EOF
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      when: oadp_autorestore_enabled | bool
+
+    - name: Apply the OADP auto-failover / auto-restore Policies
+      shell: |
+        oc apply -f {{ playbook_dir }}/acm-policy-oadp-autorestore.yaml
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      when: oadp_autorestore_enabled | bool
+
+    # -------------------------------------------------------------------------
+    # The protected VM (vm-app-oadp/) - deployed straight to the active spoke,
+    # deliberately NOT through GitOps: auto-failover deletes and restores this
+    # VM, and an ArgoCD auto-sync would immediately re-create it on the failed
+    # site. Deployed once; after a failover the VM lives wherever it was
+    # restored, so this is skipped if it already exists on either spoke.
+    # -------------------------------------------------------------------------
+    - name: Resolve the spoke currently labelled oadp-role=active
+      shell: |
+        oc get managedcluster -l oadp-role=active -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      register: oadp_active_mc
+      changed_when: false
+      when: oadp_autorestore_enabled | bool and oadp_deploy_demo_vm | bool
+
+    - name: Map that ManagedCluster back to an inventory cluster
+      set_fact:
+        oadp_demo_vm_cluster: >-
+          {{ (managedcluster_names | dict2items
+              | selectattr('value', 'equalto', oadp_active_mc.stdout | trim)
+              | map(attribute='key') | list | first) | default(oadp_active_cluster, true) }}
+      when: oadp_autorestore_enabled | bool and oadp_deploy_demo_vm | bool
+
+    - name: Look for an existing copy of the demo VM on each spoke
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig \
+          get vm {{ oadp_dr_vm_name }} -n {{ oadp_dr_vm_namespace }} -o name 2>/dev/null || true
+      delegate_to: localhost
+      register: oadp_demo_vm_check
+      loop: "{{ spoke_clusters }}"
+      changed_when: false
+      when: oadp_autorestore_enabled | bool and oadp_deploy_demo_vm | bool
+
+    - name: Deploy the protected VM to {{ oadp_demo_vm_cluster | default('the active spoke') }}
+      shell: |
+        oc apply -f {{ playbook_dir }}/vm-app-oadp/namespace.yaml
+        oc apply -f {{ playbook_dir }}/vm-app-oadp/vm-pvc.yaml
+        oc apply -f {{ playbook_dir }}/vm-app-oadp/vm.yaml
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ oadp_demo_vm_cluster }}/kubeconfig"
+      delegate_to: localhost
+      when:
+        - oadp_autorestore_enabled | bool
+        - oadp_deploy_demo_vm | bool
+        - (oadp_demo_vm_check.results | map(attribute='stdout') | select('search', 'virtualmachine') | list | length) == 0
+
+    - name: Wait for the protected VM to report Running (best-effort)
+      shell: |
+        oc get vm {{ oadp_dr_vm_name }} -n {{ oadp_dr_vm_namespace }} \
+          -o jsonpath='{.status.printableStatus}' 2>/dev/null
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ oadp_demo_vm_cluster }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_demo_vm_status
+      until: "'Running' in oadp_demo_vm_status.stdout"
+      retries: 40
+      delay: 15
+      changed_when: false
+      ignore_errors: true
+      when: oadp_autorestore_enabled | bool and oadp_deploy_demo_vm | bool
+
+    - name: Display OADP policy results
+      debug:
+        msg: |
+          ============================================
+          OADP ACM policies created
+          ============================================
+          Scheduled backups: oadp-vm-backup-schedule ({{ oadp_policy_namespace }}) -> enforced on the spokes
+          Label a VM to enable 5-min backups with a 1h TTL:
+            oc label vm {{ oadp_dr_vm_name }} -n {{ oadp_backup_vm_namespace }} {{ oadp_backup_label }}=true --overwrite
+          Then confirm backups accumulate (steady state ~12 with */5 + 1h TTL):
+            oc -n {{ oadp_namespace }} get schedule,backups.velero.io -l velero.io/schedule-name
+          {% if oadp_autorestore_enabled | bool %}
+
+          Auto-failover: oadp-vm-autofailover-hub / oadp-vm-restore-active / oadp-vm-standby-cleanup
+          Roles now:     {{ oadp_role_state.stdout | default('') | trim }}
+          Protected VM:  {{ oadp_dr_vm_name }} ({{ oadp_backup_vm_namespace }}), grace {{ oadp_failover_grace_seconds }}s
+          If that VM stops being available on the active spoke for {{ oadp_failover_grace_seconds }}s, the hub
+          hands the active role to the peer, which restores the newest backup and
+          resumes the backup schedule there. Watch it with:
+            oc -n {{ oadp_policy_namespace }} get cm oadp-dr-status -o yaml
+            oc -n {{ oadp_policy_namespace }} get job oadp-failover-timer
+          Fail back by flipping the labels yourself:
+            oc label managedcluster {{ managedcluster_names[oadp_active_cluster] }} oadp-role=active --overwrite
+            oc label managedcluster {{ managedcluster_names[oadp_standby_clusters[0]] if (oadp_standby_clusters | length) > 0 else '<peer>' }} oadp-role=standby --overwrite
+          {% endif %}

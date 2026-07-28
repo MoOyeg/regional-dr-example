@@ -1,0 +1,104 @@
+---
+# =============================================================================
+# oadp-restore.yml - Velero Restore of a VM backup on the TARGET spoke
+# =============================================================================
+# Restores a backup taken by oadp-backup onto the peer cluster. The target's
+# OADP already has the same BackupStorageLocation (from setup-oadp.yml), so
+# Velero syncs the backup metadata from the shared bucket and the data mover
+# rehydrates the VM's Block PVCs from the moved snapshot data. The VM is then
+# recreated on the target cluster.
+#
+# Run against the target cluster, e.g.:
+#   ./ansible-runner.sh oadp-restore -e oadp_to=cluster3 -e oadp_backup_name=vm-backup
+# =============================================================================
+
+- name: Restore a VM backup with OADP
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    oadp_to: "cluster3"
+    oadp_restore_name: "{{ oadp_backup_name }}-restore"
+
+  pre_tasks:
+    - name: Run only on the target cluster ({{ oadp_to }})
+      meta: end_host
+      when: cluster_name != oadp_to
+
+  tasks:
+    - name: Wait for Velero to sync the backup from the shared bucket
+      shell: |
+        oc get backups.velero.io {{ oadp_backup_name }} -n {{ oadp_namespace }} \
+          -o jsonpath='{.status.phase}' 2>/dev/null
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_synced_backup
+      # PartiallyFailed is restorable and is the NORMAL outcome for a running VM:
+      # OADP's KubeVirt freeze hook fails without a guest agent, so the backup is
+      # marked PartiallyFailed while the disk data is still fully moved to S3.
+      # Waiting for 'Completed' alone means a VM backup never becomes restorable.
+      until: oadp_synced_backup.stdout in ['Completed', 'PartiallyFailed']
+      retries: 30
+      delay: 20
+
+    - name: Create a Velero Restore from {{ oadp_backup_name }}
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: velero.io/v1
+        kind: Restore
+        metadata:
+          name: {{ oadp_restore_name }}
+          namespace: {{ oadp_namespace }}
+        spec:
+          backupName: {{ oadp_backup_name }}
+          restorePVs: true
+          existingResourcePolicy: update
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for the restore to reach a terminal phase
+      shell: |
+        oc get restores.velero.io {{ oadp_restore_name }} -n {{ oadp_namespace }} -o jsonpath='{.status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_restore_phase
+      until: oadp_restore_phase.stdout in ['Completed', 'PartiallyFailed', 'Failed', 'FailedValidation']
+      retries: 80
+      delay: 15
+      failed_when: oadp_restore_phase.stdout in ['Failed', 'FailedValidation']
+
+    # failed_when replaces the default retry/rc failure, so an exhausted `until`
+    # would be reported as ok and the summary below would claim success.
+    - name: Fail if the restore never reached a terminal phase
+      fail:
+        msg: >-
+          Restore {{ oadp_restore_name }} did not reach a terminal phase
+          (last observed: '{{ oadp_restore_phase.stdout | default('') }}').
+      when: oadp_restore_phase.stdout not in ['Completed', 'PartiallyFailed']
+
+    - name: Check the restored VM
+      shell: |
+        oc get vmi -n {{ oadp_backup_vm_namespace }} --no-headers 2>/dev/null || echo "no VMI yet"
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: oadp_restored_vm
+      changed_when: false
+
+    - name: Restore summary
+      debug:
+        msg: |
+          ============================================
+          OADP Restore complete
+          ============================================
+          Restore:    {{ oadp_restore_name }}  ({{ oadp_restore_phase.stdout }})
+          Target:     {{ oadp_to }}   Namespace: {{ oadp_backup_vm_namespace }}
+          VMI(s):     {{ oadp_restored_vm.stdout }}
+
+          If the VM is Stopped after restore, start it:
+            oc --kubeconfig artifacts/{{ oadp_to }}/kubeconfig -n {{ oadp_backup_vm_namespace }} patch vm <name> --type merge -p '{"spec":{"runStrategy":"Always"}}'

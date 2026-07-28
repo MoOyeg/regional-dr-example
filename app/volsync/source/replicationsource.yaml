@@ -1,0 +1,15 @@
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: mysql-replicationsource
+spec:
+  sourcePVC: mysql-pvc
+  trigger:
+    schedule: "*/2 * * * *"
+  rsyncTLS:
+    keySecret: volsync-rsync-tls-mysql-replicationsource
+    address: "{{ replication_dest_address }}"
+    copyMethod: Snapshot
+    storageClassName: ocs-storagecluster-ceph-rbd
+    volumeSnapshotClassName: ocs-storagecluster-rbdplugin-snapclass

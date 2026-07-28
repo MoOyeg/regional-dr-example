@@ -1,0 +1,20 @@
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationDestination
+metadata:
+  name: mysql-replicationdestination
+  namespace: quarkus-web-app-volsync
+spec:
+  
+  trigger:
+    schedule: "*/2 * * * *"
+  rsyncTLS:
+    serviceType: ClusterIP        # ClusterIP + Submariner ServiceExport (see setup-volsync-dr.yml)
+    copyMethod: Snapshot
+    # capacity: 1Gi
+    destinationPVC: mysql-pvc
+    # accessModes:
+    #   - ReadWriteOnce
+    storageClassName: ocs-storagecluster-ceph-rbd
+    keySecret: volsync-rsync-tls-mysql-replicationsource
+    volumeSnapshotClassName: ocs-storagecluster-rbdplugin-snapclass

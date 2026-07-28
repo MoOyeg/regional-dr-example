@@ -1,0 +1,290 @@
+---
+# =============================================================================
+# OADP backup & recovery teardown - use case 4
+# =============================================================================
+# Play 1: Remove the ACM policy engine (scheduled backups + auto-failover), the
+#         hub ConfigMaps, the failover timer Pod, the MCVs and the oadp-role
+#         labels (hub)
+# Play 2: Remove the DataProtectionApplication, the cloud-credentials secret,
+#         every Velero Schedule/Backup/Restore, the protected VM's namespace and
+#         the labels this repo added (spokes)
+# Play 3: OPTIONAL - empty and delete the shared S3 backup bucket
+#
+# The OADP OPERATOR and the openshift-adp namespace are NOT touched here - they
+# are installed by `operators` and removed by `operators --destroy`.
+# The shared policy namespace (open-cluster-management-global-set), the
+# dr-clusters clusterset labels and its ManagedClusterSetBinding are LEFT INTACT
+# (shared with use cases 3 and 5).
+#
+# The S3 bucket holds the backups, so it is KEPT by default - deleting it is
+# irreversible and the bucket may be shared. Remove it with:
+#   ./ansible-runner.sh oadp --destroy -e oadp_remove_bucket=true
+# Set oadp_remove_demo_vm=false to keep the protected VM (vm-example-oadp).
+# =============================================================================
+
+# =============================================================================
+# Play 1: Remove the ACM policy engine and hub state
+# =============================================================================
+- name: "Play 1: Remove OADP ACM policies, hub state and labels from hub"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    oadp_role_label: "oadp-role"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+  tasks:
+    # The policies are removed FIRST: they run remediationAction=enforce, so a
+    # spoke policy left running would re-create the Schedule (or restore the VM)
+    # while Play 2 is deleting them.
+    - name: Delete the OADP auto-failover Policies, PlacementBindings and Placements
+      shell: |
+        oc delete -f {{ playbook_dir }}/acm-policy-oadp-autorestore.yaml --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the OADP scheduled-backup Policy, PlacementBinding and Placement
+      shell: |
+        oc delete -f {{ playbook_dir }}/acm-policy-oadp-schedule.yaml --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the hub ConfigMaps and the failover timer Pod
+      shell: |
+        ns={{ oadp_policy_namespace }}
+        oc delete configmap oadp-dr-config oadp-dr-status -n "$ns" --ignore-not-found
+        oc delete pod oadp-failover-timer -n "$ns" --ignore-not-found --grace-period=0 --force
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the OADP ManagedClusterView in each spoke namespace
+      shell: |
+        oc delete managedclusterview oadp-vm-view -n {{ managedcluster_names[item] }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Remove the oadp-role label from the spoke managed clusters
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} {{ oadp_role_label }}- --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      changed_when: false
+      ignore_errors: true
+
+    - name: Give ACM a moment to withdraw the replicated policies from the spokes
+      wait_for:
+        timeout: 20
+      delegate_to: localhost
+
+    - name: Display Play 1 result
+      debug:
+        msg: >-
+          Removed the OADP policies (scheduled backup + auto-failover), oadp-dr-config /
+          oadp-dr-status, the failover timer, the oadp-vm-view MCVs and the
+          {{ oadp_role_label }} labels from {{ spoke_clusters | join(', ') }}
+          (policy namespace {{ oadp_policy_namespace }} kept).
+
+# =============================================================================
+# Play 2: Remove the OADP configuration and demo VM from each spoke
+# =============================================================================
+- name: "Play 2: Remove OADP configuration from spokes"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') == 'hub'
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+  tasks:
+    # Always fully qualified: a bare `schedule`/`backup`/`restore` is ambiguous
+    # once CNPG (use case 5) or ODF/Noobaa is installed and resolves to the wrong
+    # CRD - which is how a Velero backup that plainly existed reported "not found".
+    - name: Delete every Velero Schedule, Backup and Restore
+      shell: |
+        oc delete schedules.velero.io --all -n {{ oadp_namespace }} --ignore-not-found
+        oc delete backups.velero.io --all -n {{ oadp_namespace }} --ignore-not-found
+        oc delete restores.velero.io --all -n {{ oadp_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the DataProtectionApplication ({{ oadp_dpa_name }})
+      shell: |
+        oc delete dataprotectionapplication {{ oadp_dpa_name }} -n {{ oadp_namespace }} \
+          --ignore-not-found --timeout=120s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the cloud-credentials secret
+      shell: |
+        oc delete secret cloud-credentials -n {{ oadp_namespace }} --ignore-not-found
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove the Velero CSI label from the ODF RBD VolumeSnapshotClasses
+      shell: |
+        for vsc in $(oc get volumesnapshotclass \
+          -o jsonpath='{range .items[?(@.driver=="openshift-storage.rbd.csi.ceph.com")]}{.metadata.name}{"\n"}{end}'); do
+          oc label volumesnapshotclass "$vsc" velero.io/csi-volumesnapshot-class- --overwrite
+        done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+
+    - name: Remove the {{ oadp_backup_label }} label from any VM that still carries it
+      shell: |
+        oc get vm -A -l {{ oadp_backup_label }} \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null \
+        | while IFS=/ read -r ns name; do
+            [ -n "$name" ] && oc label vm "$name" -n "$ns" {{ oadp_backup_label }}- --overwrite
+          done
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+
+    # The protected VM lives in its OWN namespace (vm-app-oadp/), so this never
+    # touches vm-example (use case 1, Ramen + GitOps) or vm-example-volsync
+    # (use case 3). Deleting the namespace takes the VM and its PVCs with it.
+    - name: Delete the protected VM namespace ({{ oadp_dr_vm_namespace }})
+      shell: |
+        oc delete namespace {{ oadp_dr_vm_namespace }} --ignore-not-found --timeout=180s
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      when: oadp_remove_demo_vm | default(true) | bool
+      ignore_errors: true
+
+    - name: Display Play 2 result
+      debug:
+        msg: |
+          OADP configuration removed from {{ cluster_name }}:
+          - Deleted all Velero Schedules/Backups/Restores in {{ oadp_namespace }}
+          - Deleted DataProtectionApplication {{ oadp_dpa_name }} and the cloud-credentials secret
+          - Removed the velero.io/csi-volumesnapshot-class and {{ oadp_backup_label }} labels
+          {% if oadp_remove_demo_vm | default(true) | bool %}- Deleted the {{ oadp_dr_vm_namespace }} namespace (VM + PVCs){% else %}- Kept the {{ oadp_dr_vm_namespace }} namespace{% endif %}
+
+          The OADP operator and {{ oadp_namespace }} are untouched - remove them with
+          ./ansible-runner.sh operators --destroy
+
+# =============================================================================
+# Play 3: Optionally delete the shared S3 backup bucket
+# =============================================================================
+- name: "Play 3: Delete the OADP S3 backup bucket"
+  hosts: openshift_clusters
+  gather_facts: false
+  run_once: true
+
+  tasks:
+    - name: Look up bucket-owner AWS credentials ({{ oadp_aws_profile }})
+      set_fact:
+        oadp_aws_key: "{{ lookup('ini', 'aws_access_key_id', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+        oadp_aws_secret: "{{ lookup('ini', 'aws_secret_access_key', section=oadp_aws_profile, file=aws_shared_credentials_file) }}"
+
+    - name: Resolve bucket-owner account id
+      shell: |
+        AWS_ACCESS_KEY_ID="{{ oadp_aws_key }}" AWS_SECRET_ACCESS_KEY="{{ oadp_aws_secret }}" \
+          aws sts get-caller-identity --query Account --output text
+      delegate_to: localhost
+      register: oadp_del_acct
+      changed_when: false
+      ignore_errors: true
+
+    - name: Compute backup bucket name
+      set_fact:
+        oadp_bucket_name: "{{ oadp_s3_bucket if (oadp_s3_bucket | length > 0) else ('oadp-dr-' ~ (oadp_del_acct.stdout | default('') | trim)) }}"
+
+    - name: Empty and delete the backup bucket
+      shell: |
+        export AWS_ACCESS_KEY_ID="{{ oadp_aws_key }}" AWS_SECRET_ACCESS_KEY="{{ oadp_aws_secret }}"
+        if aws s3api head-bucket --bucket "{{ oadp_bucket_name }}" 2>/dev/null; then
+          aws s3 rb "s3://{{ oadp_bucket_name }}" --force >/dev/null && echo "deleted"
+        else
+          echo "absent"
+        fi
+      delegate_to: localhost
+      register: oadp_bucket_delete
+      changed_when: "'deleted' in oadp_bucket_delete.stdout"
+      when: oadp_remove_bucket | default(false) | bool
+
+    - name: Display bucket result
+      debug:
+        msg: >-
+          {% if oadp_remove_bucket | default(false) | bool %}
+          Backup bucket {{ oadp_bucket_name }}: {{ oadp_bucket_delete.stdout | default('') | trim }}
+          {% else %}
+          Backup bucket {{ oadp_bucket_name }} KEPT (it holds the backups). Delete it with
+          `./ansible-runner.sh oadp --destroy -e oadp_remove_bucket=true`, or by hand:
+          aws --profile {{ oadp_aws_profile }} s3 rb s3://{{ oadp_bucket_name }} --force
+          {% endif %}

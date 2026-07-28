@@ -75,7 +75,7 @@
           ============================================
           Configuration Validation Summary
           ============================================
-          AWS Credentials: {{ 'OK' if cred1_result.rc == 0 else 'FAILED' }}
+          AWS Credentials: {{ 'OK (' ~ (profile_results.results | selectattr('rc','equalto',0) | list | length) ~ '/' ~ (profile_results.results | length) ~ ' profiles valid)' if (profile_results.results | selectattr('rc','equalto',0) | list | length) == (profile_results.results | length) else 'FAILED - one or more profiles invalid' }}
           Pull Secret: {{ 'OK' if pull_secret_stat.stat.exists else 'MISSING' }}
           SSH Public Key: {{ 'OK' if ssh_pub_key_stat.stat.exists else 'MISSING' }}
           SSH Private Key: {{ 'Found' if ssh_priv_key_stat.stat.exists else 'Not found (optional)' }}

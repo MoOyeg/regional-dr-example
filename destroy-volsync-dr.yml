@@ -1,0 +1,94 @@
+---
+# =============================================================================
+# VolSync Direct DR - App teardown - Use case 3
+# =============================================================================
+- name: "VolSync Direct DR (app): teardown"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+    gitops_namespace: "openshift-gitops"
+    hub_kubeconfig: "{{ playbook_dir }}/artifacts/{{ cluster_name }}/kubeconfig"
+
+  pre_tasks:
+    - name: Run only on the hub cluster
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Validate hub kubeconfig exists
+      stat:
+        path: "{{ hub_kubeconfig }}"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Build ordered list of spoke clusters
+      set_fact:
+        spoke_clusters: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list
+          + groups['openshift_clusters']
+             | map('extract', hostvars)
+             | rejectattr('cluster_role', 'defined')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build managedcluster name mapping for spokes
+      set_fact:
+        managedcluster_names: >-
+          {
+          {% for c in spoke_clusters %}
+          {% set v = hostvars[c] %}
+          "{{ c }}": "{{ v.managedcluster_name | default(c) }}"{{ "," if not loop.last }}
+          {% endfor %}
+          }
+
+  tasks:
+    - name: Delete the app ApplicationSet
+      shell: |
+        oc delete applicationset quarkus-volsync-appset -n {{ gitops_namespace }} --ignore-not-found
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the VolSync automation policies
+      shell: |
+        oc delete -f {{ playbook_dir }}/acm-policy-volsync-automate.yaml --ignore-not-found
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Delete the volsync-dr-config ConfigMap
+      shell: |
+        oc delete configmap volsync-dr-config -n {{ volsync_policy_namespace }} --ignore-not-found
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Remove app-role labels from the spokes
+      shell: |
+        oc label managedcluster {{ managedcluster_names[item] }} app-role- --overwrite
+      environment: { KUBECONFIG: "{{ hub_kubeconfig }}" }
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Delete the VolSync app namespace on each spoke (removes RS/RD/PVC/secret)
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig \
+          delete namespace {{ volsync_app_namespace }} --ignore-not-found --timeout=120s
+      delegate_to: localhost
+      loop: "{{ spoke_clusters }}"
+      ignore_errors: true
+
+    - name: Show teardown result
+      debug:
+        msg: |
+          VolSync Direct DR (app) removed: ApplicationSet, policies, volsync-dr-config,
+          app-role labels, and the {{ volsync_app_namespace }} namespace on {{ spoke_clusters | join(', ') }}.

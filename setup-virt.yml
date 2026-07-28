@@ -5,19 +5,28 @@
 # Play 1: Discover spoke cluster infrastructure for metal MachineSet (spokes)
 # Play 2: Create metal MachineSet ACM Policy with per-spoke ConfigMaps (hub)
 # Play 3: Wait for metal nodes to be Ready (hub)
-# Play 4: Install OpenShift Virtualization operator via ACM Policy (hub)
+# Play 4: Install OpenShift Virtualization operator via ACM Policy (spokes)
+# Play 4b: Install OpenShift Virtualization operator directly on the hub cluster
 # Play 5: Wait for Virtualization operator readiness on spokes (hub)
 # Play 6: Deploy VM via GitOps with DR protection (hub)
 # Play 7: Verify VM deployment and data (hub)
 # =============================================================================
+#
+# Plays 1-5 are the virtualization SUBSTRATE (metal MachineSet + CNV + the
+# virtualization StorageClass). Use case 3 (`volsync-dr --vm`) and use case 4
+# (`oadp`) need exactly that and nothing else - neither uses Ramen, so neither
+# has a DRPolicy. Plays 6-7 add USE CASE 1's Ramen DR-protected VM and are the
+# only ones needing GitOps + a DRPolicy; when those are absent (or
+# virt_deploy_dr_vm=false) they are SKIPPED with an explanation, so `virt` still
+# delivers virtualization nodes for the other use cases.
 #
 # Prerequisites:
 # 1. Clusters deployed: ./ansible-runner.sh deploy
 # 2. Operators installed: ./ansible-runner.sh operators
 # 3. Clusters imported: ./ansible-runner.sh import
 # 4. DR infrastructure configured: ./ansible-runner.sh infra-dr
-# 5. DR app deployed (for GitOps setup): ./ansible-runner.sh app
-# 6. app_git_url configured pointing to repo with vm-app/ directory
+# 5. Plays 6-7 ONLY: ./ansible-runner.sh app (GitOps + MirrorPeer + DRPolicy)
+# 6. Plays 6-7 ONLY: app_git_url pointing at a repo with a vm-app/ directory
 # =============================================================================
 
 # =============================================================================
@@ -748,6 +757,179 @@
           Compliance: {{ policy_compliance.stdout | default('unknown') }}
 
 # =============================================================================
+# Play 4b: Install OpenShift Virtualization operator directly on the hub cluster
+# =============================================================================
+# The spokes get CNV via an ACM Policy bound to a Placement that is SHARED with
+# the metal-MachineSet policy (see Plays 2 & 4), so routing the hub through that
+# same Placement would also try to provision a bare-metal node on the hub and
+# would fail Play 2's infra-facts guard (Play 1 never discovers hub infra).
+# Instead the hub (local-cluster) gets CNV installed directly with the standard
+# hub operator idiom (OperatorGroup + Subscription + HyperConverged), the same
+# way setup-operators.yml installs ACM/GitOps on the hub.
+#
+# NOTE: no .metal MachineSet is created on the hub, so the CNV control plane runs
+# but VMs will not schedule there until the hub has KVM-capable nodes. Gated by
+# `virt_deploy_hub` (default true) -- set false to skip.
+# =============================================================================
+- name: "Play 4b: Install OpenShift Virtualization operator on the hub cluster"
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    artifacts_dir: "{{ playbook_dir }}/artifacts"
+
+  pre_tasks:
+    - name: Skip non-hub clusters
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Skip hub CNV install when virt_deploy_hub is false
+      meta: end_host
+      when: not (virt_deploy_hub | default(true))
+
+    - name: Validate kubeconfig exists
+      stat:
+        path: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      register: kubeconfig_stat
+      delegate_to: localhost
+
+    - name: End host if kubeconfig missing
+      meta: end_host
+      when: not kubeconfig_stat.stat.exists
+
+    # Auto-discover latest stable CNV channel (same as Play 4)
+    - name: Discover latest CNV operator channel
+      shell: |
+        oc get packagemanifest kubevirt-hyperconverged -n openshift-marketplace \
+          -o jsonpath='{.status.defaultChannel}' 2>/dev/null || echo ""
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_cnv_channel_discovery
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set CNV operator channel
+      set_fact:
+        virt_channel: "{{ hub_cnv_channel_discovery.stdout | trim if hub_cnv_channel_discovery.stdout | trim | length > 0 else virt_channel | default('stable') }}"
+
+    - name: Display hub CNV target
+      debug:
+        msg: "Installing OpenShift Virtualization on hub ({{ cluster_name }}) via channel {{ virt_channel }}"
+
+  tasks:
+    - name: Create openshift-cnv namespace on hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: openshift-cnv
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create CNV OperatorGroup on hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: openshift-cnv
+          namespace: openshift-cnv
+        spec:
+          targetNamespaces:
+            - openshift-cnv
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Create CNV Subscription on hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: operators.coreos.com/v1alpha1
+        kind: Subscription
+        metadata:
+          name: kubevirt-hyperconverged
+          namespace: openshift-cnv
+        spec:
+          channel: {{ virt_channel }}
+          installPlanApproval: Automatic
+          name: kubevirt-hyperconverged
+          source: redhat-operators
+          sourceNamespace: openshift-marketplace
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for HyperConverged CRD to be available on hub
+      shell: oc get crd hyperconvergeds.hco.kubevirt.io
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_cnv_crd_check
+      until: hub_cnv_crd_check.rc == 0
+      retries: 30
+      delay: 20
+
+    - name: Wait for CNV CSV to succeed on hub
+      shell: |
+        oc get csv -n openshift-cnv \
+          -o jsonpath='{.items[?(@.spec.displayName=="OpenShift Virtualization")].status.phase}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_cnv_csv_status
+      until: "'Succeeded' in hub_cnv_csv_status.stdout"
+      retries: 30
+      delay: 20
+
+    - name: Create HyperConverged CR on hub
+      shell: |
+        oc apply -f - <<'EOF'
+        apiVersion: hco.kubevirt.io/v1beta1
+        kind: HyperConverged
+        metadata:
+          name: kubevirt-hyperconverged
+          namespace: openshift-cnv
+        spec:
+          infra: {}
+          workloads: {}
+        EOF
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+
+    - name: Wait for HyperConverged to be Available on hub
+      shell: |
+        oc get hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+          -o jsonpath='{.status.conditions[?(@.type=="Available")].status}'
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
+      delegate_to: localhost
+      register: hub_hco_status
+      until: hub_hco_status.stdout == "True"
+      retries: 60
+      delay: 20
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display Play 4b result
+      debug:
+        msg: |
+          ============================================
+          OpenShift Virtualization installed on hub
+          ============================================
+          Cluster: {{ cluster_name }} (namespace openshift-cnv)
+          Channel: {{ virt_channel }}
+          HyperConverged Available: {{ hub_hco_status.stdout | default('unknown') }}
+          NOTE: hub has no .metal MachineSet -- VMs will not schedule here
+                until KVM-capable nodes are added.
+
+# =============================================================================
 # Play 5: Wait for Virtualization operator readiness on spokes
 # =============================================================================
 - name: "Play 5: Wait for Virtualization operator readiness on spokes"
@@ -792,6 +974,45 @@
       loop: "{{ spoke_clusters }}"
       ignore_errors: true
 
+    # =========================================================================
+    # Default virtualization StorageClass
+    # ODF only creates {{ odf_virt_storage_class }} once OpenShift Virtualization
+    # is installed, which is what this playbook just did - so infra-dr cannot set
+    # it on a first build (it runs earlier) and it is owned here instead. VM disks
+    # need this class: the cluster-wide default (gp3-csi, RWO Filesystem) is not
+    # live-migratable and breaks cross-cluster live migration.
+    # =========================================================================
+    - name: Wait for the virtualization StorageClass to be created by ODF
+      shell: |
+        oc get storageclass {{ odf_virt_storage_class }} -o name
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+      delegate_to: localhost
+      register: virt_sc_present
+      until: virt_sc_present.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      failed_when: false
+      loop: "{{ spoke_clusters }}"
+
+    - name: Make {{ odf_virt_storage_class }} the default virtualization StorageClass
+      shell: |
+        for sc in $(oc get storageclass \
+          -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubevirt\.io/is-default-virt-class=="true")]}{.metadata.name}{"\n"}{end}'); do
+          [ "$sc" = "{{ odf_virt_storage_class }}" ] && continue
+          oc annotate storageclass "$sc" storageclass.kubevirt.io/is-default-virt-class- --overwrite
+        done
+        oc annotate storageclass {{ odf_virt_storage_class }} \
+          storageclass.kubevirt.io/is-default-virt-class="true" --overwrite
+      environment:
+        KUBECONFIG: "{{ artifacts_dir }}/{{ item.item }}/kubeconfig"
+      delegate_to: localhost
+      loop: "{{ virt_sc_present.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc == 0
+
     - name: Display Play 5 result
       debug:
         msg: |
@@ -799,6 +1020,8 @@
           OpenShift Virtualization Ready on Spokes
           ============================================
           Checked clusters: {{ spoke_clusters | join(', ') }}
+          Default virt StorageClass: {{ odf_virt_storage_class }}
+            {{ virt_sc_present.results | selectattr('rc', 'equalto', 0) | map(attribute='item') | list | join(', ') | default('none yet', true) }}
 
 # =============================================================================
 # Play 6: Deploy VM via GitOps with DR protection
@@ -831,6 +1054,14 @@
              | map(attribute='cluster_name')
              | list }}
 
+    # -------------------------------------------------------------------------
+    # Everything up to here (metal MachineSet + CNV + the virtualization
+    # StorageClass) is the virtualization SUBSTRATE, which use cases 3 and 4 need
+    # too - and neither of those uses Ramen, so neither has a DRPolicy. Only this
+    # play and the next one deploy the Ramen-protected VM of use case 1, so a
+    # missing DRPolicy/GitOps SKIPS them instead of failing the whole run.
+    # Force-skip with -e virt_deploy_dr_vm=false.
+    # -------------------------------------------------------------------------
     - name: Verify GitOps operator is installed
       shell: |
         oc get argocd openshift-gitops -n {{ gitops_namespace }} \
@@ -840,13 +1071,7 @@
       delegate_to: localhost
       register: argocd_check
       changed_when: false
-
-    - name: Fail if GitOps is not installed
-      fail:
-        msg: |
-          OpenShift GitOps is not installed on the hub cluster.
-          Please run './ansible-runner.sh app' first to install GitOps and configure ArgoCD.
-      when: "'Available' not in argocd_check.stdout"
+      when: virt_deploy_dr_vm | default(true) | bool
 
     - name: Verify DRPolicy exists
       shell: |
@@ -856,13 +1081,43 @@
       delegate_to: localhost
       register: drpolicy_check
       changed_when: false
+      when: virt_deploy_dr_vm | default(true) | bool
 
-    - name: Fail if DRPolicy is missing
-      fail:
+    - name: Decide whether the DR-protected VM can be deployed
+      set_fact:
+        virt_dr_vm_ready: >-
+          {{ (virt_deploy_dr_vm | default(true) | bool)
+             and ('Available' in (argocd_check.stdout | default('')))
+             and ((drpolicy_check.stdout | default('') | trim | length) > 0) }}
+
+    - name: Explain why the DR-protected VM is being skipped
+      debug:
         msg: |
-          DRPolicy '{{ dr_policy_name }}' not found on the hub cluster.
-          Please run './ansible-runner.sh infra-dr' and './ansible-runner.sh app' first.
-      when: drpolicy_check.stdout | trim | length == 0
+          ============================================================
+          SKIPPING the DR-protected VM ({{ vm_name | default('vm-dr-example') }}) - use case 1 only
+          ============================================================
+          {% if not (virt_deploy_dr_vm | default(true) | bool) %}
+          Skipped on request (virt_deploy_dr_vm=false).
+          {% else %}
+          {% if 'Available' not in (argocd_check.stdout | default('')) %}
+          - OpenShift GitOps is not installed on the hub.
+          {% endif %}
+          {% if (drpolicy_check.stdout | default('') | trim | length) == 0 %}
+          - DRPolicy '{{ dr_policy_name }}' does not exist on the hub.
+          {% endif %}
+          Run './ansible-runner.sh app' (creates GitOps + MirrorPeer + DRPolicy) and
+          re-run './ansible-runner.sh virt' if you want use case 1's DR-protected VM.
+          {% endif %}
+
+          The virtualization substrate IS ready: metal MachineSet, OpenShift
+          Virtualization and the virtualization StorageClass are installed on the
+          spokes. That is all use case 3 (volsync-dr --vm) and use case 4 (oadp)
+          need - carry on with those.
+      when: not (virt_dr_vm_ready | bool)
+
+    - name: End the play when the DR-protected VM is skipped
+      meta: end_host
+      when: not (virt_dr_vm_ready | bool)
 
   tasks:
     # =========================================================================
@@ -1065,6 +1320,13 @@
     - name: Skip non-hub clusters
       meta: end_host
       when: cluster_role | default('spoke') != 'hub'
+
+    # Play 6 sets virt_dr_vm_ready=false when there is no DRPolicy/GitOps (use
+    # cases 3 and 4 never create one), and the fact carries into this play - so
+    # there is nothing to verify here either.
+    - name: Skip verification when the DR-protected VM was not deployed
+      meta: end_host
+      when: not (virt_dr_vm_ready | default(true) | bool)
 
     - name: Build list of spoke clusters
       set_fact:

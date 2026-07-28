@@ -1,0 +1,127 @@
+---
+# =============================================================================
+# OADP scheduled, label-driven VM backups - use case 4 (ACM policy)
+# =============================================================================
+# Enforced on the spokes. Watches VirtualMachines: any VM labelled `oadp-backup`
+# gets a Velero `Schedule` (the OADP-native backup cronjob) that backs its
+# namespace up every 5 minutes with a 1-hour TTL, using the same
+# DataProtectionApplication / BackupStorageLocation (`dr-s3`) created by `oadp`.
+# Removing the label prunes the Schedule (pruneObjectBehavior: DeleteIfCreated).
+# A second, inform-only ConfigurationPolicy confirms backups are being produced.
+#
+# Values (namespace openshift-adp, BSL dr-s3, cron */5, ttl 1h0m0s, label
+# oadp-backup) mirror the group_vars defaults; change both together if you edit them.
+# =============================================================================
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: oadp-vm-backup-schedule
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/categories: CP Contingency Planning
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/controls: CP-9 System Backup
+spec:
+  disabled: false
+  remediationAction: enforce
+  policy-templates:
+    # ------------------------------------------------------------------------
+    # 1. For every VM labelled `oadp-backup`, create a Velero Schedule.
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-backup-schedules
+        spec:
+          remediationAction: enforce
+          severity: medium
+          pruneObjectBehavior: DeleteIfCreated
+          object-templates-raw: |
+            {{- /* No-op unless OpenShift Virtualization (the VirtualMachine CRD) is present. */ -}}
+            {{- $vmcrd := (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "virtualmachines.kubevirt.io") }}
+            {{- if $vmcrd.metadata }}
+            {{- /* VirtualMachine is namespaced; ACM cannot list it across all namespaces at once, */ -}}
+            {{- /* so iterate namespaces, then the VMs in each. */ -}}
+            {{- range $ns := (lookup "v1" "Namespace" "" "").items }}
+            {{- range $vm := (lookup "kubevirt.io/v1" "VirtualMachine" $ns.metadata.name "").items }}
+            {{- if (index $vm.metadata.labels "oadp-backup") }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: velero.io/v1
+                kind: Schedule
+                metadata:
+                  name: {{ $vm.metadata.name }}-scheduled-backup
+                  namespace: openshift-adp
+                  labels:
+                    oadp-backup-vm: {{ $vm.metadata.name }}
+                    oadp-backup-namespace: {{ $vm.metadata.namespace }}
+                spec:
+                  schedule: "*/5 * * * *"
+                  template:
+                    # stamped onto every Backup this Schedule produces, so the
+                    # auto-restore policy (acm-policy-oadp-autorestore.yaml) can
+                    # tell which VM a backup in the shared bucket belongs to
+                    metadata:
+                      labels:
+                        oadp-backup-vm: {{ $vm.metadata.name }}
+                        oadp-backup-namespace: {{ $vm.metadata.namespace }}
+                    includedNamespaces:
+                      - {{ $vm.metadata.namespace }}
+                    storageLocation: dr-s3
+                    # CSI snapshot -> data mover -> S3 (VM disks are volumeMode Block)
+                    snapshotMoveData: true
+                    ttl: 1h0m0s
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+    # ------------------------------------------------------------------------
+    # 2. Confirm backups are being produced: for each Schedule we created, assert
+    #    at least one Backup carrying that schedule's name label exists. Inform
+    #    only (reports NonCompliant until the first scheduled backup lands).
+    # ------------------------------------------------------------------------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: oadp-vm-backup-confirm
+        spec:
+          remediationAction: inform
+          severity: low
+          object-templates-raw: |
+            {{- range $s := (lookup "velero.io/v1" "Schedule" "openshift-adp" "").items }}
+            {{- if (index $s.metadata.labels "oadp-backup-vm") }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: velero.io/v1
+                kind: Backup
+                metadata:
+                  namespace: openshift-adp
+                  labels:
+                    velero.io/schedule-name: {{ $s.metadata.name }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: oadp-schedule-placement
+  namespace: open-cluster-management-global-set
+spec:
+  clusterSets:
+    - dr-clusters
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: oadp-vm-backup-schedule-binding
+  namespace: open-cluster-management-global-set
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: oadp-schedule-placement
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: oadp-vm-backup-schedule

@@ -1,0 +1,508 @@
+---
+# VolSync failover/failback automation for the DR demo VirtualMachine.
+#
+# This is the VM analogue of acm-policy-volsync-automate.yaml (the Quarkus app):
+# same active/standby design driven by the app-role ManagedCluster label, but
+# every object is scoped to the vm-example-volsync namespace and the vm-data-pvc data
+# disk, and all names are prefixed vm- so the two stacks never collide.
+#
+#   * Standby clusters (app-role != active): run a ReplicationDestination that
+#     receives the replicated vm-data-pvc; the destination rsync-tls Service is
+#     published (LoadBalancer or, under Submariner, the clusterset address).
+#   * Active cluster (app-role=active): runs a ReplicationSource that pushes
+#     vm-data-pvc to the standby's discovered address.
+#   * On a label flip the wrong-role resource is deleted and recreated on the
+#     right cluster - but the delete is SKIPPED while a resource reports
+#     Synchronizing=True so an in-flight rsync is never torn down mid-transfer.
+#
+# NOTE: this is an ALTERNATIVE to acm-policy-volsync-automate.yaml. Deploy the
+# VM demo (deployvm) or the app demo (deployapp), not both at once.
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-source-hub-views
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-vs-source-create-views
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- range $managedCluster := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if and (ne (index $managedCluster.metadata.labels "name") "local-cluster") (ne (index $managedCluster.metadata.labels "app-role") "active") }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: view.open-cluster-management.io/v1beta1
+                kind: ManagedClusterView
+                metadata:
+                  name: volsync-dest-info-vm-data
+                  namespace: {{ $managedCluster.metadata.name }}
+                  labels:
+                    app: volsync-vm
+                    volsync-role: destination-info
+                spec:
+                  scope:
+                    name: vm-data-volsync-destination-standby
+                    namespace: vm-example-volsync
+                    kind: ReplicationDestination
+                    apiGroup: volsync.backube
+                    version: v1alpha1
+            {{- end }}
+            {{- end }}
+            {{- $mcvList := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" "" "").items }}
+            {{- range $mcv := $mcvList }}
+            {{- if and (index $mcv.metadata.labels "volsync-role") (eq (index $mcv.metadata.labels "volsync-role") "destination-info") (eq (index $mcv.metadata.labels "app") "volsync-vm") }}
+            {{- $shouldDelete := true }}
+            {{- range $managedCluster := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items }}
+            {{- if and (ne (index $managedCluster.metadata.labels "name") "local-cluster") (ne (index $managedCluster.metadata.labels "app-role") "active") }}
+            {{- if eq $mcv.metadata.namespace $managedCluster.metadata.name }}
+            {{- $shouldDelete = false }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if $shouldDelete }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: view.open-cluster-management.io/v1beta1
+                kind: ManagedClusterView
+                metadata:
+                  name: {{ $mcv.metadata.name }}
+                  namespace: {{ $mcv.metadata.namespace }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-dest-info-hub
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-vs-dest-info-configmap
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- $dr := (lookup "v1" "ConfigMap" "open-cluster-management-global-set" "volsync-dr-config-vm").data }}
+            {{- $submariner := and $dr (eq ($dr.submarinerEnabled | default "false") "true") }}
+            {{- $mcvList := (lookup "view.open-cluster-management.io/v1beta1" "ManagedClusterView" "" "").items }}
+            {{- range $mcv := $mcvList }}
+            {{- if and (index $mcv.metadata.labels "volsync-role") (eq (index $mcv.metadata.labels "volsync-role") "destination-info") (eq (index $mcv.metadata.labels "app") "volsync-vm") }}
+            {{- if $mcv.status.result }}
+            {{- $dest := $mcv.status.result }}
+            {{- if or $submariner $dest.status.rsyncTLS.address }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: volsync-dest-info-vm-data
+                  namespace: open-cluster-management-global-set
+                data:
+                  address: {{ if $submariner }}{{ $dr.address | quote }}{{ else }}{{ $dest.status.rsyncTLS.address | quote }}{{ end }}
+                  keySecret: {{ $dest.spec.rsyncTLS.keySecret | quote }}
+                  storageClassName: {{ $dest.spec.rsyncTLS.storageClassName | default "" | quote }}
+                  volumeSnapshotClassName: {{ $dest.spec.rsyncTLS.volumeSnapshotClassName | default "" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-source-active
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-vs-dest-info-configmap-copy
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{hub- $cm := (lookup "v1" "ConfigMap" "open-cluster-management-global-set" "volsync-dest-info-vm-data") hub}}
+            {{hub- if $cm hub}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: volsync-dest-info-vm-data
+                  namespace: vm-example-volsync
+                data:
+                  address: {{hub $cm.data.address | quote hub}}
+                  keySecret: {{hub $cm.data.keySecret | quote hub}}
+                  storageClassName: {{hub $cm.data.storageClassName | quote hub}}
+                  volumeSnapshotClassName: {{hub $cm.data.volumeSnapshotClassName | quote hub}}
+            {{hub- end hub}}
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-vs-source-create-replicationsource
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- $cm := (lookup "v1" "ConfigMap" "vm-example-volsync" "volsync-dest-info-vm-data") }}
+            {{- if and $cm $cm.data }}
+            {{- if $cm.data.address }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: volsync.backube/v1alpha1
+                kind: ReplicationSource
+                metadata:
+                  name: volsync-source-vm-data-pvc
+                  namespace: vm-example-volsync
+                spec:
+                  sourcePVC: vm-data-pvc
+                  trigger:
+                    schedule: "*/5 * * * *"
+                  rsyncTLS:
+                    keySecret: {{ $cm.data.keySecret }}
+                    address: {{ $cm.data.address | quote }}
+                    copyMethod: Snapshot
+                    {{- if ne $cm.data.storageClassName "" }}
+                    storageClassName: {{ $cm.data.storageClassName }}
+                    {{- end }}
+                    {{- if ne $cm.data.volumeSnapshotClassName "" }}
+                    volumeSnapshotClassName: {{ $cm.data.volumeSnapshotClassName }}
+                    {{- end }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-dest-active-del
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-volsync-destination-delete-active
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- range $volsyncdest := (lookup "volsync.backube/v1alpha1" "ReplicationDestination" "vm-example-volsync" "").items }}
+            {{- /* Do not delete a destination while VolSync is mid-transfer; a
+                   Synchronizing=True condition means an rsync is landing on this
+                   receive endpoint and tearing it down would abort the in-flight
+                   session. The policy re-evaluates on its interval, so it is
+                   removed on a later pass once the sync completes. */}}
+            {{- $syncing := false }}
+            {{- if $volsyncdest.status }}
+            {{- range $cond := ($volsyncdest.status.conditions | default list) }}
+            {{- if and (eq $cond.type "Synchronizing") (eq $cond.status "True") }}
+            {{- $syncing = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if not $syncing }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: volsync.backube/v1alpha1
+                kind: ReplicationDestination
+                metadata:
+                  name: {{ $volsyncdest.metadata.name }}
+                  namespace: {{ $volsyncdest.metadata.namespace }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-source-standby-del
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-volsync-replicationsource-delete-standby
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{- range $volsyncsrc := (lookup "volsync.backube/v1alpha1" "ReplicationSource" "vm-example-volsync" "").items }}
+            {{- /* Do not delete a source while VolSync is mid-transfer; a
+                   Synchronizing=True / SyncInProgress condition means an rsync
+                   is in flight and tearing it down could corrupt the standby
+                   snapshot. The policy re-evaluates on its interval, so the
+                   source is removed on a later pass once the sync completes. */}}
+            {{- $syncing := false }}
+            {{- if $volsyncsrc.status }}
+            {{- range $cond := ($volsyncsrc.status.conditions | default list) }}
+            {{- if and (eq $cond.type "Synchronizing") (eq $cond.status "True") }}
+            {{- $syncing = true }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if not $syncing }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: volsync.backube/v1alpha1
+                kind: ReplicationSource
+                metadata:
+                  name: {{ $volsyncsrc.metadata.name }}
+                  namespace: {{ $volsyncsrc.metadata.namespace }}
+            {{- end }}
+            {{- end }}
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: vm-vs-dest-standby
+  namespace: open-cluster-management-global-set
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: vm-volsync-destination-pvc-standby
+        spec:
+          remediationAction: enforce
+          severity: low
+          # serviceType + storage classes come from the hub volsync-dr-config-vm
+          # ConfigMap (written by deployvm). Under Submariner: ClusterIP (the
+          # service is exported across the clusterset); otherwise LoadBalancer.
+          object-templates-raw: |
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: volsync.backube/v1alpha1
+                kind: ReplicationDestination
+                metadata:
+                  name: vm-data-volsync-destination-standby
+                  namespace: vm-example-volsync
+                spec:
+                  trigger:
+                    schedule: "*/2 * * * *"
+                  rsyncTLS:
+                    serviceType: '{{hub fromConfigMap "open-cluster-management-global-set" "volsync-dr-config-vm" "serviceType" hub}}'
+                    copyMethod: Snapshot
+                    destinationPVC: vm-data-pvc
+                    storageClassName: '{{hub fromConfigMap "open-cluster-management-global-set" "volsync-dr-config-vm" "storageClassName" hub}}'
+                    keySecret: volsync-rsync-tls-vm-data-pvc
+                    volumeSnapshotClassName: '{{hub fromConfigMap "open-cluster-management-global-set" "volsync-dr-config-vm" "volumeSnapshotClassName" hub}}'
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-source-hub-views
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-hub
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-source-hub-views
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-dest-info-hub
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-hub
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-dest-info-hub
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-dest-active-del
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-active
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-dest-active-del
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-source-active
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-active
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-source-active
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-source-standby-del
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-standby
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-source-standby-del
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-vm-vs-dest-standby
+  namespace: open-cluster-management-global-set
+placementRef:
+  name: vm-placement-standby
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: vm-vs-dest-standby
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: vm-placement-hub
+  namespace: open-cluster-management-global-set
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values:
+                - local-cluster
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: vm-placement-active
+  namespace: open-cluster-management-global-set
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: app-role
+              operator: In
+              values:
+                - active
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: vm-placement-standby
+  namespace: open-cluster-management-global-set
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: app-role
+              operator: NotIn
+              values:
+                - active
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: vm-placement-active
+  namespace: openshift-gitops
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: app-role
+              operator: In
+              values:
+                - active
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: vm-placement-standby
+  namespace: openshift-gitops
+spec:
+  clusterSets:
+    - dr-clusters
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: app-role
+              operator: NotIn
+              values:
+                - active

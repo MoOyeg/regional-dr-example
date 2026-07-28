@@ -2,9 +2,10 @@
 # Global variables for all clusters
 # These can be overridden in host_vars for specific clusters
 
-# OpenShift version (minor only - the Containerfile pulls the latest stable-<minor>
-# installer, so "4.21" == the most stable 4.21.z, currently 4.21.22)
-openshift_version: "4.21"
+# OpenShift version (exact x.y.z - the Containerfile pulls this exact release from
+# the mirror at /clients/ocp/<version>/, so this MUST be a full z-version, e.g.
+# "4.22.5". A bare minor like "4.22" or a "stable-<minor>" value will 404.)
+openshift_version: "4.22.5"
 
 # AWS account selection (sno-cluster-ocpv style): each cluster picks its AWS
 # account via a named profile in ~/.aws/credentials ([section] per account),
@@ -256,6 +257,91 @@ dr_replication_interval: "5m"
 # StorageClass for app PVCs (must support Ceph RBD mirroring)
 app_pvc_storage_class: "ocs-storagecluster-ceph-rbd"
 
+# VolSync Direct DR (use case 3) - label-flip (app-role) failover, no Ramen
+# =========================================================================
+# An ALTERNATIVE DR engine to use case 1: instead of ODF mirroring + Ramen DRPC,
+# VolSync syncs PVCs directly spoke-to-spoke over rsync-tls, orchestrated by ACM
+# policies keyed on the `app-role: active/standby` ManagedCluster label. Failover
+# is a LABEL FLIP on the hub (no redeploy): the active spoke runs the workload +
+# a VolSync ReplicationSource; the standby runs a ReplicationDestination; GitOps
+# moves the app onto whichever spoke is labeled active. Deployed into DEDICATED
+# namespaces so it coexists with the Ramen-based use case 1 (which owns
+# quarkus-web-app / vm-example). Ported from MoOyeg/sno-disaster-recovery.
+# See "Use case 3" in the README.
+volsync_app_namespace: "quarkus-web-app-volsync"
+volsync_vm_namespace: "vm-example-volsync"
+volsync_storage_class: "ocs-storagecluster-ceph-rbd"              # RWO Block for the app/VM PVCs
+volsync_snapshot_class: "ocs-storagecluster-rbdplugin-snapclass"  # VolSync copyMethod: Snapshot
+volsync_use_submariner: true            # true = ClusterIP + ServiceExport (svc.clusterset.local); false = LoadBalancer
+volsync_source_schedule: "*/5 * * * *"  # ReplicationSource cadence = the RPO
+volsync_dest_schedule: "*/2 * * * *"    # ReplicationDestination cadence
+volsync_app_pvc: "mysql-pvc"            # app data PVC replicated by VolSync
+volsync_vm_pvc: "vm-data-pvc"           # VM data-disk PVC replicated by VolSync
+# ACM namespace the VolSync DR policies live in (the global-set ns exists in ACM 2.x)
+volsync_policy_namespace: "open-cluster-management-global-set"
+# Active spoke (runs the workload + ReplicationSource); the other spoke is standby.
+# Defaults to spoke_clusters[0]; override: ./ansible-runner.sh volsync-dr -e volsync_active=cluster3
+# volsync_active: "cluster2"
+
+# OADP (OpenShift API for Data Protection) backup & recovery - use case 4
+# =========================================================================
+# Back up a VM namespace on one spoke to an S3 bucket and restore it on the other.
+# The OADP operator is installed by `operators`; `oadp` provisions the bucket +
+# DataProtectionApplication, and `oadp-backup` / `oadp-restore` drive a backup and
+# restore. Both spokes' OADP use the SAME bucket-owner AWS credentials so a single
+# bucket (in oadp_aws_profile's account) is reachable from both. See "use case 4".
+oadp_namespace: "openshift-adp"
+oadp_aws_profile: "default"               # AWS account that owns the backup bucket
+oadp_s3_region: "us-east-2"
+oadp_s3_bucket: ""                        # empty -> auto-named oadp-dr-<managed_cluster_set_name>
+oadp_dpa_name: "dpa-dr"
+oadp_bsl_name: "dr-s3"
+oadp_backup_vm_namespace: "vm-example"    # namespace backed up / restored
+oadp_backup_name: "vm-backup"
+
+# OADP scheduled, label-driven backups (use case 4, ACM policy)
+# =========================================================================
+# `oadp` also creates an ACM Policy (acm-policy-oadp-schedule.yaml, enforced on
+# the spokes) that watches VirtualMachines: label a VM with `oadp-backup` and the
+# policy creates a Velero `Schedule` (the OADP-native "backup cronjob") that backs
+# that VM's namespace up every 5 minutes with a 1-hour TTL, to the same S3 bucket.
+# Remove the label -> the Schedule is pruned. A second (inform) policy confirms
+# backups are being produced. With */5 + 1h TTL, steady state is ~12 live backups.
+# The policy file hardcodes these values (standard); they are documented here.
+oadp_backup_label: "oadp-backup"          # label a VM with this to enable scheduled backups
+oadp_schedule_cron: "*/5 * * * *"         # Velero Schedule cron (every 5 minutes)
+oadp_backup_schedule_ttl: "1h0m0s"        # each scheduled backup expires after 1 hour
+oadp_policy_namespace: "open-cluster-management-global-set"   # ACM ns holding the OADP policy
+
+# OADP automatic failover / auto-restore (use case 4, ACM policy)
+# =========================================================================
+# `oadp` also creates acm-policy-oadp-autorestore.yaml, which watches the VM on
+# the spoke labelled `oadp-role=active`. If that VM stops being available for
+# oadp_failover_grace_seconds, the hub hands the active role to the peer spoke,
+# which restores the newest backup out of the shared bucket and then takes over
+# the scheduled backups - so the same machinery runs in the other direction.
+# Failback is a label flip you make yourself:
+#   oc label managedcluster <back-to> oadp-role=active  --overwrite
+#   oc label managedcluster <other>   oadp-role=standby --overwrite
+# The initial roles are only assigned when no spoke carries an oadp-role label
+# yet, so re-running `oadp` never yanks the role back after a failover.
+oadp_autorestore_enabled: true            # set false to skip the auto-failover policy
+oadp_dr_vm_name: "vm-dr-example"          # the VM protected by auto-failover
+# Its OWN namespace, deliberately not vm-example: use case 1 (Ramen) DR-protects
+# vm-example and ArgoCD keeps it synced, so an OADP failover there would be
+# undone by GitOps and would fight Ramen. Same split as use case 3's
+# vm-example-volsync namespace. Manifests live in vm-app-oadp/.
+oadp_dr_vm_namespace: "vm-example-oadp"
+oadp_deploy_demo_vm: true                 # deploy vm-app-oadp/ to the active spoke
+# oadp_active: "cluster2"                 # spoke that starts as active (default: first spoke)
+oadp_failover_grace_seconds: 30           # VM must stay unavailable this long before failover
+oadp_standby_cleanup: true                # standby drops its stale VM copy + that VM's PVCs
+                                          # (needed for failback: Velero will not re-hydrate an
+                                          # existing PVC). Set false if something else owns the
+                                          # VM namespace on the standby - e.g. Ramen (use case 1)
+                                          # protecting the SAME namespace.
+oadp_failover_timer_image: "registry.access.redhat.com/ubi9/ubi-minimal:latest"
+
 # OpenShift GitOps operator channel (installed on hub for ArgoCD push mode)
 gitops_channel: "latest"
 
@@ -291,6 +377,23 @@ virt_app_name: "vm-dr-example"
 # Whether to deploy CNV operator to ALL spoke clusters or only those with virt: true
 virt_deploy_all_clusters: true
 
+# Whether to ALSO install the OpenShift Virtualization operator on the hub cluster.
+# Unlike the spokes, the hub is NOT given a bare-metal MachineSet, so the CNV
+# control plane installs and the HyperConverged CR reconciles, but VMs cannot be
+# scheduled on the hub until it has KVM-capable (.metal) nodes. Installed directly
+# on the hub (not via ACM Policy) since the hub is local-cluster. Set false to skip.
+virt_deploy_hub: true
+
+# Whether `virt` should also deploy the Ramen DR-protected VM of USE CASE 1
+# (Plays 6-7: the GitOps Application + DRPlacementControl for vm-dr-example).
+# Those plays need OpenShift GitOps AND a DRPolicy, both created by
+# `./ansible-runner.sh app`. Use cases 3 (volsync-dr --vm) and 4 (oadp) need the
+# virtualization SUBSTRATE only - metal MachineSet + CNV + StorageClass, Plays
+# 1-5 - and neither uses Ramen, so neither ever has a DRPolicy. When GitOps or
+# the DRPolicy is absent the DR-VM plays are SKIPPED with an explanation rather
+# than failing the run; set this to false to skip them unconditionally.
+virt_deploy_dr_vm: true
+
 # Path within the Git repo to the VM manifests directory
 virt_git_path: "vm-app"
 
@@ -321,4 +424,72 @@ cclm_sync_port: 9185
 cclm_vm_namespace: "{{ virt_namespace }}"
 # Max seconds to wait for a migration to reach Succeeded
 cclm_migration_timeout: 1800
+
+# Red Hat Service Interconnect (RHSI) + CloudNativePG cross-site Postgres - use case 5
+# =========================================================================
+# RHSI (Skupper v2, apiVersion skupper.io/v2alpha1) builds a layer-7 Virtual
+# Application Network (VAN) between the two spokes so services reach each other ACROSS
+# clusters WITHOUT Submariner / shared CIDRs. `rhsi` builds:
+#   1. skupper-operator + Network Observer on each spoke
+#   2. a Site per spoke (in cnpg_namespace) + an mTLS Link between them
+#      (AccessGrant on the primary spoke -> AccessToken on the secondary spoke)
+#   3. CloudNativePG operator on each spoke, and a distributed-topology Postgres:
+#      a PRIMARY Cluster on the active spoke + a streaming REPLICA on the standby
+#      spoke. RHSI carries the streaming replication AND the app write path.
+#   4. an ACM policy engine (hub, enforced on spokes) keyed on the `pg-role:
+#      active/standby` ManagedCluster label:
+#        - both spokes get the CNPG `Cluster` (role driven by a hub template that
+#          reads which spoke is pg-role=active) + a `pg-write` Skupper Listener.
+#        - the active spoke additionally gets a `pg-write` Connector -> its local
+#          primary (pruned when it stops being active, so the write path follows).
+#        - a hub relay (ManagedClusterView -> hub ConfigMap -> hub templates)
+#          carries CNPG's demotionToken from the old primary to the new one so the
+#          label-flip is a zero-data-loss CONTROLLED switchover, not a failover.
+# Failover = flip `pg-role` on the hub; CNPG promotes/demotes and the Connector moves.
+# See "use case 5" in the README. Playbooks written but NOT yet run on live clusters.
+# -- RHSI operators / fabric --------------------------------------------------
+rhsi_channel: "stable-2"                        # skupper-operator v2 channel (v1 = stable-1)
+# BOTH RHSI operators install into openshift-operators, which on OpenShift carries the
+# `global-operators` OperatorGroup with an empty targetNamespaces -> AllNamespaces (cluster-wide)
+# install mode, so Sites/Connectors/Listeners can be created in ANY namespace.
+rhsi_operator_namespace: "openshift-operators"
+# Service Interconnect Network Observer ("Observe") operator. Red Hat ships it in redhat-operators as
+# `skupper-netobs-operator` (NOT "network-observer" - verified against a live 2.x catalog, default
+# channel stable-2). If that package is missing the play falls back to discovery, then warns and skips.
+# NB: the discovery pattern deliberately does NOT match `netobserv-operator`, which is the unrelated
+# OpenShift Network Observability product. Empty channel = the package defaultChannel.
+rhsi_install_observer: true
+rhsi_observer_package: "skupper-netobs-operator"   # "" = auto-discover from packagemanifests
+rhsi_observer_channel: ""                          # "" = package defaultChannel
+rhsi_site_prefix: "rhsi"                        # Site name = <prefix>-<cluster_name>
+rhsi_grant_name: "rhsi-grant"                   # AccessGrant on the primary spoke
+rhsi_token_name: "rhsi-token"                   # AccessToken on the secondary spoke
+# -- CloudNativePG (community CNPG) -------------------------------------------
+# Distributed topology needs CNPG >= 1.24 (spec.replica.self/primary/source +
+# promotionToken). Package/channel/CRD are the community `cloudnative-pg` build;
+# verify against the live catalog (`oc get packagemanifest | grep -i cloudnative`).
+cnpg_operator_namespace: "openshift-operators"  # AllNamespaces, so Clusters live in cnpg_namespace
+cnpg_channel: "stable-v1"                        # verify: community CNPG channel
+cnpg_package: "cloudnative-pg"                   # verify: packagemanifest name
+cnpg_catalog_source: "certified-operators"     # verified live: cloudnative-pg ships in the CERTIFIED catalog, not community
+cnpg_csv_display_name: "CloudNativePG"           # for the CSV-Succeeded wait
+cnpg_namespace: "postgres-dr"                    # Site + CNPG Cluster + app all live here
+cnpg_cluster_name: "pg"                           # Services: pg-rw / pg-ro / pg-r
+cnpg_instances: 1
+cnpg_storage_class: "ocs-storagecluster-ceph-rbd"
+cnpg_storage_size: "1Gi"
+cnpg_pg_port: 5432
+cnpg_db_name: "appdb"                            # bootstrap.initdb database + app DB_NAME
+cnpg_db_owner: "appuser"                          # bootstrap.initdb owner (creds in cnpg_app_secret)
+cnpg_write_key: "pg-write"                        # the only cross-VAN routing key -> current primary
+cnpg_read_service: "pg-r"                         # app reads its LOCAL any-instance Service (no VAN)
+cnpg_ca_secret: "cnpg-ca"                         # shared CA (ca.crt + ca.key) side-loaded to both spokes
+cnpg_replication_secret: "cnpg-replication"       # shared streaming_replica client cert (tls.crt/tls.key)
+cnpg_app_secret: "cnpg-app-secret"               # basic-auth (username/password) for the app + initdb
+# The sample app image (has psql; runs the read/write loop) is set in app-cnpg/pg-app.yaml
+# -- ACM policy engine / failover control surface -----------------------------
+cnpg_policy_namespace: "open-cluster-management-global-set"  # where the ACM policies live (hub)
+cnpg_role_label: "pg-role"                        # ManagedCluster label: active|standby (flip = failover)
+cnpg_active: ""                                   # "" = default to spoke_clusters[0] as the initial primary
+cnpg_remove_operator: true                        # destroy: also uninstall the CNPG operator
 
