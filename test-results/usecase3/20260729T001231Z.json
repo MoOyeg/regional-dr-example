@@ -1,0 +1,34 @@
+{
+    "caveats": {
+        "baseline_dirty": false,
+        "git_dirty": true
+    },
+    "diagnostics_dir": "/root/repos/regional-dr-example/test-results/usecase3/20260729T001231Z-diagnostics",
+    "environment": {
+        "clusters": {},
+        "collected_at": "2026-07-29T00:12:35Z",
+        "note": "clusters unreachable at run time",
+        "operators": {}
+    },
+    "failure": {
+        "message": "cluster1: Unable to connect to the server: dial tcp: lookup api.cluster1.sandbox602.opentlc.com on 192.168.5.5:53: no such host | cluster2: Unable to connect to the server: dial tcp: lookup api.cluster2.sandbox2418.opentlc.com on 192.168.5.5:53: no such host | cluster3: Unable to connect to the server: dial tcp: lookup api.cluster3.sandbox2414.opentlc.com on 192.168.5.5:53: no such host",
+        "phase": "preflight"
+    },
+    "git": {
+        "branch": "main",
+        "commit": "e128962",
+        "committed_at": "2026-07-28T00:24:00-04:00",
+        "dirty_files": "5"
+    },
+    "phases": [],
+    "recorded_at": "2026-07-29T00:12:39Z",
+    "result": "env-unavailable",
+    "run_id": "20260729T001231Z",
+    "seed": {},
+    "timings": {},
+    "use_case": {
+        "id": "3",
+        "name": "use case 3"
+    },
+    "verification": {}
+}

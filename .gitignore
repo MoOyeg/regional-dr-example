@@ -42,3 +42,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test framework: keep the ledger and result records (they answer "when did it
+# last pass"), drop the verbose captures
+test-results/**/*-diagnostics/
+test-results/**/*-prereq-*.log

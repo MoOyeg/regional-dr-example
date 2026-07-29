@@ -1,0 +1,83 @@
+---
+# =============================================================================
+# Environment facts: what was this tested against?
+# =============================================================================
+# Answers "when did this last pass, and on what?" - date, git commit, OpenShift
+# version per cluster, and the operator versions that actually decide behaviour
+# (a CNPG or ODF bump can change a DR outcome without a single repo change).
+# Everything here is best-effort: a missing operator records "absent", never
+# fails the run.
+# =============================================================================
+
+- name: Collect git provenance
+  shell: |
+    cd {{ repo_root }}
+    printf '%s|%s|%s|%s' \
+      "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+      "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+      "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
+      "$(git log -1 --format=%cI 2>/dev/null || echo unknown)"
+  register: test_git_raw
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+
+- name: Structure git provenance
+  set_fact:
+    test_git:
+      commit: "{{ (test_git_raw.stdout | default('unknown|unknown|0|unknown')).split('|')[0] }}"
+      branch: "{{ (test_git_raw.stdout | default('unknown|unknown|0|unknown')).split('|')[1] }}"
+      dirty_files: "{{ (test_git_raw.stdout | default('unknown|unknown|0|unknown')).split('|')[2] | int }}"
+      committed_at: "{{ (test_git_raw.stdout | default('unknown|unknown|0|unknown')).split('|')[3] }}"
+
+- name: Record a minimal environment when the clusters are unreachable
+  # Git provenance above is always collected - it needs no cluster, and a run
+  # that could not reach the environment still has to be attributable.
+  set_fact:
+    test_environment:
+      collected_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      clusters: {}
+      operators: {}
+      note: "clusters unreachable at run time"
+  when: not (test_env_ok | default(true))
+
+- name: Collect OpenShift version per cluster
+  shell: |
+    oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get clusterversion version \
+      -o jsonpath='{.status.desired.version}' 2>/dev/null || echo unknown
+  register: test_ocp_versions
+  loop: "{{ test_clusters }}"
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+  when: test_env_ok | default(true)
+
+- name: Collect operator versions (CSVs) across the clusters
+  # One pass per cluster; the CSV name carries the version, which is what
+  # actually matters when a DR behaviour changes without a repo change.
+  shell: |
+    oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get csv -A \
+      -o jsonpath='{range .items[*]}{.spec.displayName}={.spec.version}{"\n"}{end}' 2>/dev/null \
+      | sort -u | grep -viE '^=' | head -40 || true
+  register: test_csv_raw
+  loop: "{{ test_clusters }}"
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+  when: test_env_ok | default(true)
+
+- name: Assemble the environment record
+  when: test_env_ok | default(true)
+  set_fact:
+    test_environment:
+      collected_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      clusters: >-
+        {{ dict(test_clusters | zip(test_ocp_versions.results | map(attribute='stdout') | map('trim') | list)) }}
+      operators: >-
+        {{ dict(test_clusters | zip(test_csv_raw.results | map(attribute='stdout') | map('default', '') | list)) }}
+
+- name: Show what we are testing against
+  debug:
+    msg:
+      - "git      : {{ test_git.commit }} ({{ test_git.branch }}){{ ', DIRTY: ' ~ test_git.dirty_files ~ ' file(s)' if test_git.dirty_files | int > 0 else '' }}"
+      - "clusters : {{ test_environment.clusters }}"

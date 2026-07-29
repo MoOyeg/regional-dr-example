@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# Preflight: is the environment actually there?
+# =============================================================================
+# Sets test_env_ok / test_env_detail. A run against dead clusters must be
+# recorded as ENV-UNAVAILABLE, never as a pass or a functional failure:
+# on 2026-07-28 `rhsi --destroy` reported PLAY RECAP failed=0 against three
+# expired clusters purely because its tasks are ignore_errors: true. A green
+# recap proved nothing. Every use case test therefore starts here.
+# =============================================================================
+
+- name: Reset preflight state
+  set_fact:
+    test_env_ok: true
+    test_env_detail: []
+
+- name: Check each cluster kubeconfig exists
+  stat:
+    path: "{{ artifacts_dir }}/{{ item }}/kubeconfig"
+  register: test_kubeconfig_stat
+  loop: "{{ test_clusters }}"
+  delegate_to: localhost
+
+- name: Check each cluster API answers
+  # `oc get --raw` takes no -o flag ("--raw and --output are mutually exclusive"),
+  # which would make every cluster look unreachable regardless of its real state.
+  shell: |
+    oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig \
+      get --raw /version 2>&1 | head -c 400
+  register: test_api_check
+  loop: "{{ test_clusters }}"
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+  environment:
+    KUBECONFIG: ""
+
+- name: Record unreachable clusters
+  set_fact:
+    test_env_ok: false
+    test_env_detail: "{{ test_env_detail + [item.item ~ ': ' ~ (item.stdout | default('') | trim | truncate(160))] }}"
+  loop: "{{ test_api_check.results }}"
+  when: item.rc != 0 or 'gitVersion' not in (item.stdout | default(''))
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Report preflight outcome
+  debug:
+    msg: >-
+      {{ 'PREFLIGHT OK - ' ~ (test_clusters | join(', ')) ~ ' all reachable'
+         if test_env_ok
+         else 'PREFLIGHT FAILED - environment unavailable: ' ~ (test_env_detail | join(' | ')) }}

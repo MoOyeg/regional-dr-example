@@ -1,0 +1,253 @@
+---
+# =============================================================================
+# Use case 5 - CNPG cross-site Postgres over RHSI
+# =============================================================================
+# Prereq  : rhsi
+# Seed    : INSERT a row carrying a unique marker on the current primary
+# Action  : flip the pg-role label (and NOTHING else - the whole claim is that
+#           this alone performs a controlled switchover)
+# Verify  : on the NEW primary - the marker row survived (zero data loss), the
+#           site is genuinely read-write, a fresh write replicates BACK to the
+#           demoted site, and the pg-write Connector followed.
+#
+# Why the verification is shaped like this: on 2026-07-28 the switchover
+# deadlocked with BOTH sites left as replicas, while pg_stat_wal_receiver
+# happily reported "streaming" the entire time. Checking a status field would
+# have passed. Only reading the payload from the peer, and requiring an actual
+# read-write site, catches it.
+# =============================================================================
+
+- name: "UC5: initialise"
+  set_fact:
+    uc_id: "5"
+    uc_name: "CNPG cross-site Postgres over RHSI"
+    uc_phases: []
+    uc_timings: {}
+    uc_failure: {}
+    uc_seed: {}
+    uc_verify: {}
+    uc_result: "fail"
+    uc_diag_dir: "{{ test_results_dir }}/usecase5/{{ test_run_id }}-diagnostics"
+    uc5_ns: "{{ cnpg_namespace | default('postgres-dr') }}"
+    uc5_cluster: "{{ cnpg_cluster_name | default('pg') }}"
+    uc5_marker: "uc5-{{ test_run_id }}-{{ 999999 | random }}"
+    uc5_switchover_slo_s: 300
+
+- name: "UC5: run the prerequisite command (rhsi)"
+  block:
+    - name: "UC5: rhsi"
+      command:
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/setup-rhsi.yml
+        chdir: "{{ repo_root }}"
+      register: uc5_prereq
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+
+    - name: "UC5: save the prereq log"
+      copy:
+        content: "{{ uc5_prereq.stdout | default('') }}\n{{ uc5_prereq.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase5/{{ test_run_id }}-prereq-rhsi.log"
+        mode: "0644"
+      delegate_to: localhost
+
+    # A non-zero rc OR any failed= in the recap is a failure. Parsing the recap
+    # matters: a playbook whose tasks are ignore_errors can exit 0 having done
+    # nothing at all.
+    - name: "UC5: assert the prereq succeeded"
+      set_fact:
+        uc5_prereq_ok: >-
+          {{ uc5_prereq.rc == 0
+             and (uc5_prereq.stdout is search('failed=0'))
+             and not (uc5_prereq.stdout is search('failed=[1-9]')) }}
+
+    - name: "UC5: record the prereq phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'prereq:rhsi', 'status': 'pass' if uc5_prereq_ok else 'fail', 'detail': 'rc=' ~ uc5_prereq.rc}] }}"
+  when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
+
+- name: "UC5: functional test"
+  block:
+    # -------------------------------------------------------------------------
+    # Establish the starting topology
+    # -------------------------------------------------------------------------
+    - name: "UC5: find the site that is currently read-write"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select pg_is_in_recovery()" 2>/dev/null | tr -d ' \r'
+      register: uc5_roles
+      loop: "{{ test_spokes }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC5: resolve primary and standby"
+      set_fact:
+        uc5_primary: "{{ (uc5_roles.results | selectattr('stdout', 'equalto', 'f') | map(attribute='item') | list | first) | default('') }}"
+        uc5_standby: "{{ (uc5_roles.results | selectattr('stdout', 'equalto', 't') | map(attribute='item') | list | first) | default('') }}"
+
+    - name: "UC5: require exactly one primary and one standby before starting"
+      fail:
+        msg: >-
+          Expected one read-write site and one replica, got
+          {{ dict(uc5_roles.results | map(attribute='item') | zip(uc5_roles.results | map(attribute='stdout'))) }}.
+          (Both 'f' = split brain; both 't' = the deadlock where no site is writable.)
+      when: uc5_primary == '' or uc5_standby == '' or uc5_primary == uc5_standby
+
+    - name: "UC5: record the starting topology"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'topology', 'status': 'pass', 'detail': 'primary=' ~ uc5_primary ~ ' standby=' ~ uc5_standby}] }}"
+
+    # -------------------------------------------------------------------------
+    # Seed
+    # -------------------------------------------------------------------------
+    - name: "UC5: seed a uniquely identifiable row on the primary"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_primary }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "create table if not exists dr_test(id serial primary key, marker text, ts timestamptz default now());
+                                 insert into dr_test(marker) values ('{{ uc5_marker }}')" 2>&1 | tail -1
+      register: uc5_seed_out
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC5: confirm the marker reached the standby BEFORE we fail over"
+      # Verified at the receiver: if replication is already broken, the switchover
+      # result would be meaningless.
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_standby }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select count(*) from dr_test where marker='{{ uc5_marker }}'" 2>/dev/null | tr -d ' \r'
+      register: uc5_preflight_repl
+      until: uc5_preflight_repl.stdout == '1'
+      retries: 12
+      delay: 10
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: record the seed phase"
+      set_fact:
+        uc_seed: { marker: "{{ uc5_marker }}", method: "sql-insert", replicated_before_failover: true }
+        uc_phases: "{{ uc_phases + [{'name': 'seed', 'status': 'pass', 'detail': 'marker replicated to ' ~ uc5_standby}] }}"
+
+    # -------------------------------------------------------------------------
+    # Action: the label flip, and nothing else
+    # -------------------------------------------------------------------------
+    - name: "UC5: note the start time"
+      set_fact:
+        uc5_t0: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    - name: "UC5: flip pg-role (the entire failover procedure)"
+      shell: |
+        K={{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig
+        oc --kubeconfig $K label managedcluster {{ hostvars[uc5_standby].managedcluster_name | default(uc5_standby) }} {{ cnpg_role_label | default('pg-role') }}=active --overwrite
+        oc --kubeconfig $K label managedcluster {{ hostvars[uc5_primary].managedcluster_name | default(uc5_primary) }} {{ cnpg_role_label | default('pg-role') }}=standby --overwrite
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC5: wait for the old standby to become genuinely read-write"
+      # NOT "phase=healthy", NOT pg_stat_wal_receiver - the actual writability of
+      # the new site, which is the only thing the use case promises.
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_standby }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select pg_is_in_recovery()" 2>/dev/null | tr -d ' \r'
+      register: uc5_promoted
+      until: uc5_promoted.stdout == 'f'
+      retries: "{{ (uc5_switchover_slo_s | int / 15) | round | int }}"
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: measure the switchover"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'switchover_s': (lookup('pipe', 'date -u +%s') | int) - (uc5_t0 | int)}) }}"
+
+    # -------------------------------------------------------------------------
+    # Verify
+    # -------------------------------------------------------------------------
+    - name: "UC5: the seeded marker survived on the new primary (zero data loss)"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_standby }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select marker from dr_test where marker='{{ uc5_marker }}'" 2>/dev/null | tr -d ' \r'
+      register: uc5_marker_check
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: the demoted site is now a replica (no split brain)"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_primary }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select pg_is_in_recovery()" 2>/dev/null | tr -d ' \r'
+      register: uc5_demoted
+      until: uc5_demoted.stdout == 't'
+      retries: 12
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: a NEW write on the new primary replicates back to the demoted site"
+      # Proves replication actually reversed, rather than merely stopping.
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_standby }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "insert into dr_test(marker) values ('{{ uc5_marker }}-reverse')" 2>&1 | tail -1
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC5: read the reverse-direction row back on the demoted site"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc5_primary }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select count(*) from dr_test where marker='{{ uc5_marker }}-reverse'" 2>/dev/null | tr -d ' \r'
+      register: uc5_reverse
+      until: uc5_reverse.stdout == '1'
+      retries: 12
+      delay: 10
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: the pg-write Connector followed the primary"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get connector \
+          -n {{ uc5_ns }} -o jsonpath='{range .items[*]}{.spec.routingKey}{"\n"}{end}' 2>/dev/null | grep -c '^{{ cnpg_write_key | default("pg-write") }}$' || true
+      register: uc5_connectors
+      loop: "{{ test_spokes }}"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC5: evaluate"
+      set_fact:
+        uc_verify:
+          expected: "{{ uc5_marker }}"
+          actual: "{{ uc5_marker_check.stdout | default('') }}"
+          marker_survived: "{{ uc5_marker_check.stdout | default('') == uc5_marker }}"
+          demoted_is_replica: "{{ uc5_demoted.stdout | default('') == 't' }}"
+          reverse_replication: "{{ uc5_reverse.stdout | default('') == '1' }}"
+          write_path_followed: >-
+            {{ (uc5_connectors.results | selectattr('item', 'equalto', uc5_standby) | map(attribute='stdout') | first | default('0') | int) > 0 }}
+          passed: >-
+            {{ uc5_marker_check.stdout | default('') == uc5_marker
+               and uc5_demoted.stdout | default('') == 't'
+               and uc5_reverse.stdout | default('') == '1' }}
+
+    - name: "UC5: record the verification phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'verify', 'status': 'pass' if uc_verify.passed else 'fail', 'detail': uc_verify | to_json}] }}"
+        uc_result: "{{ 'pass' if uc_verify.passed else 'fail' }}"
+
+    - name: "UC5: flag an SLO regression without failing the run"
+      debug:
+        msg: "WARNING: switchover took {{ uc_timings.switchover_s }}s, over the {{ uc5_switchover_slo_s }}s budget"
+      when: (uc_timings.switchover_s | default(0) | int) > (uc5_switchover_slo_s | int)
+
+  rescue:
+    - name: "UC5: mark failed"
+      set_fact:
+        uc_result: "fail"
+        uc_failure:
+          phase: "{{ ansible_failed_task.name | default('unknown') }}"
+          message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
+        uc_phases: "{{ uc_phases + [{'name': 'functional', 'status': 'fail', 'detail': ansible_failed_task.name | default('unknown')}] }}"
+
+    - name: "UC5: capture diagnostics (nothing is cleaned up)"
+      include_tasks: lib/diagnostics.yml
+
+  always:
+    - name: "UC5: record the result"
+      include_tasks: lib/record-result.yml
+  when: test_stage in ['all', 'functional']

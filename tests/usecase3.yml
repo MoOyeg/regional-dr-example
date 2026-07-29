@@ -1,0 +1,244 @@
+---
+# =============================================================================
+# Use case 3 - VolSync Direct DR (label-flip failover, no Ramen)
+# =============================================================================
+# Prereq  : app (GitOps wiring) -> volsync-dr   [-e uc3_variant=vm for the VM]
+# Seed    : INSERT a marker row into MySQL on the active spoke
+# Action  : flip the app-role label
+# Verify  : on the NEW active spoke - the marker row is readable from the
+#           promoted snapshot, the workload is gone from the old active, and the
+#           ReplicationSource/Destination roles swapped.
+#
+# The pre-failover replication check is not a formality. On 2026-07-28 a PSK
+# rotation left the ReplicationSource happily publishing lastSyncTime while the
+# ReplicationDestination had never completed a single sync - so the source side
+# looked perfect and a failover would have promoted an empty volume. This test
+# therefore requires the DESTINATION's latestImage to advance before it will
+# fail anything over.
+# =============================================================================
+
+- name: "UC3: initialise"
+  set_fact:
+    uc_id: "3"
+    uc_name: "VolSync Direct DR ({{ uc3_variant | default('app') }} variant)"
+    uc_phases: []
+    uc_timings: {}
+    uc_failure: {}
+    uc_seed: {}
+    uc_verify: {}
+    uc_result: "fail"
+    uc_diag_dir: "{{ test_results_dir }}/usecase3/{{ test_run_id }}-diagnostics"
+    uc3_variant: "{{ uc3_variant | default('app') }}"
+    uc3_ns: "{{ volsync_app_namespace | default('quarkus-web-app-volsync') }}"
+    uc3_marker: "uc3-{{ test_run_id }}-{{ 999999 | random }}"
+    uc3_failover_slo_s: 240
+
+- name: "UC3: run the prerequisite commands (app, volsync-dr)"
+  block:
+    - name: "UC3: prerequisites"
+      command:
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/{{ uc3_pb }}
+        chdir: "{{ repo_root }}"
+      register: uc3_prereq
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+      loop:
+        - deploy-app.yml
+        - "{{ 'setup-volsync-dr-vm.yml' if uc3_variant == 'vm' else 'setup-volsync-dr.yml' }}"
+      loop_control:
+        loop_var: uc3_pb
+
+    - name: "UC3: save the prereq logs"
+      copy:
+        content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase3/{{ test_run_id }}-prereq-{{ item.uc3_pb | replace('.yml','') }}.log"
+        mode: "0644"
+      loop: "{{ uc3_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc3_pb }}"
+      delegate_to: localhost
+
+    - name: "UC3: record the prereq phases"
+      set_fact:
+        uc_phases: >-
+          {{ uc_phases + [{'name': 'prereq:' ~ item.uc3_pb,
+                           'status': 'pass' if (item.rc == 0 and item.stdout is search('failed=0') and not (item.stdout is search('failed=[1-9]'))) else 'fail',
+                           'detail': 'rc=' ~ item.rc}] }}
+      loop: "{{ uc3_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc3_pb }}"
+  when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
+
+- name: "UC3: functional test"
+  block:
+    - name: "UC3: read the app-role labels"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig get managedcluster \
+          -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.app-role}{"\n"}{end}' 2>/dev/null | grep -v '=$' || true
+      register: uc3_labels
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC3: resolve active and standby"
+      set_fact:
+        uc3_active: "{{ (uc3_labels.stdout_lines | select('search', '=active$') | map('regex_replace', '=active$', '') | list | first) | default('') }}"
+        uc3_standby: "{{ (uc3_labels.stdout_lines | select('search', '=standby$') | map('regex_replace', '=standby$', '') | list | first) | default('') }}"
+
+    - name: "UC3: require a clean active/standby split"
+      fail:
+        msg: "Expected one app-role=active and one app-role=standby, got: {{ uc3_labels.stdout_lines }}"
+      when: uc3_active == '' or uc3_standby == '' or uc3_active == uc3_standby
+
+    - name: "UC3: only the app variant can be data-seeded without guest access"
+      fail:
+        msg: >-
+          uc3_variant=vm needs the in-guest marker helper (cloud-init + SSH); run the
+          app variant, or use tests/lib/guest-marker.yml once the demo VMs carry it.
+      when: uc3_variant == 'vm'
+
+    # -------------------------------------------------------------------------
+    # Seed
+    # -------------------------------------------------------------------------
+    - name: "UC3: seed a marker row into MySQL on the active spoke"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_active }}/kubeconfig -n {{ uc3_ns }} \
+          exec deploy/mysql -- mysql -uroot -prootpassword quarkusdb -e \
+          "create table if not exists dr_test(id int auto_increment primary key, marker varchar(128), ts timestamp default current_timestamp);
+           insert into dr_test(marker) values ('{{ uc3_marker }}'); flush tables;" 2>&1 | tail -3
+      register: uc3_seed
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC3: note the destination's sync position before we force one"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
+          get replicationdestination -o jsonpath='{.items[0].status.latestImage.name}' 2>/dev/null || true
+      register: uc3_image_before
+      delegate_to: localhost
+      changed_when: false
+
+    # THE check that a source-side lastSyncTime cannot give us: the destination
+    # must produce a NEW snapshot after the seed, or the data is not really there.
+    - name: "UC3: wait for a NEW snapshot to land on the standby"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
+          get replicationdestination -o jsonpath='{.items[0].status.latestImage.name}' 2>/dev/null || true
+      register: uc3_image_after
+      until: uc3_image_after.stdout | trim != '' and uc3_image_after.stdout | trim != uc3_image_before.stdout | trim
+      retries: 30
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC3: record the seed phase"
+      set_fact:
+        uc_seed:
+          marker: "{{ uc3_marker }}"
+          method: "mysql-insert"
+          snapshot_before: "{{ uc3_image_before.stdout | trim }}"
+          snapshot_after: "{{ uc3_image_after.stdout | trim }}"
+        uc_phases: "{{ uc_phases + [{'name': 'seed', 'status': 'pass', 'detail': 'new snapshot ' ~ (uc3_image_after.stdout | trim) ~ ' on ' ~ uc3_standby}] }}"
+
+    # -------------------------------------------------------------------------
+    # Action
+    # -------------------------------------------------------------------------
+    - name: "UC3: note the start time"
+      set_fact:
+        uc3_t0: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    - name: "UC3: flip app-role (the entire failover procedure)"
+      shell: |
+        K={{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig
+        oc --kubeconfig $K label managedcluster {{ uc3_standby }} app-role=active --overwrite
+        oc --kubeconfig $K label managedcluster {{ uc3_active }} app-role=standby --overwrite
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC3: wait for MySQL to be serving on the new active spoke"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
+          exec deploy/mysql -- mysql -uroot -prootpassword quarkusdb -e "select 1" 2>/dev/null | tail -1
+      register: uc3_mysql_up
+      until: uc3_mysql_up.rc == 0 and uc3_mysql_up.stdout | trim != ''
+      retries: "{{ (uc3_failover_slo_s | int / 15) | round | int }}"
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC3: measure the failover"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'failover_s': (lookup('pipe', 'date -u +%s') | int) - (uc3_t0 | int)}) }}"
+
+    # -------------------------------------------------------------------------
+    # Verify
+    # -------------------------------------------------------------------------
+    - name: "UC3: read the marker back on the new active spoke"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
+          exec deploy/mysql -- mysql -uroot -prootpassword quarkusdb -N -B -e \
+          "select marker from dr_test where marker='{{ uc3_marker }}'" 2>/dev/null | tr -d ' \r'
+      register: uc3_marker_check
+      until: uc3_marker_check.stdout | trim == uc3_marker
+      retries: 10
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC3: the workload is gone from the old active spoke"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_active }}/kubeconfig -n {{ uc3_ns }} \
+          get deploy mysql -o name 2>/dev/null | wc -l | tr -d ' '
+      register: uc3_old_gone
+      until: uc3_old_gone.stdout | trim == '0'
+      retries: 10
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC3: the VolSync roles swapped"
+      shell: |
+        echo "src=$(oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} get replicationsource -o name 2>/dev/null | wc -l | tr -d ' ')"
+        echo "dst=$(oc --kubeconfig {{ artifacts_dir }}/{{ uc3_active }}/kubeconfig -n {{ uc3_ns }} get replicationdestination -o name 2>/dev/null | wc -l | tr -d ' ')"
+      register: uc3_roles_swapped
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC3: evaluate"
+      set_fact:
+        uc_verify:
+          expected: "{{ uc3_marker }}"
+          actual: "{{ uc3_marker_check.stdout | default('') | trim }}"
+          marker_recovered: "{{ (uc3_marker_check.stdout | default('') | trim) == uc3_marker }}"
+          old_site_drained: "{{ (uc3_old_gone.stdout | default('1') | trim) == '0' }}"
+          roles_swapped: "{{ 'src=1' in uc3_roles_swapped.stdout and 'dst=1' in uc3_roles_swapped.stdout }}"
+          passed: "{{ (uc3_marker_check.stdout | default('') | trim) == uc3_marker }}"
+
+    - name: "UC3: record the verification phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'verify', 'status': 'pass' if uc_verify.passed else 'fail', 'detail': uc_verify | to_json}] }}"
+        uc_result: "{{ 'pass' if uc_verify.passed else 'fail' }}"
+
+    - name: "UC3: flag an SLO regression without failing the run"
+      debug:
+        msg: "WARNING: failover took {{ uc_timings.failover_s }}s, over the {{ uc3_failover_slo_s }}s budget"
+      when: (uc_timings.failover_s | default(0) | int) > (uc3_failover_slo_s | int)
+
+  rescue:
+    - name: "UC3: mark failed"
+      set_fact:
+        uc_result: "fail"
+        uc_failure:
+          phase: "{{ ansible_failed_task.name | default('unknown') }}"
+          message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
+        uc_phases: "{{ uc_phases + [{'name': 'functional', 'status': 'fail', 'detail': ansible_failed_task.name | default('unknown')}] }}"
+
+    - name: "UC3: capture diagnostics (nothing is cleaned up)"
+      include_tasks: lib/diagnostics.yml
+
+  always:
+    - name: "UC3: record the result"
+      include_tasks: lib/record-result.yml
+  when: test_stage in ['all', 'functional']

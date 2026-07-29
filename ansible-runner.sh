@@ -158,6 +158,7 @@ Commands:
     oadp            OADP backup/restore: S3 bucket, DPA, backup + failover policies (use case 4)
     oadp-backup     Back up a VM namespace to the OADP S3 bucket
     oadp-restore    Restore a VM namespace from the OADP S3 bucket on another cluster
+    test            Run the DR use case test framework (see docs/TEST-STATUS.md)
     test-failover   Test DR failover and failback for app instances
     validate        Validate configuration and credentials
     list            List configured clusters
@@ -213,6 +214,10 @@ Examples:
     $0 oadp-restore -e oadp_to=cluster3 -e oadp_backup_name=vm-backup
     $0 oadp --destroy                 # Remove OADP policies, DPA, demo VM (keeps the S3 bucket)
     $0 oadp --destroy -e oadp_remove_bucket=true      # ...and delete the backup bucket too
+    $0 test                             # Test every use case (functional only, no re-deploy)
+    $0 test -e test_use_cases=5         # Just use case 5 (or "3,5")
+    $0 test -e test_run_prereqs=true    # Also (re)run each use case's prerequisite commands
+    $0 test -e test_stage=prereq        # prereq | functional | all
     $0 test-failover                    # Test failover+failback for both app instances
     $0 test-failover -e instance=gitops # Test GitOps instance only
     $0 test-failover -e instance=direct # Test Direct instance only
@@ -778,6 +783,15 @@ case "${1:-}" in
         build_image
         shift
         run_ansible "oadp-restore.yml" "$@"
+        ;;
+
+    test)
+        build_image
+        shift
+        # DR use case test framework. Results land in test-results/ and
+        # docs/TEST-STATUS.md; a failing run deliberately leaves the environment
+        # standing so it can be diagnosed.
+        run_ansible "tests/run-tests.yml" "$@"
         ;;
 
     test-failover)

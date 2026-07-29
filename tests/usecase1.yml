@@ -1,0 +1,168 @@
+---
+# =============================================================================
+# Use case 1 - Regional DR failover (ODF Regional-DR + Ramen)
+# =============================================================================
+# Prereq  : app -> virt   (app MUST precede virt: virt's last two plays need the
+#           DRPolicy and GitOps that app creates)
+# Action  : patch the DRPC to Failover
+# Verify  : VM Running on the failover cluster, the old site drained, and the
+#           DRPC returns to Protected=True / PeerReady=True.
+#
+# DATA VERIFICATION IS NOT YET IMPLEMENTED for this use case: the payload lives
+# inside the VM's disk, which needs the in-guest marker (cloud-init writes it,
+# SSH reads it back). Until that lands this test proves ORCHESTRATION only, and
+# records data_verified=false so the status page cannot overstate it.
+# =============================================================================
+
+- name: "UC1: initialise"
+  set_fact:
+    uc_id: "1"
+    uc_name: "Regional DR failover (Ramen)"
+    uc_phases: []
+    uc_timings: {}
+    uc_failure: {}
+    uc_seed: {}
+    uc_verify: {}
+    uc_result: "fail"
+    uc_diag_dir: "{{ test_results_dir }}/usecase1/{{ test_run_id }}-diagnostics"
+    uc1_ns: "{{ vm_namespace | default('vm-example') }}"
+    uc1_vm: "{{ vm_name | default('vm-dr-example') }}"
+    uc1_drpc: "{{ vm_drpc_name | default('vm-dr-example-gitops-drpc') }}"
+    uc1_gitops_ns: "{{ gitops_namespace | default('openshift-gitops') }}"
+    uc1_failover_slo_s: 600
+
+- name: "UC1: functional test"
+  block:
+    - name: "UC1: read the DRPC state"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig get drpc {{ uc1_drpc }} \
+          -n {{ uc1_gitops_ns }} -o jsonpath='{.spec.preferredCluster}|{.status.phase}|{.status.conditions[?(@.type=="PeerReady")].status}' 2>/dev/null || true
+      register: uc1_drpc_state
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC1: resolve the current and target clusters"
+      set_fact:
+        uc1_current: "{{ (uc1_drpc_state.stdout | trim).split('|')[0] | default('') }}"
+        uc1_peerready: "{{ (uc1_drpc_state.stdout | trim).split('|')[2] | default('') }}"
+
+    - name: "UC1: pick the failover target"
+      set_fact:
+        uc1_target: "{{ (test_spokes | difference([uc1_current]) | list | first) | default('') }}"
+
+    - name: "UC1: require a protected, peer-ready starting point"
+      fail:
+        msg: >-
+          DRPC {{ uc1_drpc }} is not ready to fail over (state '{{ uc1_drpc_state.stdout | trim }}').
+          PeerReady must be True and preferredCluster set before a failover means anything.
+      when: uc1_current == '' or uc1_target == '' or uc1_peerready != 'True'
+
+    - name: "UC1: confirm the VM is actually running where the DRPC says"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc1_current }}/kubeconfig get vmi {{ uc1_vm }} \
+          -n {{ uc1_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc1_before
+      delegate_to: localhost
+      changed_when: false
+      failed_when: uc1_before.stdout | trim != 'Running'
+
+    - name: "UC1: record the starting topology"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'topology', 'status': 'pass', 'detail': 'VM Running on ' ~ uc1_current ~ ', failing over to ' ~ uc1_target}] }}"
+        uc1_t0: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    # -------------------------------------------------------------------------
+    # Action
+    # -------------------------------------------------------------------------
+    - name: "UC1: patch the DRPC to Failover"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig patch drpc {{ uc1_drpc }} \
+          -n {{ uc1_gitops_ns }} --type=merge \
+          -p '{"spec":{"action":"Failover","failoverCluster":"{{ uc1_target }}"}}'
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC1: wait for the VM to run on the failover cluster"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc1_target }}/kubeconfig get vmi {{ uc1_vm }} \
+          -n {{ uc1_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc1_after
+      until: uc1_after.stdout | trim == 'Running'
+      retries: "{{ (uc1_failover_slo_s | int / 20) | round | int }}"
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC1: measure the failover"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'vm_running_on_peer_s': (lookup('pipe', 'date -u +%s') | int) - (uc1_t0 | int)}) }}"
+
+    # -------------------------------------------------------------------------
+    # Verify
+    # -------------------------------------------------------------------------
+    - name: "UC1: the old site drained"
+      # Ramen's VolSync cleanup can strand a PVC finalizer and leave the old
+      # namespace Terminating, which blocks the reverse ReplicationDestination -
+      # so an empty old site is part of the claim, not a nicety.
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc1_current }}/kubeconfig get vmi,pvc \
+          -n {{ uc1_ns }} --no-headers 2>/dev/null | wc -l | tr -d ' '
+      register: uc1_drained
+      until: uc1_drained.stdout | trim == '0'
+      retries: 20
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC1: wait for protection to re-establish on the new site"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig get drpc {{ uc1_drpc }} \
+          -n {{ uc1_gitops_ns }} \
+          -o jsonpath='{.status.phase}|{.status.conditions[?(@.type=="Protected")].status}|{.status.conditions[?(@.type=="PeerReady")].status}' 2>/dev/null || true
+      register: uc1_reprotect
+      until: "'FailedOver|True|True' in uc1_reprotect.stdout"
+      retries: 30
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC1: measure re-protection"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'reprotected_s': (lookup('pipe', 'date -u +%s') | int) - (uc1_t0 | int)}) }}"
+
+    - name: "UC1: evaluate"
+      set_fact:
+        uc_verify:
+          vm_running_on_target: "{{ (uc1_after.stdout | default('') | trim) == 'Running' }}"
+          old_site_drained: "{{ (uc1_drained.stdout | default('1') | trim) == '0' }}"
+          drpc_reprotected: "{{ 'FailedOver|True|True' in (uc1_reprotect.stdout | default('')) }}"
+          data_verified: false
+          data_verification_note: "in-guest marker not implemented yet - orchestration only"
+          passed: >-
+            {{ (uc1_after.stdout | default('') | trim) == 'Running'
+               and (uc1_drained.stdout | default('1') | trim) == '0'
+               and 'FailedOver|True|True' in (uc1_reprotect.stdout | default('')) }}
+
+    - name: "UC1: record the verification phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'verify', 'status': 'pass' if uc_verify.passed else 'fail', 'detail': uc_verify | to_json}] }}"
+        uc_result: "{{ 'pass' if uc_verify.passed else 'fail' }}"
+
+  rescue:
+    - name: "UC1: mark failed"
+      set_fact:
+        uc_result: "fail"
+        uc_failure:
+          phase: "{{ ansible_failed_task.name | default('unknown') }}"
+          message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
+        uc_phases: "{{ uc_phases + [{'name': 'functional', 'status': 'fail', 'detail': ansible_failed_task.name | default('unknown')}] }}"
+
+    - name: "UC1: capture diagnostics (nothing is cleaned up)"
+      include_tasks: lib/diagnostics.yml
+
+  always:
+    - name: "UC1: record the result"
+      include_tasks: lib/record-result.yml
+  when: test_stage in ['all', 'functional']

@@ -1,0 +1,118 @@
+---
+# =============================================================================
+# DR use case test framework - driver
+# =============================================================================
+#   ./ansible-runner.sh test                      # every use case
+#   ./ansible-runner.sh test -e test_use_cases=5  # one (or "3,5")
+#   ./ansible-runner.sh test -e test_stage=prereq # prereq | functional | all
+#   ./ansible-runner.sh test -e test_run_prereqs=true   # actually (re)run the
+#                                                       # setup commands, slow
+#
+# Each use case test runs the same lifecycle:
+#   preflight -> env facts -> [prereq commands] -> seed -> action -> verify
+#   -> record  (-> diagnostics, on failure only)
+#
+# Design rules, each one paid for by a real defect (see docs/TESTING.md):
+#   * Verify at the RECEIVER, never the sender.
+#   * Assert the payload, not a status field.
+#   * A green PLAY RECAP against a dead cluster is not a pass - preflight first.
+#   * Never clean up after a failure; capture and leave it standing.
+# =============================================================================
+
+- name: DR use case tests
+  hosts: openshift_clusters
+  gather_facts: false
+
+  vars:
+    repo_root: "{{ playbook_dir | dirname }}"
+    artifacts_dir: "{{ playbook_dir | dirname }}/artifacts"
+    test_results_dir: "{{ playbook_dir | dirname }}/test-results"
+    policy_namespace: "{{ oadp_policy_namespace | default('open-cluster-management-global-set') }}"
+    test_use_cases: "all"
+    test_stage: "all"
+    test_run_prereqs: false
+    test_baseline_dirty: false
+
+  pre_tasks:
+    - name: Run the driver once, from the hub
+      meta: end_host
+      when: cluster_role | default('spoke') != 'hub'
+
+    - name: Identify hub and spokes
+      set_fact:
+        hub_cluster: "{{ cluster_name }}"
+        test_spokes: >-
+          {{ groups['openshift_clusters']
+             | map('extract', hostvars)
+             | selectattr('cluster_role', 'defined')
+             | selectattr('cluster_role', 'equalto', 'spoke')
+             | map(attribute='cluster_name') | list }}
+
+    - name: Build the full cluster list
+      set_fact:
+        test_clusters: "{{ [hub_cluster] + test_spokes }}"
+
+    - name: Allocate a run id
+      set_fact:
+        test_run_id: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Select the use cases to run
+      set_fact:
+        test_selected: >-
+          {{ ['1','2','3','4','5'] if (test_use_cases | string) == 'all'
+             else (test_use_cases | string).split(',') | map('trim') | list }}
+
+    - name: Announce the run
+      debug:
+        msg:
+          - "run id     : {{ test_run_id }}"
+          - "use cases  : {{ test_selected | join(', ') }}"
+          - "stage      : {{ test_stage }}"
+          - "run prereqs: {{ test_run_prereqs }}"
+          - "results    : {{ test_results_dir }}"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Preflight + provenance, once for the whole run
+    # -------------------------------------------------------------------------
+    - name: Preflight the environment
+      include_tasks: lib/preflight.yml
+
+    # Always: git provenance needs no cluster, and a run that could not reach the
+    # environment still has to be attributable. Cluster/operator facts are gated
+    # inside env-facts.yml on test_env_ok.
+    - name: Collect environment facts
+      include_tasks: lib/env-facts.yml
+
+    - name: Record env-unavailable for every selected use case and stop
+      include_tasks: lib/record-result.yml
+      vars:
+        uc_id: "{{ uc_item }}"
+        uc_name: "use case {{ uc_item }}"
+        uc_result: "env-unavailable"
+        uc_phases: []
+        uc_failure:
+          phase: preflight
+          message: "{{ test_env_detail | join(' | ') }}"
+      loop: "{{ test_selected }}"
+      loop_control:
+        loop_var: uc_item
+      when: not test_env_ok
+
+    # -------------------------------------------------------------------------
+    # Use case tests - skipped, not aborted, when the environment is down, so the
+    # summary below is still regenerated and the run stays on the record.
+    # -------------------------------------------------------------------------
+    - name: Run the selected use case tests
+      include_tasks: "usecase{{ uc_item }}.yml"
+      loop: "{{ test_selected }}"
+      loop_control:
+        loop_var: uc_item
+        label: "use case {{ uc_item }}"
+      when: test_env_ok
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    - name: Regenerate the status page
+      include_tasks: lib/summarise.yml

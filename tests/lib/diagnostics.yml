@@ -1,0 +1,117 @@
+---
+# =============================================================================
+# Failure diagnostics
+# =============================================================================
+# Captured ON FAILURE ONLY, and NOTHING is cleaned up afterwards (deliberate:
+# on 2026-07-28 the diverged CNPG timelines were only diagnosable because the
+# broken state was still standing). This collects exactly the artefacts that
+# took manual digging that day, so a failed run is debuggable from disk.
+#
+# Caller sets: uc_id, and optionally uc_diag_namespaces (extra namespaces).
+# =============================================================================
+
+- name: Create the diagnostics directory
+  file:
+    path: "{{ uc_diag_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+
+- name: Capture ACM policy compliance, including the REPLICATED policies
+  # The root policy often reads Compliant while the replicated copy in the
+  # cluster namespace holds the real error (hub-template render failures and
+  # "cannot be updated, likely due to immutable fields not matching" both hide
+  # there, with no event on the root object).
+  shell: |
+    K={{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig
+    echo "### root policies"
+    oc --kubeconfig $K get policy -A -o wide 2>&1
+    echo; echo "### replicated policy detail (per cluster namespace)"
+    for ns in {{ test_spokes | join(' ') }} local-cluster; do
+      echo "--- $ns"
+      oc --kubeconfig $K get policy -n "$ns" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.details[*]}   {.templateMeta.name}={.compliant} {.history[0].message}{"\n"}{end}{end}' 2>&1
+    done
+  register: diag_policies
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+
+- name: Save policy diagnostics
+  copy:
+    content: "{{ diag_policies.stdout | default('') }}\n{{ diag_policies.stderr | default('') }}"
+    dest: "{{ uc_diag_dir }}/acm-policies.txt"
+    mode: "0644"
+  delegate_to: localhost
+
+- name: Capture per-spoke DR state
+  shell: |
+    K={{ artifacts_dir }}/{{ item }}/kubeconfig
+    echo "########## {{ item }}"
+    echo "### VolSync"
+    oc --kubeconfig $K get replicationsource,replicationdestination -A -o wide 2>&1
+    for p in $(oc --kubeconfig $K get pods -A -l app.kubernetes.io/created-by=volsync -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+      echo "--- mover log $p"
+      oc --kubeconfig $K logs -n "${p%%/*}" "${p##*/}" --tail=40 2>&1 | tail -40
+    done
+    echo "### Velero (fully qualified - bare 'backup' is ambiguous once CNPG is installed)"
+    oc --kubeconfig $K get schedules.velero.io,backups.velero.io,restores.velero.io -A 2>&1 | head -30
+    echo "### CNPG"
+    oc --kubeconfig $K get cluster.postgresql.cnpg.io -A -o wide 2>&1
+    oc --kubeconfig $K get cluster.postgresql.cnpg.io -A \
+      -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} primary={.status.currentPrimary} replica={.spec.replica}{"\n"}{end}' 2>&1
+    echo "### Skupper routing (which key resolves where)"
+    oc --kubeconfig $K get site,link,connector,listener -A -o wide 2>&1
+    echo "### Postgres replication state"
+    for ns in $(oc --kubeconfig $K get cluster.postgresql.cnpg.io -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u); do
+      oc --kubeconfig $K exec -n "$ns" pg-1 -- psql -U postgres -tAc \
+        "select 'in_recovery='||pg_is_in_recovery()||' timeline='||(select timeline_id from pg_control_checkpoint())||' receive='||coalesce(pg_last_wal_receive_lsn()::text,'-')||' replay='||coalesce(pg_last_wal_replay_lsn()::text,'-')" 2>&1 | tail -2
+      oc --kubeconfig $K exec -n "$ns" pg-1 -- psql -U postgres -tAc \
+        "select 'downstream: '||coalesce(string_agg(application_name||':'||state,','),'none') from pg_stat_replication" 2>&1 | tail -1
+    done
+  register: diag_spoke
+  loop: "{{ test_spokes }}"
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+
+- name: Save per-spoke diagnostics
+  copy:
+    content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}"
+    dest: "{{ uc_diag_dir }}/spoke-{{ item.item }}.txt"
+    mode: "0644"
+  loop: "{{ diag_spoke.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: localhost
+
+- name: Capture hub DR control plane
+  shell: |
+    K={{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig
+    echo "### DRPC / DRPolicy / DRCluster"
+    oc --kubeconfig $K get drpc,drpolicy,drcluster,mirrorpeer -A -o wide 2>&1
+    oc --kubeconfig $K get drpc -A -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase}{range .status.conditions[*]} {.type}={.status}{end}{"\n"}{end}' 2>&1
+    echo "### ManagedClusters + DR role labels"
+    oc --kubeconfig $K get managedcluster -o custom-columns=NAME:.metadata.name,APP:.metadata.labels.app-role,OADP:.metadata.labels.oadp-role,PG:.metadata.labels.pg-role 2>&1
+    echo "### hub DR ConfigMaps"
+    for cm in oadp-dr-config oadp-dr-status cnpg-dr-config volsync-dr-config volsync-dr-config-vm; do
+      echo "--- $cm"; oc --kubeconfig $K get cm "$cm" -n {{ policy_namespace }} -o jsonpath='{.data}' 2>&1; echo
+    done
+    echo "### ArgoCD applications"
+    oc --kubeconfig $K get application.argoproj.io -A -o wide 2>&1
+    oc --kubeconfig $K get application.argoproj.io -A -o jsonpath='{range .items[*]}{.metadata.name}: {.status.conditions[*].message}{"\n"}{end}' 2>&1
+  register: diag_hub
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+
+- name: Save hub diagnostics
+  copy:
+    content: "{{ diag_hub.stdout | default('') }}\n{{ diag_hub.stderr | default('') }}"
+    dest: "{{ uc_diag_dir }}/hub.txt"
+    mode: "0644"
+  delegate_to: localhost
+
+- name: Point at the diagnostics
+  debug:
+    msg: "Diagnostics for use case {{ uc_id }} saved to {{ uc_diag_dir }} (environment deliberately left as-is)"

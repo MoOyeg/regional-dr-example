@@ -1,0 +1,168 @@
+---
+# =============================================================================
+# Use case 2 - Cross-cluster live migration (CCLM) over Submariner
+# =============================================================================
+# Prereq  : cclm  (+ a running VM to migrate)
+# Action  : cclm-migrate from the spoke currently hosting the VM to the peer
+# Verify  : the VirtualMachineInstanceMigration Succeeded, the VMI is Running on
+#           the target, and the source no longer runs it.
+#
+# The claim here is LIVE mobility - the guest must not reboot. Proving that
+# properly means reading the guest's boot id before and after, which needs the
+# in-guest marker (cloud-init + SSH); until then this asserts the migration
+# completed and records data_verified=false rather than implying a no-reboot
+# guarantee it has not measured.
+#
+# The VM under test must be a STANDALONE one (default cclm-fedora in cclm-demo).
+# Do not point this at the VMs owned by use cases 1, 3 or 4: their controllers
+# (Ramen DRPC, the VolSync policies, OADP auto-failover) will fight a
+# cross-cluster migration and corrupt those tests.
+# =============================================================================
+
+- name: "UC2: initialise"
+  set_fact:
+    uc_id: "2"
+    uc_name: "Cross-cluster live migration (CCLM)"
+    uc_phases: []
+    uc_timings: {}
+    uc_failure: {}
+    uc_seed: {}
+    uc_verify: {}
+    uc_result: "fail"
+    uc_diag_dir: "{{ test_results_dir }}/usecase2/{{ test_run_id }}-diagnostics"
+    uc2_ns: "{{ cclm_test_namespace | default('cclm-demo') }}"
+    uc2_vm: "{{ cclm_test_vm | default('cclm-fedora') }}"
+    uc2_slo_s: 300
+
+- name: "UC2: functional test"
+  block:
+    - name: "UC2: locate the VM"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get vmi {{ uc2_vm }} \
+          -n {{ uc2_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc2_where
+      loop: "{{ test_spokes }}"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC2: resolve source and target"
+      set_fact:
+        uc2_from: "{{ (uc2_where.results | selectattr('stdout', 'equalto', 'Running') | map(attribute='item') | list | first) | default('') }}"
+        uc2_to: "{{ (test_spokes | difference([(uc2_where.results | selectattr('stdout', 'equalto', 'Running') | map(attribute='item') | list | first) | default('')]) | list | first) | default('') }}"
+
+    - name: "UC2: require the test VM to be running on exactly one spoke"
+      fail:
+        msg: >-
+          {{ uc2_vm }} is not Running on exactly one spoke
+          ({{ dict(test_spokes | zip(uc2_where.results | map(attribute='stdout') | list)) }}).
+          Create the standalone demo VM first - see docs/TESTING.md.
+      when: uc2_from == '' or uc2_to == ''
+
+    - name: "UC2: capture the VMI identity before migrating"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc2_from }}/kubeconfig get vmi {{ uc2_vm }} \
+          -n {{ uc2_ns }} -o jsonpath='{.metadata.uid}|{.status.phase}' 2>/dev/null || true
+      register: uc2_before
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC2: record the starting topology"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'topology', 'status': 'pass', 'detail': uc2_vm ~ ' Running on ' ~ uc2_from ~ ', migrating to ' ~ uc2_to}] }}"
+        uc2_t0: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    # -------------------------------------------------------------------------
+    # Action
+    # -------------------------------------------------------------------------
+    - name: "UC2: run cclm-migrate"
+      command:
+        cmd: >-
+          ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/cclm-migrate.yml
+          -e cclm_vm={{ uc2_vm }} -e cclm_from={{ uc2_from }} -e cclm_to={{ uc2_to }}
+          -e cclm_vm_namespace={{ uc2_ns }}
+        chdir: "{{ repo_root }}"
+      register: uc2_migrate
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+
+    - name: "UC2: save the migration log"
+      copy:
+        content: "{{ uc2_migrate.stdout | default('') }}\n{{ uc2_migrate.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase2/{{ test_run_id }}-cclm-migrate.log"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: "UC2: assert the migrate playbook itself succeeded"
+      fail:
+        msg: "cclm-migrate failed (rc={{ uc2_migrate.rc }}); see the saved log"
+      when: uc2_migrate.rc != 0 or not (uc2_migrate.stdout is search('failed=0')) or (uc2_migrate.stdout is search('failed=[1-9]'))
+
+    - name: "UC2: wait for the VMI to be Running on the target"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc2_to }}/kubeconfig get vmi {{ uc2_vm }} \
+          -n {{ uc2_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc2_after
+      until: uc2_after.stdout | trim == 'Running'
+      retries: "{{ (uc2_slo_s | int / 15) | round | int }}"
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC2: measure the migration"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'migration_s': (lookup('pipe', 'date -u +%s') | int) - (uc2_t0 | int)}) }}"
+
+    # -------------------------------------------------------------------------
+    # Verify
+    # -------------------------------------------------------------------------
+    - name: "UC2: the migration object reports Succeeded"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc2_from }}/kubeconfig get vmim \
+          -n {{ uc2_ns }} -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null | tail -2
+      register: uc2_vmim
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC2: the source no longer runs the VM"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc2_from }}/kubeconfig get vmi {{ uc2_vm }} \
+          -n {{ uc2_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || echo gone
+      register: uc2_source_state
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC2: evaluate"
+      set_fact:
+        uc_verify:
+          vmi_running_on_target: "{{ (uc2_after.stdout | default('') | trim) == 'Running' }}"
+          migration_succeeded: "{{ 'Succeeded' in (uc2_vmim.stdout | default('')) }}"
+          source_released: "{{ (uc2_source_state.stdout | default('') | trim) in ['gone', 'Succeeded', ''] }}"
+          data_verified: false
+          data_verification_note: "no-reboot not measured - needs the in-guest boot-id marker"
+          passed: >-
+            {{ (uc2_after.stdout | default('') | trim) == 'Running'
+               and 'Succeeded' in (uc2_vmim.stdout | default(''))
+               and (uc2_source_state.stdout | default('') | trim) in ['gone', 'Succeeded', ''] }}
+
+    - name: "UC2: record the verification phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'verify', 'status': 'pass' if uc_verify.passed else 'fail', 'detail': uc_verify | to_json}] }}"
+        uc_result: "{{ 'pass' if uc_verify.passed else 'fail' }}"
+
+  rescue:
+    - name: "UC2: mark failed"
+      set_fact:
+        uc_result: "fail"
+        uc_failure:
+          phase: "{{ ansible_failed_task.name | default('unknown') }}"
+          message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
+        uc_phases: "{{ uc_phases + [{'name': 'functional', 'status': 'fail', 'detail': ansible_failed_task.name | default('unknown')}] }}"
+
+    - name: "UC2: capture diagnostics (nothing is cleaned up)"
+      include_tasks: lib/diagnostics.yml
+
+  always:
+    - name: "UC2: record the result"
+      include_tasks: lib/record-result.yml
+  when: test_stage in ['all', 'functional']

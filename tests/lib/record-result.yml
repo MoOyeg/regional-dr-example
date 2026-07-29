@@ -1,0 +1,71 @@
+---
+# =============================================================================
+# Record one use case result
+# =============================================================================
+# Writes test-results/<use-case>/<run-id>.json (full detail) and appends one
+# line to test-results/history.jsonl (the "when did it last pass" ledger).
+#
+# Expects, set by the caller:
+#   uc_id, uc_name, uc_result (pass|fail|env-unavailable|skipped)
+#   uc_phases     : list of {name, status, duration_s, detail}
+#   uc_seed       : {marker, method}          (optional)
+#   uc_verify     : {expected, actual, passed}(optional)
+#   uc_timings    : {<name>_s: int, ...}      (optional)
+#   uc_failure    : {phase, message}          (optional)
+# =============================================================================
+
+- name: Ensure the results directories exist
+  file:
+    path: "{{ rr_dir }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ test_results_dir }}"
+    - "{{ test_results_dir }}/usecase{{ uc_id }}"
+  loop_control:
+    loop_var: rr_dir
+  delegate_to: localhost
+
+- name: Build the result record
+  set_fact:
+    uc_record:
+      run_id: "{{ test_run_id }}"
+      recorded_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      use_case: { id: "{{ uc_id | int }}", name: "{{ uc_name }}" }
+      result: "{{ uc_result }}"
+      # A pass recorded while the working tree is dirty, or while a previous
+      # failure left the environment un-cleaned, is not a release-grade pass.
+      caveats:
+        git_dirty: "{{ (test_git.dirty_files | int) > 0 }}"
+        baseline_dirty: "{{ test_baseline_dirty | default(false) }}"
+      git: "{{ test_git }}"
+      environment: "{{ test_environment | default({}) }}"
+      phases: "{{ uc_phases | default([]) }}"
+      seed: "{{ uc_seed | default({}) }}"
+      verification: "{{ uc_verify | default({}) }}"
+      timings: "{{ uc_timings | default({}) }}"
+      failure: "{{ uc_failure | default({}) }}"
+      diagnostics_dir: "{{ test_results_dir }}/usecase{{ uc_id }}/{{ test_run_id }}-diagnostics"
+
+- name: Write the full result document
+  copy:
+    content: "{{ uc_record | to_nice_json }}\n"
+    dest: "{{ test_results_dir }}/usecase{{ uc_id }}/{{ test_run_id }}.json"
+    mode: "0644"
+  delegate_to: localhost
+
+- name: Append to the history ledger
+  lineinfile:
+    path: "{{ test_results_dir }}/history.jsonl"
+    line: "{{ uc_record | to_json }}"
+    create: true
+    mode: "0644"
+    insertafter: EOF
+  delegate_to: localhost
+
+- name: Announce the result
+  debug:
+    msg: >-
+      USE CASE {{ uc_id }} ({{ uc_name }}): {{ uc_result | upper }}
+      {{ '- ' ~ uc_failure.message | default('') if uc_result == 'fail' else '' }}
+      {{ '(git ' ~ test_git.commit ~ (', DIRTY tree' if (test_git.dirty_files | int) > 0 else '') ~ ')' }}

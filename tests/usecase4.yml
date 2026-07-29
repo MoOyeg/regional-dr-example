@@ -1,0 +1,218 @@
+---
+# =============================================================================
+# Use case 4 - OADP backup & recovery to object storage
+# =============================================================================
+# Prereq  : virt -> oadp
+# Seed    : a ConfigMap carrying a unique marker in the protected VM's namespace
+#           (Velero backs up the whole namespace, so the ConfigMap rides along
+#           with the VM and its PVC)
+# Action  : delete the VM on the active spoke - the documented failure trigger
+# Verify  : on the PEER - the VM is Running again, the Restore reached a terminal
+#           phase, and the marker ConfigMap came back out of S3.
+#
+# Two traps this encodes, both real:
+#   * Backups of a running VM are PartiallyFailed (KubeVirt freeze hook, no guest
+#     agent) and that IS restorable - anything demanding Completed can never pass.
+#   * Phases are matched EXACTLY: WaitingForPluginOperationsPartiallyFailed is a
+#     real non-terminal phase, so a substring test on "PartiallyFailed" would
+#     call an in-flight backup finished.
+# =============================================================================
+
+- name: "UC4: initialise"
+  set_fact:
+    uc_id: "4"
+    uc_name: "OADP backup & recovery to object storage"
+    uc_phases: []
+    uc_timings: {}
+    uc_failure: {}
+    uc_seed: {}
+    uc_verify: {}
+    uc_result: "fail"
+    uc_diag_dir: "{{ test_results_dir }}/usecase4/{{ test_run_id }}-diagnostics"
+    uc4_ns: "{{ oadp_dr_vm_namespace | default('vm-example-oadp') }}"
+    uc4_vm: "{{ oadp_dr_vm_name | default('vm-dr-example') }}"
+    uc4_oadp_ns: "{{ oadp_namespace | default('openshift-adp') }}"
+    uc4_marker: "uc4-{{ test_run_id }}-{{ 999999 | random }}"
+    uc4_failover_slo_s: 600
+    uc4_terminal_ok: ["Completed", "PartiallyFailed"]
+
+- name: "UC4: run the prerequisite command (oadp)"
+  block:
+    - name: "UC4: oadp"
+      command:
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/setup-oadp.yml
+        chdir: "{{ repo_root }}"
+      register: uc4_prereq
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+
+    - name: "UC4: save the prereq log"
+      copy:
+        content: "{{ uc4_prereq.stdout | default('') }}\n{{ uc4_prereq.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase4/{{ test_run_id }}-prereq-oadp.log"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: "UC4: record the prereq phase"
+      set_fact:
+        uc_phases: >-
+          {{ uc_phases + [{'name': 'prereq:oadp',
+                           'status': 'pass' if (uc4_prereq.rc == 0 and uc4_prereq.stdout is search('failed=0') and not (uc4_prereq.stdout is search('failed=[1-9]'))) else 'fail',
+                           'detail': 'rc=' ~ uc4_prereq.rc}] }}
+  when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
+
+- name: "UC4: functional test"
+  block:
+    - name: "UC4: find the spoke currently holding the protected VM"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig get vmi {{ uc4_vm }} \
+          -n {{ uc4_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc4_where
+      loop: "{{ test_spokes }}"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC4: resolve active and peer"
+      set_fact:
+        uc4_active: "{{ (uc4_where.results | selectattr('stdout', 'equalto', 'Running') | map(attribute='item') | list | first) | default('') }}"
+        uc4_peer: "{{ (test_spokes | difference([(uc4_where.results | selectattr('stdout', 'equalto', 'Running') | map(attribute='item') | list | first) | default('')]) | list | first) | default('') }}"
+
+    - name: "UC4: require the protected VM to be running on exactly one spoke"
+      fail:
+        msg: "Expected {{ uc4_vm }} Running on exactly one spoke, got {{ dict(test_spokes | zip(uc4_where.results | map(attribute='stdout') | list)) }}"
+      when: uc4_active == '' or uc4_peer == ''
+
+    # -------------------------------------------------------------------------
+    # Seed - into the namespace Velero backs up
+    # -------------------------------------------------------------------------
+    - name: "UC4: seed a marker ConfigMap alongside the VM"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_active }}/kubeconfig -n {{ uc4_ns }} \
+          create configmap dr-test-marker --from-literal=marker={{ uc4_marker }} \
+          --dry-run=client -o yaml | oc --kubeconfig {{ artifacts_dir }}/{{ uc4_active }}/kubeconfig apply -f -
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC4: wait for a backup that STARTED after the seed to reach a terminal phase"
+      # Exact phase match against the allow-list; a substring test would accept
+      # WaitingForPluginOperationsPartiallyFailed, which is still in flight.
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_active }}/kubeconfig -n {{ uc4_oadp_ns }} \
+          get backups.velero.io -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.status.startTimestamp}{"\n"}{end}' 2>/dev/null \
+          | sort -k3 | tail -1
+      register: uc4_backup
+      until: (uc4_backup.stdout | default('') | trim).split(' ') | length > 1 and ((uc4_backup.stdout | trim).split(' ')[1] in uc4_terminal_ok)
+      retries: 40
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC4: record the seed phase"
+      set_fact:
+        uc_seed:
+          marker: "{{ uc4_marker }}"
+          method: "configmap-in-backed-up-namespace"
+          backup: "{{ (uc4_backup.stdout | trim).split(' ')[0] }}"
+          backup_phase: "{{ (uc4_backup.stdout | trim).split(' ')[1] }}"
+        uc_phases: "{{ uc_phases + [{'name': 'seed', 'status': 'pass', 'detail': uc4_backup.stdout | trim}] }}"
+
+    # -------------------------------------------------------------------------
+    # Action - the documented trigger: the VM disappears from the active site
+    # -------------------------------------------------------------------------
+    - name: "UC4: note the start time"
+      set_fact:
+        uc4_t0: "{{ lookup('pipe', 'date -u +%s') | int }}"
+
+    - name: "UC4: delete the VM on the active spoke"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_active }}/kubeconfig -n {{ uc4_ns }} \
+          delete vm {{ uc4_vm }} --wait=false
+      delegate_to: localhost
+      changed_when: true
+
+    - name: "UC4: wait for the VM to come up on the peer"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_peer }}/kubeconfig get vmi {{ uc4_vm }} \
+          -n {{ uc4_ns }} -o jsonpath='{.status.phase}' 2>/dev/null || true
+      register: uc4_recovered
+      until: uc4_recovered.stdout | trim == 'Running'
+      retries: "{{ (uc4_failover_slo_s | int / 20) | round | int }}"
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC4: measure the recovery"
+      set_fact:
+        uc_timings: "{{ uc_timings | combine({'recovery_s': (lookup('pipe', 'date -u +%s') | int) - (uc4_t0 | int)}) }}"
+
+    # -------------------------------------------------------------------------
+    # Verify - the seeded data came back out of object storage
+    # -------------------------------------------------------------------------
+    - name: "UC4: read the marker back on the peer"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_peer }}/kubeconfig -n {{ uc4_ns }} \
+          get cm dr-test-marker -o jsonpath='{.data.marker}' 2>/dev/null || true
+      register: uc4_marker_check
+      until: uc4_marker_check.stdout | trim == uc4_marker
+      retries: 10
+      delay: 15
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: "UC4: the restore reached a terminal phase"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc4_peer }}/kubeconfig -n {{ uc4_oadp_ns }} \
+          get restores.velero.io -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null | tail -1
+      register: uc4_restore
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC4: the oadp-role labels flipped"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ hub_cluster }}/kubeconfig get managedcluster \
+          -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.oadp-role}{"\n"}{end}' 2>/dev/null | grep -v '=$' || true
+      register: uc4_labels
+      delegate_to: localhost
+      changed_when: false
+
+    - name: "UC4: evaluate"
+      set_fact:
+        uc_verify:
+          expected: "{{ uc4_marker }}"
+          actual: "{{ uc4_marker_check.stdout | default('') | trim }}"
+          marker_recovered: "{{ (uc4_marker_check.stdout | default('') | trim) == uc4_marker }}"
+          vm_running_on_peer: "{{ uc4_recovered.stdout | default('') | trim == 'Running' }}"
+          restore: "{{ uc4_restore.stdout | default('') | trim }}"
+          role_flipped: "{{ uc4_peer ~ '=active' in uc4_labels.stdout | default('') }}"
+          passed: >-
+            {{ (uc4_marker_check.stdout | default('') | trim) == uc4_marker
+               and (uc4_recovered.stdout | default('') | trim) == 'Running' }}
+
+    - name: "UC4: record the verification phase"
+      set_fact:
+        uc_phases: "{{ uc_phases + [{'name': 'verify', 'status': 'pass' if uc_verify.passed else 'fail', 'detail': uc_verify | to_json}] }}"
+        uc_result: "{{ 'pass' if uc_verify.passed else 'fail' }}"
+
+    - name: "UC4: flag an SLO regression without failing the run"
+      debug:
+        msg: "WARNING: recovery took {{ uc_timings.recovery_s }}s, over the {{ uc4_failover_slo_s }}s budget"
+      when: (uc_timings.recovery_s | default(0) | int) > (uc4_failover_slo_s | int)
+
+  rescue:
+    - name: "UC4: mark failed"
+      set_fact:
+        uc_result: "fail"
+        uc_failure:
+          phase: "{{ ansible_failed_task.name | default('unknown') }}"
+          message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
+        uc_phases: "{{ uc_phases + [{'name': 'functional', 'status': 'fail', 'detail': ansible_failed_task.name | default('unknown')}] }}"
+
+    - name: "UC4: capture diagnostics (nothing is cleaned up)"
+      include_tasks: lib/diagnostics.yml
+
+  always:
+    - name: "UC4: record the result"
+      include_tasks: lib/record-result.yml
+  when: test_stage in ['all', 'functional']
