@@ -47,6 +47,8 @@
         payload, never on a status field.
       - **FAIL** - the environment is deliberately left as-is. See
         `test-results/usecase<N>/<run-id>-diagnostics/`.
+      - **NOT-DEPLOYED** - the use case is not set up on this environment, so
+        there was nothing to test. Distinct from FAIL on purpose.
       - **ENV-UNAVAILABLE** - clusters unreachable; proves nothing either way.
 
       {% if test_history | default([]) | length > 0 %}

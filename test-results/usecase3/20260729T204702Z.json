@@ -1,0 +1,47 @@
+{
+    "caveats": {
+        "baseline_dirty": false,
+        "git_dirty": false
+    },
+    "diagnostics_dir": "/root/repos/regional-dr-example/test-results/usecase3/20260729T204702Z-diagnostics",
+    "environment": {
+        "clusters": {
+            "cluster1": "4.22.2",
+            "cluster2": "4.22.2",
+            "cluster3": "4.22.2"
+        },
+        "collected_at": "2026-07-29T20:47:09Z",
+        "operators": {
+            "cluster1": "Package Server=0.0.1-snapshot",
+            "cluster2": "Package Server=0.0.1-snapshot",
+            "cluster3": "Package Server=0.0.1-snapshot"
+        }
+    },
+    "failure": {
+        "message": "Expected one app-role=active and one app-role=standby, got: []",
+        "phase": "UC3: require a clean active/standby split"
+    },
+    "git": {
+        "branch": "main",
+        "commit": "974ade7",
+        "committed_at": "2026-07-28T20:13:07-04:00",
+        "dirty_files": "0"
+    },
+    "phases": [
+        {
+            "detail": "UC3: require a clean active/standby split",
+            "name": "functional",
+            "status": "fail"
+        }
+    ],
+    "recorded_at": "2026-07-29T20:47:55Z",
+    "result": "fail",
+    "run_id": "20260729T204702Z",
+    "seed": {},
+    "timings": {},
+    "use_case": {
+        "id": "3",
+        "name": "VolSync Direct DR (app variant)"
+    },
+    "verification": {}
+}

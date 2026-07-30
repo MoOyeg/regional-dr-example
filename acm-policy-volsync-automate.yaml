@@ -210,7 +210,14 @@ spec:
           remediationAction: enforce
           severity: low
           object-templates-raw: |
-            {{- range $volsyncdest := (lookup "volsync.backube/v1alpha1" "ReplicationDestination" "" "").items }}
+            {{- /* Scoped to THIS use case's namespace. A cluster-wide lookup ("" for
+                   the namespace) makes this policy delete EVERY ReplicationDestination
+                   on the active spoke - including the ones Ramen creates for use case 1
+                   when it protects PVCs with VolSync. That coexists only while use case
+                   1's primary and use case 3's active happen to be the same cluster;
+                   fail over one without the other and this policy tears down the other
+                   use case's replication. The -vm variant was already scoped this way. */}}
+            {{- range $volsyncdest := (lookup "volsync.backube/v1alpha1" "ReplicationDestination" "quarkus-web-app-volsync" "").items }}
             {{- /* Do not delete a destination while VolSync is mid-transfer; a
                    Synchronizing=True condition means an rsync is landing on this
                    receive endpoint and tearing it down would abort the in-flight
@@ -258,7 +265,11 @@ spec:
           remediationAction: enforce
           severity: low
           object-templates-raw: |
-            {{- range $volsyncsrc := (lookup "volsync.backube/v1alpha1" "ReplicationSource" "" "").items }}
+            {{- /* Namespace-scoped for the same reason as the destination-delete policy
+                   above: a cluster-wide lookup would delete Ramen's ReplicationSource on
+                   the standby and break use case 1 whenever the two use cases' roles
+                   diverge. */}}
+            {{- range $volsyncsrc := (lookup "volsync.backube/v1alpha1" "ReplicationSource" "quarkus-web-app-volsync" "").items }}
             {{- /* Do not delete a source while VolSync is mid-transfer; a
                    Synchronizing=True / SyncInProgress condition means an rsync
                    is in flight and tearing it down could corrupt the standby

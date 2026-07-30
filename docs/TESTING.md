@@ -85,3 +85,18 @@ Measured 2026-07-28 on the three-cluster environment; useful as SLO budgets:
 | 3 VolSync | ~50 s to VM on peer, 70 s to full convergence |
 | 4 OADP | 74 s to role flip, 219 s to restored VM |
 | 5 CNPG/RHSI | deadlocked before the fix; budget 300 s |
+
+## RPO caveat for use case 3 (measured 2026-07-29)
+
+VolSync rsyncs a **live, unquiesced** MySQL datadir, so the copy is
+crash-inconsistent. A marker seeded ~60-90 s before the FIRST sync arrived as an
+`.ibd` file whose dictionary state did not, and the failed-over database reported
+`Table 'quarkusdb.dr_test' doesn't exist` - while replication itself was working
+perfectly (the file was present on the standby volume). The same marker, given a
+full settled sync cycle, recovered intact and the workload was serving on the
+peer 62 s after the label flip.
+
+So the honest boundary is: **writes are recoverable once a full sync cycle has
+completed after them**; anything newer than the last completed sync may not be
+readable even though the bytes replicated. The test now waits for two
+destination snapshots after seeding, so it measures DR rather than that race.

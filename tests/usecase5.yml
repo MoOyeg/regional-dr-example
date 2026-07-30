@@ -71,6 +71,24 @@
     # -------------------------------------------------------------------------
     # Establish the starting topology
     # -------------------------------------------------------------------------
+    # setup-rhsi.yml returns as soon as the CRs are applied, but CNPG keeps
+    # bootstrapping asynchronously (pg_basebackup on the second site takes
+    # minutes). Asserting the topology immediately reported "no primary and no
+    # standby" on 2026-07-29 for a deployment that was perfectly healthy a few
+    # minutes later - a false NOT-DEPLOYED. Wait for the fabric to settle first.
+    - name: "UC5: wait for CNPG to finish bootstrapping on both spokes"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
+          psql -U postgres -tAc "select pg_is_in_recovery()" 2>/dev/null | tr -d ' \r'
+      register: uc5_settle
+      until: uc5_settle.stdout in ['t', 'f']
+      retries: 30
+      delay: 20
+      loop: "{{ test_spokes }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
     - name: "UC5: find the site that is currently read-write"
       shell: |
         oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig exec -n {{ uc5_ns }} {{ uc5_cluster }}-1 -- \
@@ -237,8 +255,11 @@
 
   rescue:
     - name: "UC5: mark failed"
+      # A guard named "require ..." is a PRECONDITION, not a DR failure: it means
+      # the use case was never set up on this environment. Recording that as
+      # 'fail' would make "never deployed" indistinguishable from "DR is broken".
       set_fact:
-        uc_result: "fail"
+        uc_result: "{{ 'not-deployed' if ('require' in (ansible_failed_task.name | default('') | lower)) else 'fail' }}"
         uc_failure:
           phase: "{{ ansible_failed_task.name | default('unknown') }}"
           message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"

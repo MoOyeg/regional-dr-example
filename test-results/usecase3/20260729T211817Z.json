@@ -1,0 +1,73 @@
+{
+    "caveats": {
+        "baseline_dirty": false,
+        "git_dirty": true
+    },
+    "diagnostics_dir": "/workspace/test-results/usecase3/20260729T211817Z-diagnostics",
+    "environment": {
+        "clusters": {
+            "cluster1": "4.22.2",
+            "cluster2": "4.22.2",
+            "cluster3": "4.22.2"
+        },
+        "collected_at": "2026-07-29T21:18:31Z",
+        "operators": {
+            "cluster1": "Advanced Cluster Management for Kubernetes=2.17.0\nODF Multicluster Orchestrator=4.21.9-rhodf\nOpenshift DR Hub Operator=4.21.9-rhodf\nPackage Server=0.0.1-snapshot\nRed Hat OpenShift GitOps=1.21.1\ncert-manager Operator for Red Hat OpenShift=1.20.0\nmulticluster engine for Kubernetes=2.17.0",
+            "cluster2": "CSI Addons=4.21.9-rhodf\nCephCSI operator=4.21.9-rhodf\nData Foundation Dependencies=4.21.9-rhodf\nNooBaa Operator=4.21.9-rhodf\nOADP Operator=1.6.1\nOpenShift Container Storage=4.21.9-rhodf\nOpenShift Data Foundation Client=4.21.9-rhodf\nOpenShift Data Foundation=4.21.9-rhodf\nOpenshift DR Cluster Operator=4.21.9-rhodf\nPackage Server=0.0.1-snapshot\nPrometheus Operator=4.21.9-rhodf\nRecipe=4.21.9-rhodf\nRook-Ceph=4.21.9-rhodf\nSnapshot Controller=4.21.9-rhodf\nSubmariner=0.24.0\ncert-manager Operator for Red Hat OpenShift=1.20.0",
+            "cluster3": "CSI Addons=4.21.9-rhodf\nCephCSI operator=4.21.9-rhodf\nData Foundation Dependencies=4.21.9-rhodf\nNooBaa Operator=4.21.9-rhodf\nOADP Operator=1.6.1\nOpenShift Container Storage=4.21.9-rhodf\nOpenShift Data Foundation Client=4.21.9-rhodf\nOpenShift Data Foundation=4.21.9-rhodf\nOpenshift DR Cluster Operator=4.21.9-rhodf\nPackage Server=0.0.1-snapshot\nPrometheus Operator=4.21.9-rhodf\nRecipe=4.21.9-rhodf\nRook-Ceph=4.21.9-rhodf\nSnapshot Controller=4.21.9-rhodf\nSubmariner=0.24.0\ncert-manager Operator for Red Hat OpenShift=1.20.0"
+        }
+    },
+    "failure": {},
+    "git": {
+        "branch": "main",
+        "commit": "974ade7",
+        "committed_at": "2026-07-28T20:13:07-04:00",
+        "dirty_files": "15"
+    },
+    "phases": [
+        {
+            "detail": "rc=0",
+            "name": "prereq:deploy-app.yml",
+            "status": "pass"
+        },
+        {
+            "detail": "rc=0",
+            "name": "prereq:setup-volsync-dr.yml",
+            "status": "pass"
+        },
+        {
+            "detail": "new snapshot mysql-pvc-20260729212630 on cluster3",
+            "name": "seed",
+            "status": "pass"
+        },
+        {
+            "detail": "{\"expected\": \"uc3-20260729T211817Z-201739\", \"actual\": \"\", \"marker_recovered\": false, \"old_site_drained\": true, \"roles_swapped\": true, \"passed\": false}",
+            "name": "verify",
+            "status": "fail"
+        }
+    ],
+    "recorded_at": "2026-07-29T21:30:57Z",
+    "result": "fail",
+    "run_id": "20260729T211817Z",
+    "seed": {
+        "marker": "uc3-20260729T211817Z-201739",
+        "method": "mysql-insert",
+        "snapshot_after": "mysql-pvc-20260729212630",
+        "snapshot_before": ""
+    },
+    "timings": {
+        "failover_s": 95
+    },
+    "use_case": {
+        "id": "3",
+        "name": "VolSync Direct DR (app variant)"
+    },
+    "verification": {
+        "actual": "",
+        "expected": "uc3-20260729T211817Z-201739",
+        "marker_recovered": false,
+        "old_site_drained": true,
+        "passed": false,
+        "roles_swapped": true
+    }
+}

@@ -120,6 +120,29 @@ plane installs and reconciles but cannot schedule VMs until the hub has KVM-capa
 `app` **must precede** `virt`: `virt`'s last two plays need the `DRPolicy` and GitOps that `app` creates
 — without them they skip, and you get virtualization nodes but no protected VM.
 
+**Choosing how the sample app is deployed.** `app` ships the same Quarkus + MySQL application two
+ways, selected with `app_deployment_mode`:
+
+| Mode | Deploys | DR-protected |
+|------|---------|--------------|
+| `gitops` *(default)* | ArgoCD `ApplicationSet` pushes it to the DR cluster — the flow this README walks through | yes |
+| `direct` | the same manifests applied with `oc apply`, no GitOps in the picture | yes (it is the only instance) |
+| `both` | both, in separate namespaces | GitOps only, unless `-e app_protect_direct_instance=true` |
+
+```bash
+./ansible-runner.sh app                              # gitops (default)
+./ansible-runner.sh app -e app_deployment_mode=direct
+```
+
+> **Why `both` protects only one by default:** two DR-protected instances of the same app on one
+> storage class collide on ODF versions that group PVCs into consistency groups. The group id is
+> derived from the **storage class, not the application**, so both PVCs land in the same RBD group —
+> and an RBD image may belong to only one group. The second `VolumeGroupReplication` fails in Ceph
+> with `rbd: ret=-22, Invalid argument`, that DRPC never leaves `Protected=False`, and the ODF DR
+> dashboard shows the app critical. There is no Kubernetes-level fix, and clearing it in Ceph is
+> worse: the group is **mirrored**, so deleting it on the primary breaks the peer's promote
+> (`failed to get volume group by id …`) and strands an in-flight failover. Found live 2026-07-30.
+
 ![Regional DR — VM + RBD-mirrored PVC on cluster2, ODF async mirror to cluster3; a Ramen DRPlacementControl restarts the VM on cluster3 on failover](docs/images/diagrams/01-regional-dr.drawio.svg)
 
 A DR-protected VM (`vm-dr-example`) runs on **cluster2**. Its disk is mirrored to **cluster3**
@@ -976,7 +999,7 @@ seeded once and then left to whoever flips them.
 | `./ansible-runner.sh import` | Import spokes into ACM |
 | `./ansible-runner.sh infra-dr` | Submariner (globalnet off) + ODF StorageCluster |
 | `./ansible-runner.sh certs` | cert-manager + Let's Encrypt wildcard certs |
-| `./ansible-runner.sh app` | MirrorPeer + DRPolicy + sample DR app |
+| `./ansible-runner.sh app` | MirrorPeer + DRPolicy + sample DR app (GitOps instance by default; `-e app_deployment_mode=direct\|both`) |
 | `./ansible-runner.sh virt` | OpenShift Virtualization + DR-protected VM |
 | `./ansible-runner.sh volsync-dr` | VolSync Direct DR (app-role label-flip failover) for the app; `--vm` for the VM — the `--vm` variant needs `virt` run first (use case 3) |
 | `./ansible-runner.sh volsync-dr --destroy` | Tear down VolSync Direct DR (`--vm` for the VM variant) |

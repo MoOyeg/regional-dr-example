@@ -144,7 +144,7 @@ Commands:
     operators       Install DR operators on deployed clusters
     import          Import spoke clusters into ACM hub
     infra-dr        Configure DR infrastructure (Submariner, ODF, SSL certs)
-    app             Deploy DR-protected sample application (Quarkus + MySQL)
+    app             Deploy DR-protected sample application (Quarkus + MySQL, GitOps by default)
     certs           Install cert-manager and Let's Encrypt wildcard certificate
     netobserv       Install NetObserv for network traffic monitoring
     acs             Install ACS (Advanced Cluster Security) for cluster security
@@ -223,7 +223,9 @@ Examples:
     $0 test-failover -e instance=direct # Test Direct instance only
     $0 operators
     $0 infra-dr
-    $0 app                            # Deploy DR-protected sample application
+    $0 app                            # Deploy DR-protected sample application (GitOps instance)
+    $0 app -e app_deployment_mode=direct   # ...the non-GitOps instance instead
+    $0 app -e app_deployment_mode=both     # ...both (only GitOps is DR-protected)
     $0 app --destroy                  # Remove DR application and DRPolicy
     $0 validate
     $0 list

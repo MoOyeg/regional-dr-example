@@ -34,6 +34,42 @@
     uc2_vm: "{{ cclm_test_vm | default('cclm-fedora') }}"
     uc2_slo_s: 300
 
+- name: "UC2: run the prerequisite commands (cclm)"
+  block:
+    - name: "UC2: prerequisites"
+      command:
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/{{ uc2_pb }}
+        chdir: "{{ repo_root }}"
+      register: uc2_prereq
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+      loop:
+        - setup-cclm.yml
+      loop_control:
+        loop_var: uc2_pb
+
+    - name: "UC2: save the prereq logs"
+      copy:
+        content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase2/{{ test_run_id }}-prereq-{{ item.uc2_pb | replace('.yml','') }}.log"
+        mode: "0644"
+      loop: "{{ uc2_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc2_pb }}"
+      delegate_to: localhost
+
+    - name: "UC2: record the prereq phases"
+      set_fact:
+        uc_phases: >-
+          {{ uc_phases + [{'name': 'prereq:' ~ item.uc2_pb,
+                           'status': 'pass' if (item.rc == 0 and item.stdout is search('failed=0') and not (item.stdout is search('failed=[1-9]'))) else 'fail',
+                           'detail': 'rc=' ~ item.rc}] }}
+      loop: "{{ uc2_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc2_pb }}"
+  when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
+
 - name: "UC2: functional test"
   block:
     - name: "UC2: locate the VM"
@@ -152,8 +188,11 @@
 
   rescue:
     - name: "UC2: mark failed"
+      # A guard named "require ..." is a PRECONDITION, not a DR failure: it means
+      # the use case was never set up on this environment. Recording that as
+      # 'fail' would make "never deployed" indistinguishable from "DR is broken".
       set_fact:
-        uc_result: "fail"
+        uc_result: "{{ 'not-deployed' if ('require' in (ansible_failed_task.name | default('') | lower)) else 'fail' }}"
         uc_failure:
           phase: "{{ ansible_failed_task.name | default('unknown') }}"
           message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"

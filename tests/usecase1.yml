@@ -31,6 +31,43 @@
     uc1_gitops_ns: "{{ gitops_namespace | default('openshift-gitops') }}"
     uc1_failover_slo_s: 600
 
+- name: "UC1: run the prerequisite commands (app then virt)"
+  block:
+    - name: "UC1: prerequisites"
+      command:
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/{{ uc1_pb }}
+        chdir: "{{ repo_root }}"
+      register: uc1_prereq
+      delegate_to: localhost
+      changed_when: true
+      failed_when: false
+      loop:
+        - deploy-app.yml
+        - setup-virt.yml
+      loop_control:
+        loop_var: uc1_pb
+
+    - name: "UC1: save the prereq logs"
+      copy:
+        content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase1/{{ test_run_id }}-prereq-{{ item.uc1_pb | replace('.yml','') }}.log"
+        mode: "0644"
+      loop: "{{ uc1_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc1_pb }}"
+      delegate_to: localhost
+
+    - name: "UC1: record the prereq phases"
+      set_fact:
+        uc_phases: >-
+          {{ uc_phases + [{'name': 'prereq:' ~ item.uc1_pb,
+                           'status': 'pass' if (item.rc == 0 and item.stdout is search('failed=0') and not (item.stdout is search('failed=[1-9]'))) else 'fail',
+                           'detail': 'rc=' ~ item.rc}] }}
+      loop: "{{ uc1_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc1_pb }}"
+  when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
+
 - name: "UC1: functional test"
   block:
     - name: "UC1: read the DRPC state"
@@ -152,8 +189,11 @@
 
   rescue:
     - name: "UC1: mark failed"
+      # A guard named "require ..." is a PRECONDITION, not a DR failure: it means
+      # the use case was never set up on this environment. Recording that as
+      # 'fail' would make "never deployed" indistinguishable from "DR is broken".
       set_fact:
-        uc_result: "fail"
+        uc_result: "{{ 'not-deployed' if ('require' in (ansible_failed_task.name | default('') | lower)) else 'fail' }}"
         uc_failure:
           phase: "{{ ansible_failed_task.name | default('unknown') }}"
           message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"

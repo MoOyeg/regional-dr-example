@@ -231,6 +231,27 @@ acs_deploy_all_clusters: true
 # Push this repo to a Git server and set app_git_url to the repo URL.
 # =========================================================================
 
+# Which application instance(s) use case 1 deploys:
+#   gitops (default) - ArgoCD ApplicationSet pushes the app to the DR cluster;
+#                      this is the flow the README walks through.
+#   direct           - the same manifests applied with `oc apply`, no GitOps.
+#                      DR-protected too, since it is then the only instance.
+#   both             - deploy both, in separate namespaces. Only the GitOps one
+#                      is DR-protected unless app_protect_direct_instance=true.
+#
+# Why `both` does not protect both by default: two DR-protected instances of the
+# same app on one storage class collide on ODF versions that group PVCs into
+# consistency groups. The group id comes from the storage class, not the app, so
+# both PVCs land in the same RBD group - and an RBD image may belong to only one
+# group. The second VolumeGroupReplication fails in Ceph with
+# "rbd: ret=-22, Invalid argument", that DRPC never leaves Protected=False, and
+# the ODF DR dashboard goes critical. Clearing it means Ceph surgery on a
+# MIRRORED group, which breaks the peer's promote and strands any in-flight
+# failover. Found live 2026-07-30.
+#   ./ansible-runner.sh app -e app_deployment_mode=direct
+app_deployment_mode: "gitops"
+app_protect_direct_instance: false
+
 # Application namespace (GitOps instance; Direct instance uses {{ app_namespace }}-direct)
 app_namespace: "quarkus-web-app"
 

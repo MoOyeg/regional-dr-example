@@ -36,30 +36,41 @@
     uc4_failover_slo_s: 600
     uc4_terminal_ok: ["Completed", "PartiallyFailed"]
 
-- name: "UC4: run the prerequisite command (oadp)"
+- name: "UC4: run the prerequisite commands (virt then oadp)"
   block:
-    - name: "UC4: oadp"
+    - name: "UC4: prerequisites"
       command:
-        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/setup-oadp.yml
+        cmd: ansible-playbook -i {{ repo_root }}/inventory/hosts {{ repo_root }}/{{ uc4_pb }}
         chdir: "{{ repo_root }}"
       register: uc4_prereq
       delegate_to: localhost
       changed_when: true
       failed_when: false
+      loop:
+        - setup-virt.yml
+        - setup-oadp.yml
+      loop_control:
+        loop_var: uc4_pb
 
-    - name: "UC4: save the prereq log"
+    - name: "UC4: save the prereq logs"
       copy:
-        content: "{{ uc4_prereq.stdout | default('') }}\n{{ uc4_prereq.stderr | default('') }}"
-        dest: "{{ test_results_dir }}/usecase4/{{ test_run_id }}-prereq-oadp.log"
+        content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}"
+        dest: "{{ test_results_dir }}/usecase4/{{ test_run_id }}-prereq-{{ item.uc4_pb | replace('.yml','') }}.log"
         mode: "0644"
+      loop: "{{ uc4_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc4_pb }}"
       delegate_to: localhost
 
-    - name: "UC4: record the prereq phase"
+    - name: "UC4: record the prereq phases"
       set_fact:
         uc_phases: >-
-          {{ uc_phases + [{'name': 'prereq:oadp',
-                           'status': 'pass' if (uc4_prereq.rc == 0 and uc4_prereq.stdout is search('failed=0') and not (uc4_prereq.stdout is search('failed=[1-9]'))) else 'fail',
-                           'detail': 'rc=' ~ uc4_prereq.rc}] }}
+          {{ uc_phases + [{'name': 'prereq:' ~ item.uc4_pb,
+                           'status': 'pass' if (item.rc == 0 and item.stdout is search('failed=0') and not (item.stdout is search('failed=[1-9]'))) else 'fail',
+                           'detail': 'rc=' ~ item.rc}] }}
+      loop: "{{ uc4_prereq.results }}"
+      loop_control:
+        label: "{{ item.uc4_pb }}"
   when: test_run_prereqs | bool and test_stage in ['all', 'prereq']
 
 - name: "UC4: functional test"
@@ -202,8 +213,11 @@
 
   rescue:
     - name: "UC4: mark failed"
+      # A guard named "require ..." is a PRECONDITION, not a DR failure: it means
+      # the use case was never set up on this environment. Recording that as
+      # 'fail' would make "never deployed" indistinguishable from "DR is broken".
       set_fact:
-        uc_result: "fail"
+        uc_result: "{{ 'not-deployed' if ('require' in (ansible_failed_task.name | default('') | lower)) else 'fail' }}"
         uc_failure:
           phase: "{{ ansible_failed_task.name | default('unknown') }}"
           message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"

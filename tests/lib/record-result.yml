@@ -6,7 +6,12 @@
 # line to test-results/history.jsonl (the "when did it last pass" ledger).
 #
 # Expects, set by the caller:
-#   uc_id, uc_name, uc_result (pass|fail|env-unavailable|skipped)
+#   uc_id, uc_name, uc_result (pass|fail|not-deployed|env-unavailable|skipped)
+#
+# not-deployed vs fail matters: "the use case was never set up here" and "DR is
+# broken" look identical in a ledger that only knows pass/fail, and conflating
+# them is the same dishonesty this framework exists to prevent. A use case test
+# raises not-deployed from its topology guard by setting uc_precondition_failed.
 #   uc_phases     : list of {name, status, duration_s, detail}
 #   uc_seed       : {marker, method}          (optional)
 #   uc_verify     : {expected, actual, passed}(optional)

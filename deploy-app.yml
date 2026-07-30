@@ -476,6 +476,18 @@
 # =============================================================================
 # Play 5: Deploy DR-protected application via OpenShift GitOps (ArgoCD)
 # =============================================================================
+# =============================================================================
+# Play: the GITOPS application instance - deployed by DEFAULT
+# =============================================================================
+# Which instance(s) use case 1 deploys is chosen with app_deployment_mode:
+#   gitops (default) - ArgoCD ApplicationSet pushes the app to the DR cluster.
+#                      This is the mode the README walks through.
+#   direct           - plain `oc apply` of the same manifests, no GitOps.
+#   both             - both instances, in separate namespaces.
+# In `both`, only the GitOps instance is DR-protected unless
+# app_protect_direct_instance=true: two DR-protected instances of the same app
+# on one storage class collide in Ceph (see the direct play below for the full
+# mechanism and error).
 - name: Deploy DR-protected application via OpenShift GitOps
   hosts: openshift_clusters
   gather_facts: false
@@ -485,6 +497,10 @@
     gitops_namespace: "openshift-gitops"
 
   pre_tasks:
+    - name: Skip the GitOps instance when app_deployment_mode excludes it
+      meta: end_host
+      when: (app_deployment_mode | default('gitops')) not in ['gitops', 'both']
+
     - name: Skip non-hub clusters
       meta: end_host
       when: cluster_role | default('spoke') != 'hub'
@@ -703,6 +719,28 @@
 # =============================================================================
 # Play 6: Deploy DR-protected application via direct manifests
 # =============================================================================
+# =============================================================================
+# Play: the DIRECT (non-GitOps) application instance
+# =============================================================================
+# Deployed only when app_deployment_mode is `direct` or `both` (default is
+# `gitops`, so this play is skipped). Same manifests as the GitOps instance,
+# applied with `oc apply` instead of through ArgoCD - useful for showing DR
+# without GitOps in the picture.
+#
+# In `direct` mode this instance IS DR-protected (it is the only one). In `both`
+# mode it is deployed but NOT protected unless app_protect_direct_instance=true,
+# because two DR-protected instances of the same app on the same storage class
+# collide on ODF versions that group PVCs into consistency groups: the group id
+# is derived from the storage class, not the app, so both PVCs land in one RBD
+# group - and an RBD image may belong to only ONE group. The second
+# VolumeGroupReplication then fails in Ceph with
+#     failed to add image ... to volume group ...: rbd: ret=-22, Invalid argument
+# leaving that DRPC at Protected=False and the ODF DR dashboard critical. There
+# is no Kubernetes-level fix: the orphaned group membership has to be cleared in
+# Ceph, and deleting the RBD group is itself destructive - it is mirrored, so
+# removing it on the primary breaks the peer's promote with
+#     failed to get volume group by id ...
+# and strands an in-flight failover. Observed live 2026-07-30.
 - name: Deploy DR-protected application via direct manifests
   hosts: openshift_clusters
   gather_facts: false
@@ -712,6 +750,10 @@
     direct_namespace: "{{ app_namespace }}-direct"
 
   pre_tasks:
+    - name: Skip the direct instance entirely unless explicitly enabled
+      meta: end_host
+      when: (app_deployment_mode | default('gitops')) not in ['direct', 'both']
+
     - name: Skip non-hub clusters
       meta: end_host
       when: cluster_role | default('spoke') != 'hub'
@@ -1052,6 +1094,25 @@
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
 
+    # =========================================================================
+    # DR protection for the DIRECT instance - OFF by default
+    # =========================================================================
+    # Only the GitOps instance is DR-protected. Protecting BOTH instances of the
+    # same app, on the same storage class, collides on ODF versions that group
+    # PVCs into consistency groups: the group id is derived from the storage
+    # class rather than the application, so both PVCs get the SAME
+    # `ramendr.openshift.io/consistency-group` label, Ramen creates a
+    # VolumeGroupReplication per DRPC, and only the first one is bound to a
+    # VolumeGroupReplicationContent. The second sits with an empty status
+    # forever:
+    #     UploadFailed: error getting VGRC for VGR ...
+    #     VolumeGroupReplicationContent "" not found
+    # -> DataReady=False -> DRPC Protected=False -> the ODF DR dashboard shows
+    # the app critical, even though replication for the other instance is fine.
+    # Observed live 2026-07-30. The direct instance is still deployed (it is what
+    # demonstrates the non-GitOps path); it just is not DR-protected.
+    # Set app_protect_direct_instance=true to restore the old behaviour, but do
+    # not expect both DRPCs to report Protected on a consistency-group ODF.
     - name: Create Placement for direct application
       shell: |
         oc apply -f - <<'EOF'
@@ -1069,8 +1130,14 @@
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
+      when: >-
+        (app_deployment_mode | default('gitops')) == 'direct'
+        or (app_protect_direct_instance | default(false) | bool)
 
     - name: Create DRPlacementControl for direct application
+      when: >-
+        (app_deployment_mode | default('gitops')) == 'direct'
+        or (app_protect_direct_instance | default(false) | bool)
       shell: |
         oc apply -f - <<'EOF'
         apiVersion: ramendr.openshift.io/v1alpha1
@@ -1122,6 +1189,9 @@
       register: direct_drpc_status
       changed_when: false
       ignore_errors: true
+      when: >-
+        (app_deployment_mode | default('gitops')) == 'direct'
+        or (app_protect_direct_instance | default(false) | bool)
 
     - name: Get Direct application Route URL
       shell: |

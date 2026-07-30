@@ -124,8 +124,27 @@
       shell: |
         oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
           get replicationdestination -o jsonpath='{.items[0].status.latestImage.name}' 2>/dev/null || true
+      register: uc3_image_first
+      until: uc3_image_first.stdout | trim != '' and uc3_image_first.stdout | trim != uc3_image_before.stdout | trim
+      retries: 30
+      delay: 20
+      delegate_to: localhost
+      changed_when: false
+
+    # ...and then a SECOND one. VolSync rsyncs a LIVE, unquiesced MySQL datadir,
+    # so the copy is crash-inconsistent: a table created seconds before a sync can
+    # arrive as an .ibd file whose dictionary/redo state did not, and the failed
+    # over database then reports "Table doesn't exist". Measured 2026-07-29 - a
+    # marker seeded ~60-90s before the FIRST sync was unreadable after failover,
+    # while the same marker given a full settled cycle recovered intact. One full
+    # cycle after the seed is therefore the honest RPO boundary for this use case,
+    # and a test that fails over inside it is measuring its own race, not DR.
+    - name: "UC3: wait for a SECOND snapshot so the seed is a settled write"
+      shell: |
+        oc --kubeconfig {{ artifacts_dir }}/{{ uc3_standby }}/kubeconfig -n {{ uc3_ns }} \
+          get replicationdestination -o jsonpath='{.items[0].status.latestImage.name}' 2>/dev/null || true
       register: uc3_image_after
-      until: uc3_image_after.stdout | trim != '' and uc3_image_after.stdout | trim != uc3_image_before.stdout | trim
+      until: uc3_image_after.stdout | trim != '' and uc3_image_after.stdout | trim != uc3_image_first.stdout | trim
       retries: 30
       delay: 20
       delegate_to: localhost
@@ -137,7 +156,9 @@
           marker: "{{ uc3_marker }}"
           method: "mysql-insert"
           snapshot_before: "{{ uc3_image_before.stdout | trim }}"
+          snapshot_first: "{{ uc3_image_first.stdout | trim }}"
           snapshot_after: "{{ uc3_image_after.stdout | trim }}"
+          settled: "seed survived a full sync cycle before failover"
         uc_phases: "{{ uc_phases + [{'name': 'seed', 'status': 'pass', 'detail': 'new snapshot ' ~ (uc3_image_after.stdout | trim) ~ ' on ' ~ uc3_standby}] }}"
 
     # -------------------------------------------------------------------------
@@ -228,8 +249,11 @@
 
   rescue:
     - name: "UC3: mark failed"
+      # A guard named "require ..." is a PRECONDITION, not a DR failure: it means
+      # the use case was never set up on this environment. Recording that as
+      # 'fail' would make "never deployed" indistinguishable from "DR is broken".
       set_fact:
-        uc_result: "fail"
+        uc_result: "{{ 'not-deployed' if ('require' in (ansible_failed_task.name | default('') | lower)) else 'fail' }}"
         uc_failure:
           phase: "{{ ansible_failed_task.name | default('unknown') }}"
           message: "{{ (ansible_failed_result.msg | default(ansible_failed_result.stdout | default('no detail'))) | string | truncate(600) }}"
