@@ -91,7 +91,8 @@
         msg: >-
           {{ uc2_vm }} is not Running on exactly one spoke
           ({{ dict(test_spokes | zip(uc2_where.results | map(attribute='stdout') | list)) }}).
-          Create the standalone demo VM first - see docs/TESTING.md.
+          Create the standalone demo VM first:
+            oc --kubeconfig artifacts/<spoke>/kubeconfig apply -f cclm-demo/
       when: uc2_from == '' or uc2_to == ''
 
     - name: "UC2: capture the VMI identity before migrating"

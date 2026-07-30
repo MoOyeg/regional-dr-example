@@ -1,0 +1,15 @@
+---
+# Standalone namespace for the cross-cluster live migration demo (use case 2).
+#
+# Deliberately NOT one of the DR-protected namespaces. The VMs in vm-example
+# (use case 1, Ramen DRPC), vm-example-volsync (use case 3, app-role policies)
+# and vm-example-oadp (use case 4, oadp-role auto-failover) are each owned by a
+# controller that decides where they run - migrating one of those across
+# clusters makes that controller fight the migration and corrupts the use case.
+# CCLM needs a VM nobody else is managing.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cclm-demo
+  labels:
+    app: cclm-fedora

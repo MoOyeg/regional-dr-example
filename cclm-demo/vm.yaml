@@ -1,0 +1,77 @@
+---
+# The VM use case 2 live-migrates between spokes.
+#
+# cloud-init writes a boot id once at first boot and then appends a heartbeat
+# every 5s to the DATA disk. That is what makes "the guest never rebooted"
+# measurable rather than assumed: after a migration the boot id must be
+# UNCHANGED and the heartbeat must have no gap. A VMI that is Running on the
+# target proves only that a VM exists there - it does not distinguish a live
+# migration from a restart, which is the entire claim of this use case.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cclm-fedora
+  namespace: cclm-demo
+  labels:
+    app: cclm-fedora
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        app: cclm-fedora
+        kubevirt.io/vm: cclm-fedora
+    spec:
+      # evictionStrategy keeps a node drain from killing the guest - it triggers
+      # a live migration instead, which is the same machinery this demo exercises.
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 2Gi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: datadisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/containerdisks/fedora:latest
+        - name: datadisk
+          persistentVolumeClaim:
+            claimName: cclm-data-pvc
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: fedora
+              chpasswd: { expire: False }
+              ssh_pwauth: true
+              packages:
+                - qemu-guest-agent
+              runcmd:
+                # Format and mount the data disk on first boot only.
+                - [ sh, -c, "blkid /dev/vdb || mkfs.ext4 -F /dev/vdb" ]
+                - [ mkdir, -p, /mnt/data ]
+                - [ mount, /dev/vdb, /mnt/data ]
+                # Record the boot id ONCE. It changes only across a real reboot,
+                # so comparing it before and after a migration is the no-reboot proof.
+                - [ sh, -c, "cat /proc/sys/kernel/random/boot_id > /mnt/data/boot-id" ]
+                # Heartbeat: a gap here means the guest stopped, i.e. not a live move.
+                - [ sh, -c, "nohup sh -c 'while true; do date -u +%%H:%%M:%%S >> /mnt/data/heartbeat.log; sync; sleep 5; done' >/dev/null 2>&1 &" ]
+                - [ systemctl, enable, --now, qemu-guest-agent ]

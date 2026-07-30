@@ -44,7 +44,7 @@ Each rule below exists because something looked healthy while being broken.
 | # | Prereqs run | Seed | Action | Verified at the receiver |
 |---|---|---|---|---|
 | 1 | `app`, `virt` | *(guest marker - pending)* | DRPC `Failover` | VM Running on peer, old site drained, `Protected` returns |
-| 2 | `cclm` | *(guest marker - pending)* | `cclm-migrate` | Same boot ID (no reboot), VMI on target |
+| 2 | `cclm` | *(boot id + heartbeat on the VM's data disk, written by `cclm-demo/` cloud-init - read-back pending)* | `cclm-migrate` | VMI on target, migration Succeeded, source released |
 | 3 | `app`, `volsync-dr` | MySQL row | flip `app-role` | Row readable from the promoted snapshot; new destination snapshot required **before** failover |
 | 4 | `oadp` | ConfigMap in the VM namespace | delete the VM | Marker restored from S3, VM Running on peer, role flipped |
 | 5 | `rhsi` | SQL row | flip `pg-role` | Row survived, site genuinely read-write, **reverse** replication works, write path followed |

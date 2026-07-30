@@ -244,9 +244,24 @@ oc --kubeconfig artifacts/cluster1/kubeconfig \
 ./ansible-runner.sh cclm         # decentralizedLiveMigration feature gate + cross-imported KubeVirt CAs
 ```
 
-Then you need **a running VM on a spoke** to migrate. The walkthrough below uses `cclm-fedora` in
-`cclm-demo`, a plain VM you create yourself (no playbook owns it). To migrate `virt`'s DR-protected
-`vm-dr-example` instead, run `./ansible-runner.sh app` before `virt` so that VM is deployed.
+Then create the VM to migrate — a **standalone** one, deliberately not owned by any DR controller:
+
+```bash
+for c in cluster2; do
+  oc --kubeconfig artifacts/$c/kubeconfig apply -f cclm-demo/
+done
+```
+
+[`cclm-demo/`](cclm-demo/) carries the namespace, a **Block-mode RWX** data disk (decentralized live
+migration rejects a Filesystem-mode disk on the receiving side) and the `cclm-fedora` VM. Its
+cloud-init records a **boot id** once and appends a heartbeat every 5 s to that disk, which is what
+makes "the guest never rebooted" measurable: after the migration the boot id must be unchanged and
+the heartbeat must have no gap. A VMI merely `Running` on the target does not distinguish a live
+migration from a restart.
+
+> Do **not** point this use case at the VMs of use cases 1, 3 or 4. Each is owned by a controller
+> that decides where it runs — Ramen's DRPC, the `app-role` VolSync policies, OADP auto-failover —
+> and a cross-cluster migration makes that controller fight the move and corrupts the other use case.
 
 ![CCLM — a running VM live-migrates from cluster2 to cluster3 over the Submariner encrypted pod network, memory and disk moving without a reboot](docs/images/diagrams/02-cclm.drawio.svg)
 

@@ -1,0 +1,24 @@
+---
+# Data disk for the CCLM demo VM.
+#
+# volumeMode MUST be Block and access mode RWX. Decentralized live migration
+# streams the disk between the two clusters' virt-launcher pods, and the
+# RECEIVING side rejects a Filesystem-mode disk - the migration fails rather
+# than falling back. The virtualization StorageClass
+# (ocs-storagecluster-ceph-rbd-virtualization) is the one ODF creates for exactly
+# this; it only exists once `virt` has installed CNV.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cclm-data-pvc
+  namespace: cclm-demo
+  labels:
+    app: cclm-fedora
+spec:
+  accessModes:
+    - ReadWriteMany
+  volumeMode: Block
+  storageClassName: ocs-storagecluster-ceph-rbd-virtualization
+  resources:
+    requests:
+      storage: 5Gi
