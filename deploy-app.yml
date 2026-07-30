@@ -235,18 +235,41 @@
     # not landed yet the task is a no-op and the next `app` run cleans up.
     # Both failure modes were reproduced live 2026-07-30: two groups -> CSV
     # Failed; deleting ours too early (no group at all) -> CSV never installs.
-    - name: Remove the bootstrap OperatorGroup once ramen-operator-group exists
+    # The orchestrator pushes ramen-operator-group via an AppliedManifestWork,
+    # which lands MINUTES after the MirrorPeer/DRPolicy is accepted - not
+    # immediately. A single check here is always too early: it finds nothing,
+    # leaves the bootstrap group in place, the orchestrator's group arrives after
+    # the play has moved on, and the CSV goes Failed with TooManyOperatorGroups
+    # with nothing left to clean it up. Observed exactly that on 2026-07-30.
+    # So WAIT for the orchestrator's group before removing ours.
+    - name: Wait for the orchestrator's ramen-operator-group on each spoke
       shell: |
-        K={{ artifacts_dir }}/{{ item }}/kubeconfig
+        oc --kubeconfig {{ artifacts_dir }}/{{ item }}/kubeconfig \
+          get operatorgroup ramen-operator-group -n openshift-dr-system \
+          -o jsonpath='{.metadata.name}' 2>/dev/null || true
+      delegate_to: localhost
+      loop: "{{ spoke_clusters[:2] }}"
+      register: dr_ramen_og
+      until: dr_ramen_og.stdout | trim == 'ramen-operator-group'
+      retries: 30
+      delay: 20
+      changed_when: false
+      failed_when: false
+
+    - name: Remove the bootstrap OperatorGroup now the orchestrator owns one
+      shell: |
+        K={{ artifacts_dir }}/{{ item.item }}/kubeconfig
         if oc --kubeconfig $K get operatorgroup ramen-operator-group -n openshift-dr-system >/dev/null 2>&1; then
           oc --kubeconfig $K delete operatorgroup openshift-dr-system-operatorgroup \
             -n openshift-dr-system --ignore-not-found
-          echo "removed bootstrap OperatorGroup on {{ item }}"
+          echo "removed bootstrap OperatorGroup on {{ item.item }}"
         else
-          echo "orchestrator OperatorGroup not present yet on {{ item }}; leaving bootstrap in place"
+          echo "WARNING: ramen-operator-group never appeared on {{ item.item }}; bootstrap left in place - if it lands later, delete openshift-dr-system-operatorgroup by hand or re-run app"
         fi
       delegate_to: localhost
-      loop: "{{ spoke_clusters[:2] }}"
+      loop: "{{ dr_ramen_og.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
       register: dr_og_cleanup
       changed_when: "'removed' in dr_og_cleanup.stdout | default('')"
 
