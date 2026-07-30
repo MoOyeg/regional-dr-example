@@ -252,12 +252,15 @@ acs_deploy_all_clusters: true
 app_deployment_mode: "gitops"
 app_protect_direct_instance: false
 
-# The ODF Multicluster Orchestrator creates `ramen-operator-group` in
-# openshift-dr-system on each spoke when `app` configures the DRPolicy/MirrorPeer.
-# `operators` therefore does NOT create one: a second OperatorGroup in that
-# namespace makes OLM fail odr-cluster-operator with TooManyOperatorGroups.
-# Set true only when installing the DR cluster operator without the orchestrator.
-dr_create_operatorgroup: false
+# openshift-dr-system OperatorGroup handling (spokes):
+#   `operators` creates a BOOTSTRAP OperatorGroup - OLM will not resolve the
+#   odr-cluster-operator Subscription without one, so removing it entirely means
+#   the CSV never installs at all.
+#   `app` then DELETES that bootstrap group once the ODF Multicluster
+#   Orchestrator has pushed its own `ramen-operator-group`, because two
+#   OperatorGroups in one namespace make OLM fail the CSV with
+#   TooManyOperatorGroups. Both failure modes were reproduced live 2026-07-30.
+# No variable to set - the handoff is automatic.
 
 # Application namespace (GitOps instance; Direct instance uses {{ app_namespace }}-direct)
 app_namespace: "quarkus-web-app"

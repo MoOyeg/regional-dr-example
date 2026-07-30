@@ -219,6 +219,44 @@
       delay: 15
       ignore_errors: true
 
+    # =========================================================================
+    # Remove the bootstrap OperatorGroup now the orchestrator owns one
+    # =========================================================================
+    # setup-operators.yml creates openshift-dr-system-operatorgroup on each spoke
+    # because OLM will not resolve the odr-cluster-operator Subscription without
+    # an OperatorGroup. Configuring the MirrorPeer/DRPolicy above makes the ODF
+    # Multicluster Orchestrator push its own `ramen-operator-group` (owned by an
+    # AppliedManifestWork) into that same namespace - and two OperatorGroups make
+    # OLM fail the CSV with TooManyOperatorGroups, leaving Ramen's dr-cluster
+    # operator unmanaged on every spoke.
+    #
+    # So the bootstrap group is dropped here, once the orchestrator's exists. Only
+    # ours is removed (it carries the bootstrap label); if the orchestrator has
+    # not landed yet the task is a no-op and the next `app` run cleans up.
+    # Both failure modes were reproduced live 2026-07-30: two groups -> CSV
+    # Failed; deleting ours too early (no group at all) -> CSV never installs.
+    - name: Remove the bootstrap OperatorGroup once ramen-operator-group exists
+      shell: |
+        K={{ artifacts_dir }}/{{ item }}/kubeconfig
+        if oc --kubeconfig $K get operatorgroup ramen-operator-group -n openshift-dr-system >/dev/null 2>&1; then
+          oc --kubeconfig $K delete operatorgroup openshift-dr-system-operatorgroup \
+            -n openshift-dr-system --ignore-not-found
+          echo "removed bootstrap OperatorGroup on {{ item }}"
+        else
+          echo "orchestrator OperatorGroup not present yet on {{ item }}; leaving bootstrap in place"
+        fi
+      delegate_to: localhost
+      loop: "{{ spoke_clusters[:2] }}"
+      register: dr_og_cleanup
+      changed_when: "'removed' in dr_og_cleanup.stdout | default('')"
+
+    - name: Report the OperatorGroup cleanup
+      debug:
+        msg: "{{ item.stdout | default('') | trim }}"
+      loop: "{{ dr_og_cleanup.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
     - name: Display MirrorPeer status
       debug:
         msg: >-

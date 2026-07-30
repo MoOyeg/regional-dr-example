@@ -265,25 +265,19 @@
       delegate_to: localhost
 
     # =========================================================================
-    # We do NOT create an OperatorGroup here. The ODF Multicluster Orchestrator
-    # creates `ramen-operator-group` in this namespace (owned by an
-    # AppliedManifestWork) as soon as a DRPolicy/MirrorPeer is configured - i.e.
-    # during `app`, which always runs AFTER this playbook. Two OperatorGroups in
-    # one namespace make OLM fail the CSV with TooManyOperatorGroups, so
-    # odr-cluster-operator ends up Failed on every spoke and Ramen's dr-cluster
-    # operator is left unmanaged until someone deletes our group by hand.
+    # An OperatorGroup is REQUIRED here: OLM will not resolve a Subscription in a
+    # namespace that has none, so without it odr-cluster-operator never installs
+    # at all (the Subscription sits with an empty status and no CSV appears).
     #
-    # A "create only if the namespace has none" guard does NOT help: at this
-    # point in the run the namespace is genuinely empty, the guard fires, and the
-    # orchestrator adds the second group later. The collision is created by
-    # ORDERING, not by a pre-existing group - so the only reliable fix is to let
-    # the orchestrator own the OperatorGroup. Reproduced on a fresh build
-    # 2026-07-30: both spokes showed odr-cluster-operator Failed with
-    # openshift-dr-system-operatorgroup + ramen-operator-group side by side, and
-    # deleting ours returned the CSV to Succeeded within a minute.
-    #
-    # Set dr_create_operatorgroup=true only if you are installing the DR cluster
-    # operator WITHOUT the ODF Multicluster Orchestrator (it will not supply one).
+    # The catch is what happens later. When `app` configures the
+    # DRPolicy/MirrorPeer, the ODF Multicluster Orchestrator creates its OWN
+    # OperatorGroup (`ramen-operator-group`, owned by an AppliedManifestWork) in
+    # this same namespace. Two OperatorGroups make OLM fail the CSV with
+    # TooManyOperatorGroups, and Ramen's dr-cluster operator is left unmanaged on
+    # every spoke. So ours is created here to bootstrap the install and REMOVED
+    # by deploy-app.yml once the orchestrator's group exists - see
+    # "Remove the bootstrap OperatorGroup" there. Reproduced live 2026-07-30 in
+    # both directions: two groups -> CSV Failed; zero groups -> CSV never installs.
     - name: Check for an existing OperatorGroup in openshift-dr-system
       shell: |
         oc get operatorgroup -n openshift-dr-system \
@@ -294,7 +288,7 @@
       register: dr_existing_operatorgroup
       changed_when: false
 
-    - name: Create DR Cluster OperatorGroup (opt-in; the orchestrator normally owns this)
+    - name: Create the bootstrap DR Cluster OperatorGroup (removed later by `app`)
       shell: |
         oc apply -f - <<'EOF'
         apiVersion: operators.coreos.com/v1
@@ -302,25 +296,20 @@
         metadata:
           name: openshift-dr-system-operatorgroup
           namespace: openshift-dr-system
+          labels:
+            regional-dr-example/bootstrap-operatorgroup: "true"
         EOF
       environment:
         KUBECONFIG: "{{ artifacts_dir }}/{{ cluster_name }}/kubeconfig"
       delegate_to: localhost
-      when:
-        - dr_create_operatorgroup | default(false) | bool
-        - dr_existing_operatorgroup.stdout | trim | length == 0
+      when: dr_existing_operatorgroup.stdout | trim | length == 0
 
-    - name: Explain that the OperatorGroup is left to the ODF orchestrator
+    - name: Report the OperatorGroup already present
       debug:
         msg: >-
-          {{ 'openshift-dr-system already has OperatorGroup(s): '
-             ~ (dr_existing_operatorgroup.stdout | trim)
-             if (dr_existing_operatorgroup.stdout | trim | length > 0)
-             else 'No OperatorGroup created on ' ~ cluster_name ~ ' - the ODF Multicluster
-                   Orchestrator supplies ramen-operator-group when app configures the
-                   DRPolicy/MirrorPeer. Creating one here would fail the CSV with
-                   TooManyOperatorGroups.' }}
-      when: not (dr_create_operatorgroup | default(false) | bool)
+          openshift-dr-system on {{ cluster_name }} already has OperatorGroup(s):
+          {{ dr_existing_operatorgroup.stdout | trim }} - not creating another.
+      when: dr_existing_operatorgroup.stdout | trim | length > 0
 
     - name: Create OpenShift DR Cluster Operator Subscription
       shell: |
