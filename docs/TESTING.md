@@ -84,7 +84,16 @@ Measured 2026-07-28 on the three-cluster environment; useful as SLO budgets:
 | 2 CCLM | ~45 s, no reboot |
 | 3 VolSync | ~50 s to VM on peer, 70 s to full convergence |
 | 4 OADP | 74 s to role flip, 219 s to restored VM |
-| 5 CNPG/RHSI | deadlocked before the fix; budget 300 s |
+| 5 CNPG/RHSI | **50 s** switchover, unaided (2026-07-30); budget 300 s |
+
+## Five use cases on one environment (2026-07-30)
+
+All five were deployed side by side on a single three-cluster environment and
+verified healthy simultaneously - no cleanup or teardown between them. They are
+isolated by construction: separate namespaces, and three dedicated role labels
+(`app-role`, `oadp-role`, `pg-role`) that never read each other. Use case 5 in
+particular needs no `virt`, no `app` and no Submariner - only ODF storage and the
+`dr-clusters` clusterset.
 
 ## RPO caveat for use case 3 (measured 2026-07-29)
 

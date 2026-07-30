@@ -84,7 +84,7 @@
   (`--vm`, `--destroy`). Images in `docs/images/volsync-dr/`.
 - `setup-rhsi.yml` / `destroy-rhsi.yml` — **CNPG cross-site Postgres over Red Hat Service Interconnect**
   (Skupper v2). Command `rhsi` (use case 5). REWRITTEN 2026-07 from the old VM-bridging demo (which was
-  live-validated but is now retired). Written + syntax-checked, NOT yet run live. Installs `skupper-operator`
+  live-validated but is now retired). Installs `skupper-operator`
   + Network Observer (AllNamespaces, asserted) **and** the CloudNativePG operator on each spoke; a Site +
   mTLS Link in `postgres-dr`; side-loads a **shared CA + `streaming_replica` cert** to both spokes; deploys
   the `pg-app` sample (`app-cnpg/`, writes a heartbeat via the `pg-write` VAN key, reads the local `pg-r`).
@@ -107,6 +107,16 @@
   ints — but **CNPG `connectionParameters` ports must be QUOTED strings** (it is `map[string]string`),
   opposite rules in one file. Also: the `.j2` **header is outside the raw block**, so it must contain no
   Jinja delimiters at all.
+  **RE-VALIDATED 2026-07-30** on a rebuilt environment with all FIVE use cases running side by side:
+  switchover completed **unaided in 50s** from the label flip, the pre-switchover row survived, a fresh
+  write on the new primary replicated **back** to the demoted site, and the `pg-write` Connector
+  followed. A SIXTH defect was found and fixed first: replication dialled the shared `pg-write` key,
+  but during handover BOTH pods still carry `cnpg.io/instanceRole=primary`, so the promoting site's own
+  Connector matched its own replica and Skupper local-preference made it **stream from itself** -
+  `receive_lsn` frozen short of the promotion token's LSN, token never verified, BOTH sites left as
+  replicas with no writable database, indefinitely. `pg_stat_wal_receiver` said `streaming` the whole
+  time. Fix: **site-scoped routing keys** (`pg-site-<site>`, one Connector per site with a role-agnostic
+  selector, `externalClusters` host `pg-<site>`), so there is no local target to shadow the peer.
   **VALIDATED LIVE 2026-07-27** (Sites+Link Ready, CNPG streaming over the VAN, `pg-role` flip =
   controlled switchover with zero data loss, write path followed). Five defects found live:
     - `cloudnative-pg` is in the **certified-operators** catalog, NOT community.
@@ -175,6 +185,26 @@
 - Hub SNO defaults to `m5.8xlarge` (`minimal_hub_instance_type`) to fit the full hub stack
 
 ## Known Issues / Gotchas
+- **Deleting a Ramen-managed object directly on a spoke does NOT self-heal.** The hub's ManifestWork
+  still believes the resource is applied, so nothing re-pushes it and the DRPC sits at
+  `Missing VolumeReplicationGroup status from cluster <spoke>` forever. Recovery goes through the HUB:
+  `oc delete manifestwork <drpc>-<ns>-vrg-mw -n <spoke>` — Ramen recreates it and re-derives
+  protection cleanly (a fresh `vr-<uuid>` appears, not the old name). Nudging the VRG with an
+  annotation does nothing; Ramen reconciles, logs `Requeue:false`, and stops. Cost ~15 min on
+  2026-07-30.
+- **A DRPC can stall at `Protected=False` because ONE PVC got claimed by both replication schemes.**
+  csi-addons then refuses it: `PVC (<ns>/<pvc>) can't be owned by both VolumeReplication and
+  VolumeGroupReplication`, the VolumeGroupReplicationContent never gets a handle, and `DataReady`
+  never flips. Ramen creates the per-PVC VR first and the group VGR ~14s later without removing the
+  first. NOTE both objects coexisting is NORMAL when a namespace has several PVCs (vm-example runs
+  VR + VGR happily) — the fault is one PVC owned twice. Do NOT delete the VolumeReplication (that
+  removes the half actually replicating and leaves Ramen with nothing to reconcile); recreate the VRG
+  via the hub ManifestWork instead.
+- **RBD consistency groups are MIRRORED — never `rbd group rm` to unstick a DRPC.** Deleting the group
+  on the primary destroys the peer's copy, and the peer's promote then fails with `failed to get
+  volume group by id ...`, stranding an in-flight failover with no writable site. `rbd group image rm`
+  is refused outright (`cannot remove image from mirror enabled group`). If a group membership really
+  is orphaned, recreate the PVC instead.
 - **`oc get backup` is ambiguous and the winner changes as you install use cases.** It resolved to
   `backups.postgresql.cnpg.noobaa.io` with ODF, and once use case 5 installs CNPG it resolves to
   `backups.postgresql.cnpg.io` — so `oadp-backup`/`oadp-restore` started reporting "not found" for a

@@ -883,6 +883,22 @@ moves to the other cluster, and the RHSI write path follows.
 > Five defects were found and fixed in the process — see the "Gotchas found live" note at the end of
 > this section. None were visible to YAML/template validation; every one needed a live operator.
 
+> ✅ **Re-validated 2026-07-30** after a **sixth** defect was found: the switchover used to deadlock
+> with **both sites left as replicas and no writable database anywhere**, indefinitely. Replication
+> dialled the shared `pg-write` key, but during handover both pods still carry
+> `cnpg.io/instanceRole=primary`, so the promoting site's own Connector matched its own replica and
+> Skupper's local-preference made it **stream from itself** — `receive_lsn` frozen short of the
+> promotion token's LSN, token never verified. `pg_stat_wal_receiver` reported `streaming` throughout,
+> so every status field looked healthy. Replication now uses **site-scoped keys** (`pg-site-<site>`,
+> one Connector per site, role-agnostic selector), so there is no local target to shadow the peer and
+> the deadlock is impossible by construction.
+>
+> Measured on the rebuilt environment with all five use cases running side by side: **switchover
+> completed unaided in 50 s** (label flip and nothing else), the pre-switchover row survived, a fresh
+> write on the new primary replicated **back** to the demoted site, and the `pg-write` Connector
+> followed. That last check is the one that matters — it distinguishes a real controlled switchover
+> from replication merely stopping.
+
 ![CNPG over RHSI — a CloudNativePG primary on cluster2 and a streaming replica on cluster3, linked by a Skupper VAN on the pg-write routing key; a hub relay carries the demotionToken so a pg-role label-flip performs a controlled switchover](docs/images/diagrams/05-cnpg-rhsi.drawio.svg)
 
 ### How it works
